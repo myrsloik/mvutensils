@@ -99,6 +99,7 @@
   <ItemGroup>
     <ClInclude Include="..\src\Common.h" />
     <ClInclude Include="..\src\CopyCode.h" />
+    <ClInclude Include="..\src\FunctionTable.h" />
     <ClInclude Include="..\src\CPU.h" />
     <ClInclude Include="..\src\DepanCompensatePlane.h" />
     <ClInclude Include="..\src\DepanShared.h" />

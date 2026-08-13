@@ -19,7 +19,6 @@
 
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <memory>
 #include <cmath>
 #include <limits>
@@ -29,6 +28,7 @@
 #include <VapourSynth4.h>
 
 #include "Degrains.h"
+#include "FunctionTable.h"
 #include "Overlap.h"
 #include "Common.h"
 #include "CPU.h"
@@ -403,23 +403,25 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
     }
 
 // One table per radius, generated for 1..kMaxDegrainRadius so the cap lives in a single constant.
+// consteval, not constexpr: these only ever build the table below, and a stray runtime call would
+// materialise the whole array on the stack instead of using the one baked into the image.
 template <int Radius>
-static std::unordered_map<uint32_t, DenoiseFunction> makeDegrainMap() {
-    return DEGRAIN_LEVEL(Radius);
+static consteval auto makeDegrainTable() {
+    return std::to_array<FunctionTableEntry<DenoiseFunction>>(DEGRAIN_LEVEL(Radius));
 }
 
 template <int... Is>
-static auto makeDegrainMaps(std::integer_sequence<int, Is...>) {
-    return std::array<std::unordered_map<uint32_t, DenoiseFunction>, sizeof...(Is)>{ makeDegrainMap<Is + 1>()... };
+static consteval auto makeDegrainTables(std::integer_sequence<int, Is...>) {
+    return std::array{ makeDegrainTable<Is + 1>()... };
 }
 
-static const auto degrain_functions = makeDegrainMaps(std::make_integer_sequence<int, kMaxDegrainRadius>{});
+static constexpr auto degrain_functions = makeDegrainTables(std::make_integer_sequence<int, kMaxDegrainRadius>{});
 
 static DenoiseFunction selectDegrainFunction(unsigned radius, unsigned width, unsigned height, unsigned bits) {
     if (radius < 1 || radius > kMaxDegrainRadius)
         throw std::out_of_range("degrain radius out of range");
 
-    return degrain_functions[radius - 1].at(KEY(width, height, bits));
+    return findFunctionOrThrow(degrain_functions[radius - 1], KEY(width, height, bits));
 }
 
 #undef DEGRAIN

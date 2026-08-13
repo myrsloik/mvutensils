@@ -1,7 +1,6 @@
 #include <cstdint>
-#include <stdexcept>
-#include <unordered_map>
 
+#include "FunctionTable.h"
 #include "SADFunctions.h"
 #include "SADFunctions_Float.h"
 #include "Common.h"
@@ -246,7 +245,7 @@ static unsigned int sad_f32_avx512(const uint8_t *s, intptr_t sp, const uint8_t 
 #define SAD_U16_AVX512(width, height) { KEY(width, height, 16), SADWrapperU16_AVX512<width, height>::sad_u16_avx512 },
 #define SAD_F32_AVX512(width, height) { KEY(width, height, 32), sad_f32_avx512<width, height> },
 
-static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
+static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     // 8-bit: width >= 64 only
     SAD_U8_AVX512(64, 16) SAD_U8_AVX512(64, 32) SAD_U8_AVX512(64, 64) SAD_U8_AVX512(64, 128)
     SAD_U8_AVX512(128, 32) SAD_U8_AVX512(128, 64) SAD_U8_AVX512(128, 128)
@@ -260,48 +259,45 @@ static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
     SAD_F32_AVX512(32, 8) SAD_F32_AVX512(32, 16) SAD_F32_AVX512(32, 32) SAD_F32_AVX512(32, 64)
     SAD_F32_AVX512(64, 16) SAD_F32_AVX512(64, 32) SAD_F32_AVX512(64, 64) SAD_F32_AVX512(64, 128)
     SAD_F32_AVX512(128, 32) SAD_F32_AVX512(128, 64) SAD_F32_AVX512(128, 128)
-};
+});
 
 #define SATD_U8_AVX512(width, height)  { KEY(width, height, 8), satd_u8_avx512<width, height> },
 #define SATD_U16_AVX512(width, height) { KEY(width, height, 16), satd_u16_avx512<width, height> },
 
-static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
+static constexpr auto satd_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     // 8-bit: width >= 32
     SATD_U8_AVX512(32, 16) SATD_U8_AVX512(32, 32) SATD_U8_AVX512(64, 32)
     SATD_U8_AVX512(64, 64) SATD_U8_AVX512(128, 64) SATD_U8_AVX512(128, 128)
     // 16-bit: width >= 16
     SATD_U16_AVX512(16, 8) SATD_U16_AVX512(16, 16) SATD_U16_AVX512(32, 16) SATD_U16_AVX512(32, 32)
     SATD_U16_AVX512(64, 32) SATD_U16_AVX512(64, 64) SATD_U16_AVX512(128, 64) SATD_U16_AVX512(128, 128)
-};
+});
 
 void selectSADFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
-    auto it = sad_functions.find(KEY(width, height, bits));
-    if (it != sad_functions.end())
-        sad = it->second;
+    if (SADFunction fn = findFunction(sad_functions, KEY(width, height, bits)))
+        sad = fn;
 }
 
 // 16-bit VNNI SAD: only the sizes where the vpdpwssd bias kernel beats the plain AVX-512 kernel
 // (widths 8-64, height >= 8; 4x4/8x4 were ~parity, 128-wide regressed -- bench_degrain/sad16_vnni*).
 #define SAD_U16_AVX512_VNNI(width, height) { KEY(width, height, 16), sad_u16_avx512_vnni<width, height> },
-static const std::unordered_map<uint32_t, SADFunction> sad_vnni_functions = {
+static constexpr auto sad_vnni_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     SAD_U16_AVX512_VNNI(8, 8)  SAD_U16_AVX512_VNNI(8, 16)  SAD_U16_AVX512_VNNI(8, 32)
     SAD_U16_AVX512_VNNI(16, 8) SAD_U16_AVX512_VNNI(16, 16) SAD_U16_AVX512_VNNI(16, 32)
     SAD_U16_AVX512_VNNI(32, 8) SAD_U16_AVX512_VNNI(32, 16) SAD_U16_AVX512_VNNI(32, 32) SAD_U16_AVX512_VNNI(32, 64)
     SAD_U16_AVX512_VNNI(64, 16) SAD_U16_AVX512_VNNI(64, 32) SAD_U16_AVX512_VNNI(64, 64) SAD_U16_AVX512_VNNI(64, 128)
-};
+});
 
 void selectSADFunctionAVX512VNNI(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
     if (bits != 16)
         return;
-    auto it = sad_vnni_functions.find(KEY(width, height, bits));
-    if (it != sad_vnni_functions.end())
-        sad = it->second;
+    if (SADFunction fn = findFunction(sad_vnni_functions, KEY(width, height, bits)))
+        sad = fn;
 }
 
 void selectSATDFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &satd) {
-    auto it = satd_functions.find(KEY(width, height, bits));
-    if (it != satd_functions.end())
-        satd = it->second;
+    if (SADFunction fn = findFunction(satd_functions, KEY(width, height, bits)))
+        satd = fn;
 }
 
 #endif // MVTOOLS_X86

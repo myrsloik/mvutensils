@@ -1,6 +1,4 @@
-#include <stdexcept>
-#include <unordered_map>
-
+#include "FunctionTable.h"
 #include "Overlap.h"
 
 #if defined(MVTOOLS_X86)
@@ -67,7 +65,7 @@ static void overlaps_avx2_u16(uint8_t *pDst8, ptrdiff_t nDstPitch, const uint8_t
 #define OVERS_AVX2_16(width, height)
 #endif
 
-static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions = {
+static constexpr auto overlaps_functions = std::to_array<FunctionTableEntry<OverlapsFunction>>({
     // 8-bit: width 8 intentionally omitted -- the SSE2 intrinsic is faster there (see overlaps_avx2 note).
     // 16-bit: width 8 IS included -- a ymm holds 8 uint32 = one full width-8 row, so no row stitching.
     OVERS_AVX2(16, 1)
@@ -109,11 +107,10 @@ static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions =
     OVERS_AVX2_16(128, 32)
     OVERS_AVX2_16(128, 64)
     OVERS_AVX2_16(128, 128)
-};
+});
 
 
 void selectOverlapsFunctionAVX2(unsigned width, unsigned height, unsigned bits, OverlapsFunction &overs) {
-    auto it = overlaps_functions.find(KEY(width, height, bits));
-    if (it != overlaps_functions.end())
-        overs = it->second;
+    if (OverlapsFunction fn = findFunction(overlaps_functions, KEY(width, height, bits)))
+        overs = fn;
 }

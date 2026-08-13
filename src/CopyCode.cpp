@@ -1,8 +1,8 @@
 #include <cstdint>
 #include <cstring>
-#include <unordered_map>
 
 #include "CopyCode.h"
+#include "FunctionTable.h"
 
 template <unsigned width, unsigned height>
 void copyBlock(uint8_t * __restrict pDst, ptrdiff_t nDstPitch, const uint8_t * __restrict pSrc, ptrdiff_t nSrcPitch) {
@@ -17,7 +17,7 @@ void copyBlock(uint8_t * __restrict pDst, ptrdiff_t nDstPitch, const uint8_t * _
     { KEY(width, height, 16), copyBlock<width * sizeof(uint16_t), height> }, \
     { KEY(width, height, 32), copyBlock<width * sizeof(float), height> },
 
-static const std::unordered_map<uint32_t, COPYFunction> copy_functions = {
+static constexpr auto copy_functions = std::to_array<FunctionTableEntry<COPYFunction>>({
     COPY(2, 2)
     COPY(2, 4)
     COPY(4, 2)
@@ -45,10 +45,10 @@ static const std::unordered_map<uint32_t, COPYFunction> copy_functions = {
     COPY(128, 32)
     COPY(128, 64)
     COPY(128, 128)
-};
+});
 
 COPYFunction selectCopyFunction(unsigned width, unsigned height, unsigned bits) {
-    return copy_functions.at(KEY(width, height, bits));
+    return findFunctionOrThrow(copy_functions, KEY(width, height, bits));
 }
 
 #undef COPY

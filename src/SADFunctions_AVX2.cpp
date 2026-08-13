@@ -1,7 +1,6 @@
 #include <cstdint>
-#include <stdexcept>
-#include <unordered_map>
 
+#include "FunctionTable.h"
 #include "SADFunctions.h"
 #include "SADFunctions_Float.h"
 #include "Common.h"
@@ -122,7 +121,7 @@ struct SADWrapperU16_AVX2 {
 #define SAD_F32_AVX2(width, height) \
     { KEY(width, height, 32), sad_f32_avx2<width, height> },
 
-static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
+static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     SAD_U8_AVX2(16, 2)
     SAD_U8_AVX2(16, 4)
     SAD_U8_AVX2(16, 8)
@@ -163,12 +162,11 @@ static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
     SAD_F32_AVX2(32, 8) SAD_F32_AVX2(32, 16) SAD_F32_AVX2(32, 32) SAD_F32_AVX2(32, 64)
     SAD_F32_AVX2(64, 16) SAD_F32_AVX2(64, 32) SAD_F32_AVX2(64, 64) SAD_F32_AVX2(64, 128)
     SAD_F32_AVX2(128, 32) SAD_F32_AVX2(128, 64) SAD_F32_AVX2(128, 128)
-};
+});
 
 void selectSADFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
-    auto it = sad_functions.find(KEY(width, height, bits));
-    if (it != sad_functions.end())
-        sad = it->second;
+    if (SADFunction fn = findFunction(sad_functions, KEY(width, height, bits)))
+        sad = fn;
 }
 
 
@@ -288,7 +286,7 @@ static unsigned int satd_u16_avx2(const uint8_t *src, intptr_t sp, const uint8_t
 
 #define SATD_U8_AVX2(width, height) { KEY(width, height, 8), satd_u8_avx2<width, height> },
 #define SATD_U16_AVX2(width, height) { KEY(width, height, 16), satd_u16_avx2<width, height> },
-static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
+static constexpr auto satd_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     SATD_U8_AVX2(8, 8)
     SATD_U8_AVX2(16, 8) SATD_U8_AVX2(16, 16)
     SATD_U8_AVX2(32, 16) SATD_U8_AVX2(32, 32) SATD_U8_AVX2(64, 32)
@@ -296,12 +294,11 @@ static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
     SATD_U16_AVX2(8, 4) SATD_U16_AVX2(8, 8) SATD_U16_AVX2(16, 8) SATD_U16_AVX2(16, 16)
     SATD_U16_AVX2(32, 16) SATD_U16_AVX2(32, 32) SATD_U16_AVX2(64, 32)
     SATD_U16_AVX2(64, 64) SATD_U16_AVX2(128, 64) SATD_U16_AVX2(128, 128)
-};
+});
 
 void selectSATDFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &satd) {
-    auto it = satd_functions.find(KEY(width, height, bits));
-    if (it != satd_functions.end())
-        satd = it->second;
+    if (SADFunction fn = findFunction(satd_functions, KEY(width, height, bits)))
+        satd = fn;
 }
 
 #endif // MVTOOLS_X86

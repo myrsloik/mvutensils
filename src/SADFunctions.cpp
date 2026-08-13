@@ -1,8 +1,8 @@
 #include <cstdlib>
 #include <stdexcept>
-#include <unordered_map>
 
 #include "CPU.h"
+#include "FunctionTable.h"
 #include "SADFunctions.h"
 #include "Common.h"
 
@@ -285,7 +285,7 @@ unsigned int sad_c(const uint8_t *pSrc8, intptr_t nSrcPitch, const uint8_t *pRef
     { KEY(width, height, 16), sad_c<width, height, uint16_t> },
 #endif
 
-static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
+static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     SAD(2, 2)
     SAD(2, 4)
     SAD(4, 2)
@@ -313,7 +313,7 @@ static const std::unordered_map<uint32_t, SADFunction> sad_functions = {
     SAD(128, 32)
     SAD(128, 64)
     SAD(128, 128)
-};
+});
 
 SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
     // 32-bit float pixels: separate dispatch (auto-vec C baseline, overridden by the hand AVX2/AVX-512
@@ -330,7 +330,7 @@ SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
         return sad;
     }
 
-    SADFunction sad = sad_functions.at(KEY(width, height, bits));
+    SADFunction sad = findFunctionOrThrow(sad_functions, KEY(width, height, bits));
 
 #if defined(MVTOOLS_X86)
     if (g_cpuinfo & MVU_CPU_AVX2)
@@ -594,7 +594,7 @@ static unsigned int satd_u16_sse2(const uint8_t *src, intptr_t sp, const uint8_t
     { KEY(width, height, 16), Satd_C<width, height, uint16_t> },
 #endif
 
-static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
+static constexpr auto satd_functions = std::to_array<FunctionTableEntry<SADFunction>>({
     SATD(4, 4)
     SATD(8, 4)
     SATD(8, 8)
@@ -606,7 +606,7 @@ static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
     SATD(64, 64)
     SATD(128, 64)
     SATD(128, 128)
-};
+});
 
 SADFunction selectSATDFunction(unsigned width, unsigned height, unsigned bits) {
     // 32-bit float pixels: pure scalar SATD (auto-vectorized at the baseline ISA), no per-ISA overrides.
@@ -617,7 +617,7 @@ SADFunction selectSATDFunction(unsigned width, unsigned height, unsigned bits) {
         return satd;
     }
 
-    SADFunction satd = satd_functions.at(KEY(width, height, bits));
+    SADFunction satd = findFunctionOrThrow(satd_functions, KEY(width, height, bits));
 
 #if defined(MVTOOLS_X86)
     if (g_cpuinfo & MVU_CPU_AVX2)

@@ -21,9 +21,9 @@
 #include <stdexcept>
 #include <algorithm>
 #include <numbers>
-#include <unordered_map>
 
 #include "CPU.h"
+#include "FunctionTable.h"
 #include "Overlap.h"
 
 void OverlapWindows::Init(int nx, int ny, int ox, int oy) {
@@ -264,7 +264,7 @@ struct OverlapsWrapper16<4, blockHeight> {
     { KEY(width, height, 16), overlaps_c<width, height, uint32_t, uint16_t> }, \
     { KEY(width, height, 32), overlaps_c<width, height, float, float> },
 
-static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions = {
+static constexpr auto overlaps_functions = std::to_array<FunctionTableEntry<OverlapsFunction>>({
     OVERS_C(2, 2)
     OVERS_C(2, 4)
     OVERS(4, 2)
@@ -292,10 +292,10 @@ static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions =
     OVERS(128, 32)
     OVERS(128, 64)
     OVERS(128, 128)
-};
+});
 
 OverlapsFunction selectOverlapsFunction(unsigned width, unsigned height, unsigned bits) {
-    OverlapsFunction overs = overlaps_functions.at(KEY(width, height, bits));
+    OverlapsFunction overs = findFunctionOrThrow(overlaps_functions, KEY(width, height, bits));
 
 #if defined(MVTOOLS_X86)
     if (g_cpuinfo & MVU_CPU_AVX2)
