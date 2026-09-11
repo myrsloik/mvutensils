@@ -48,6 +48,8 @@ struct CompensateData {
     int deltaFrame;
 
     bool chroma;
+    int xRatioUV;
+    int yRatioUV;
 
     int dstTempPitch;
     int dstTempPitchUV;
@@ -99,8 +101,8 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             // Construct (and validate) the vectors inside the try: deserialization can throw on corrupt data.
             MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
 
-            const int ySubUV = ilog2(vectors.yRatioUV);
-            const int xSubUV = ilog2(vectors.xRatioUV);
+            const int ySubUV = ilog2(d->yRatioUV);
+            const int xSubUV = ilog2(d->xRatioUV);
             const int nWidth[3] = { vectors.nWidth, nWidth[0] >> xSubUV, nWidth[1] };
             const int nHeight[3] = { vectors.nHeight, nHeight[0] >> ySubUV, nHeight[1] };
             const int nOverlapX[3] = { vectors.nOverlapX, nOverlapX[0] >> xSubUV, nOverlapX[1] };
@@ -341,6 +343,9 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         if (!super.IsCompatibleWithSource(d->vi))
             throw std::runtime_error("source clip isn't compatible with super clip");
 
+        d->xRatioUV = super.xRatioUV;
+        d->yRatioUV = super.yRatioUV;
+
         MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
 
         vectors.ScaleThSCD(d->nSCD1, d->nSCD2, vectors.bitsPerSample);
@@ -355,7 +360,7 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         // accumulator is 1x pixel width for float (bytesPerSample 4), 2x for 8/16-bit integer.
         const int accRatio = (d->vi->format.bytesPerSample == 4) ? 1 : 2;
         d->dstTempPitch = ((vectors.nWidth + 15) / 16) * 16 * d->vi->format.bytesPerSample * accRatio;
-        d->dstTempPitchUV = (((vectors.nWidth / vectors.xRatioUV) + 15) / 16) * 16 * d->vi->format.bytesPerSample * accRatio;
+        d->dstTempPitchUV = (((vectors.nWidth / d->xRatioUV) + 15) / 16) * 16 * d->vi->format.bytesPerSample * accRatio;
 
         d->supervi = vsapi->getVideoInfo(d->super);
 
@@ -367,7 +372,7 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         if (vectors.nOverlapX > 0 || vectors.nOverlapY > 0) {
             d->OverWins.Init(vectors.nBlkSizeX, vectors.nBlkSizeY, vectors.nOverlapX, vectors.nOverlapY);
             if (d->chroma)
-                d->OverWinsUV.Init(vectors.nBlkSizeX / vectors.xRatioUV, vectors.nBlkSizeY / vectors.yRatioUV, vectors.nOverlapX / vectors.xRatioUV, vectors.nOverlapY / vectors.yRatioUV);
+                d->OverWinsUV.Init(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, vectors.nOverlapX / d->xRatioUV, vectors.nOverlapY / d->yRatioUV);
         }
 
         const unsigned bits = d->vi->format.bytesPerSample * 8;
@@ -375,8 +380,8 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         d->OVERS[0] = selectOverlapsFunction(vectors.nBlkSizeX, vectors.nBlkSizeY, bits);
         d->BLIT[0] = selectCopyFunction(vectors.nBlkSizeX, vectors.nBlkSizeY, bits);
 
-        d->OVERS[1] = d->OVERS[2] = selectOverlapsFunction(vectors.nBlkSizeX / vectors.xRatioUV, vectors.nBlkSizeY / vectors.yRatioUV, bits);
-        d->BLIT[1] = d->BLIT[2] = selectCopyFunction(vectors.nBlkSizeX / vectors.xRatioUV, vectors.nBlkSizeY / vectors.yRatioUV, bits);
+        d->OVERS[1] = d->OVERS[2] = selectOverlapsFunction(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, bits);
+        d->BLIT[1] = d->BLIT[2] = selectCopyFunction(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, bits);
 
         d->time256 = (int)(time * 256 / 100);
 

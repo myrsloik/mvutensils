@@ -177,11 +177,10 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         d->thSAD = (int64_t)((double)d->thSAD * pixelMax / 255.0 + 0.5);
         d->nLambda = (int64_t)((double)d->nLambda * pixelMax / 255.0 + 0.5);
 
-        // Normalize threshold to old block size
         const int referenceBlockSize = 8 * 8;
-        d->thSAD = d->thSAD * (vectors.nBlkSizeX * vectors.nBlkSizeY) / referenceBlockSize;
+        d->thSAD = d->thSAD * (d->nBlkSizeX * d->nBlkSizeY) / referenceBlockSize;
         if (d->chroma)
-            d->thSAD += d->thSAD / (vectors.xRatioUV * vectors.yRatioUV) * 2;
+            d->thSAD += d->thSAD / (super.xRatioUV * super.yRatioUV) * 2;
 
         d->nPel = super.nPel;
 

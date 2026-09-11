@@ -431,9 +431,9 @@ static DenoiseFunction selectDegrainFunction(unsigned radius, unsigned width, un
 
 
 template <int radius>
-static void selectFunctions(DegrainData<radius> &d, const MotionBlockPyramid &vectors) {
-    const unsigned xRatioUV = vectors.xRatioUV;
-    const unsigned yRatioUV = vectors.yRatioUV;
+static void selectFunctions(DegrainData<radius> &d, const MotionBlockPyramid &vectors, const FramePyramid &super) {
+    const unsigned xRatioUV = super.xRatioUV;
+    const unsigned yRatioUV = super.yRatioUV;
     const unsigned nBlkSizeX = vectors.nBlkSizeX;
     const unsigned nBlkSizeY = vectors.nBlkSizeY;
     const unsigned bits = d.vi->format.bytesPerSample * 8;
@@ -638,7 +638,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
             }
         }
 
-        selectFunctions<radius>(*d, *vectors[0]);
+        selectFunctions<radius>(*d, *vectors[0], super);
 
         const int numDeps = 2 + radius * 2; // input clip, super, and corresponding backward and forward vectors.
         std::vector<VSFilterDependency> deps;

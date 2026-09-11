@@ -1785,7 +1785,7 @@ bool MotionBlockPyramid::IsCompatible(const MotionBlockPyramid &other) const noe
     if (nPel != other.nPel)
         return false;
 
-    if (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV)
+    if (chroma && other.chroma && (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV))
         return false;
 
     if (nHPadding != other.nHPadding || nVPadding != other.nVPadding)
@@ -1801,7 +1801,7 @@ bool MotionBlockPyramid::IsCompatibleWithAnalysis(const FramePyramid &other) con
     if (nWidth != other.nWidth[0] || nHeight != other.nHeight[0] || nRealWidth != other.nRealWidth[0] || nRealHeight != other.nRealHeight[0])
         return false;
 
-    if (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV)
+    if (chroma && (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV))
         return false;
 
     if (nHPadding != other.nHPad[0] || nVPadding != other.nVPad[0])
