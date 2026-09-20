@@ -5,7 +5,7 @@ project('MVUtensils', 'cpp',
     license: 'GPL-2.0-or-later',
     license_files: 'LICENSE',
     meson_version: '>=1.2.3',
-    version: '8',
+    version: '9',
 )
 
 py = import('python').find_installation(pure: false)
@@ -20,7 +20,7 @@ deps = [
 ]
 
 add_project_arguments('-DPACKAGE_VERSION="@0@"'.format(meson.project_version()), language: ['cpp'])
-
+add_project_arguments('-DVS_USE_API_42', language: ['cpp'])
 add_project_arguments('-fno-math-errno', language: ['cpp'])
 
 install_dir = py.get_install_dir() / 'vapoursynth/plugins/mvutensils'
