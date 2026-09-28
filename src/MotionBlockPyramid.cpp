@@ -20,7 +20,6 @@ void MotionBlockLevel::InterpolatePredictorsFromParent(const MotionBlockLevel &p
     int aoddy = (nBlkSizeY * 3 - nOverlapY * 2);
     int aeveny = (nBlkSizeY * 3 - nOverlapY * 4);
 
-    double scaleov = 1.0 / normov;
     for (int l = 0, index = 0; l < nBlkY; l++) {
         for (int k = 0; k < nBlkX; k++, index++) {
             VECTOR v1, v2, v3, v4;
@@ -63,9 +62,12 @@ void MotionBlockLevel::InterpolatePredictorsFromParent(const MotionBlockLevel &p
                 int ay2 = (nBlkSizeY - nOverlapY) * 4 - ay1;
                 // 64 bit so that the multiplications by the SADs don't overflow with 16 bit input.
                 int64_t a11 = ax1 * ay1, a12 = ax1 * ay2, a21 = ax2 * ay1, a22 = ax2 * ay2;
-                vectors[index].x = (int)((a11 * v1.x + a21 * v2.x + a12 * v3.x + a22 * v4.x) * scaleov);
-                vectors[index].y = (int)((a11 * v1.y + a21 * v2.y + a12 * v3.y + a22 * v4.y) * scaleov);
-                temp_sad = static_cast<int64_t>((a11 * v1.sad + a21 * v2.sad + a12 * v3.sad + a22 * v4.sad) * scaleov);
+                // Exact integer division. Multiplying by a rounded 1.0 / normov truncated exact multiples
+                // (uniform motion) one unit low whenever normov * fl(1 / normov) < 1 -- every
+                // overlap = blksize / 8 geometry among others -- biasing positive components only.
+                vectors[index].x = (int)((a11 * v1.x + a21 * v2.x + a12 * v3.x + a22 * v4.x) / normov);
+                vectors[index].y = (int)((a11 * v1.y + a21 * v2.y + a12 * v3.y + a22 * v4.y) / normov);
+                temp_sad = (a11 * v1.sad + a21 * v2.sad + a12 * v3.sad + a22 * v4.sad) / normov;
             }
             vectors[index].x = (vectors[index].x >> normFactor) * (1 << mulFactor);
             vectors[index].y = (vectors[index].y >> normFactor) * (1 << mulFactor);
