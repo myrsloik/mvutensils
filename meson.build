@@ -5,7 +5,7 @@ project('MVUtensils', 'cpp',
     license: 'GPL-2.0-or-later',
     license_files: 'LICENSE',
     meson_version: '>=1.2.3',
-    version: '9',
+    version: '10',
 )
 
 py = import('python').find_installation(pure: false)

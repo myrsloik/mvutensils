@@ -48,7 +48,7 @@ MVUtensils is API-compatible in spirit but not verbatim. The main differences:
 | `blksize`/`blksizev`, `overlap`/`overlapv` | `blksize=[h, v]`, `overlap=[h, v]` (a single value applies to both axes) |
 | `Analyse(isb=False, delta=1)` (forward) | `Analyse(delta=-1)` — **negative delta = forward, positive = backward** |
 | `dct=0` / `dct=5` | `satd=False` / `satd=True` |
-| `search`/`pelsearch` modes 0–7 | modes 0–5 (old modes 0 and 1 dropped, everything shifted by −2) |
+| `search` modes 0–7 | modes 0–5 (old modes 0 and 1 dropped, everything shifted by −2). `pelsearch` is a radius, not a mode: keep its value |
 | `rfilter` 2 / 4 | `rfilter` 1 / 2 (modes 1 and 3 dropped) |
 | `lambda`, `global` | `mvlambda`, `globalmv` (avoid Python keywords) |
 | `Degrain1(clip, super, mvbw, mvfw, ...)` | `Degrain(clip, super, [mvbw, mvfw], ...)` — vectors in a list |
@@ -180,9 +180,9 @@ core.mvu.Analyse(vnode super[, int[] blksize=<from super>, int[] overlap=<from s
 | blksize | int[] | (super's value) | Block size `[h, v]`. Smaller = more accurate but slower. |
 | overlap | int[] | (super's value) | Block overlap `[h, v]`, ≤ blksize/2. More overlap = smoother field, slower. |
 | levels | int | (0 = all) | Number of hierarchical levels to use. 0 uses all available: every level that still fits at least one block, as in mvtools. Asking for more levels than fit, or than the super clip has, is an error. |
-| search | int | 0–5 (2) | Search algorithm: 0 = logarithmic/diamond, 1 = exhaustive, 2 = hexagon, 3 = uneven multi-hexagon (UMH), 4 = horizontal, 5 = vertical. |
-| searchparam | int | (2) | Search radius/step for the chosen `search`. |
-| pelsearch | int | (super's pel) | Refinement search radius at the finest (sub-pixel) level. |
+| search | int | 0–5 (2) | Search algorithm used at the finest level: 0 = logarithmic/diamond, 1 = exhaustive, 2 = hexagon, 3 = uneven multi-hexagon (UMH), 4 = horizontal, 5 = vertical. The coarser levels always search exhaustively, except with horizontal/vertical, which search along their axis at every level. |
+| searchparam | int | (2) | Search radius at every level except the finest, in pixels of that level. One pixel at level *n* is 2ⁿ source pixels, so a small radius still covers large motion; raising it helps little and costs a lot (16 roughly doubles `Analyse` time). Not used with `levels=1`. |
+| pelsearch | int | (super's pel) | Radius of the `search` algorithm at the finest level, in sub-pixel units (the default searches ±1 pixel). For logarithmic/diamond it is the initial step size, for hexagon/UMH the search range. |
 | mvlambda | int | (1000) | Weight of the motion-coherence penalty (see [below](#motion-coherence-tuning-mvlambda-lsad-plevel)), **given per 8×8 block**: the value is multiplied internally by `blksizeh·blksizev/64` so the same setting behaves consistently at any block size (the same normalisation `lsad` and `badsad` use), then scaled for bit depth, `pel` and level. Higher favours smooth, spatially consistent fields; `0` disables the penalty and takes the pure lowest-SAD match per block. |
 | chroma | bint | (True) | Include chroma planes in the SAD/SATD metric. |
 | delta | int | (1) | Temporal distance **and direction** of the reference frame. **Positive = backward (past), negative = forward (future).** |
@@ -235,8 +235,8 @@ photometric match. The three parameters shape that trade-off:
   covers more pixels and benefits from extra smoothing.
 
 > **Porting:** `isb` is gone — direction is now the sign of `delta` (negative = forward).
-> `dct` became the boolean `satd` (`dct=0`→`satd=False`, `dct=5`→`satd=True`). `search`/`pelsearch`
-> modes lost the old 0 and 1, so subtract 2 from your old value. `lambda`→`mvlambda`,
+> `dct` became the boolean `satd` (`dct=0`→`satd=False`, `dct=5`→`satd=True`). `search`
+> modes lost the old 0 and 1, so subtract 2 from your old value (`pelsearch` is a radius and stays as it was). `lambda`→`mvlambda`,
 > `global`→`globalmv`. `trymany` is now a 0–2 int instead of a bool — the old `False`/`True` map to
 > `0`/`1`, and the new `2` also tries multiple candidates on the finest level.
 > The `truemotion` preset was removed in favour of fixed defaults: `mvlambda=1000`
@@ -293,8 +293,10 @@ out = core.mvu.Degrain(clip, super, vectors)
 | blksize | int[] | (super's value) | Finer block size `[h, v]`. Usually half of the original. |
 | overlap | int[] | (super's value) | Finer overlap `[h, v]`. |
 
-Other parameters (`search`, `searchparam`, `mvlambda`, `chroma`, `pnew`, `meander`, `fields`, `tff`,
-`satd`) behave exactly as in [Analyse](#analyse).
+`search` picks the algorithm as in [Analyse](#analyse), but since `Recalculate` works on a single level,
+`searchparam` is directly that algorithm's radius, in sub-pixel units (the role `pelsearch` plays in
+`Analyse`). Other parameters (`mvlambda`, `chroma`, `pnew`, `meander`, `fields`, `tff`, `satd`) behave
+exactly as in [Analyse](#analyse).
 
 `Recalculate` deliberately has **no `lsad`** (nor `plevel`, `globalmv`, `pzero`, `pglobal`,
 `badsad`/`badrange` or `trymany`). It is not a from-scratch hierarchical search: it works on a single
