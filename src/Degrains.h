@@ -24,14 +24,14 @@ static_assert(kMaxDegrainRadius >= 1 &&
     "kMaxDegrainRadius too large: the normaliseWeights int accumulation would overflow");
 
 
-using DenoiseFunction = void (*)(uint8_t *pDst, ptrdiff_t nDstPitch, const uint8_t *pSrc, ptrdiff_t nSrcPitch, const uint8_t **_pRefs, ptrdiff_t nRefPitch, uint16_t WSrc, const uint16_t *WRefs) noexcept;
+using DenoiseFunction = void (*)(uint8_t *pDst, ptrdiff_t nDstPitch, const uint8_t *pSrc, ptrdiff_t nSrcPitch, const uint8_t **_pRefs, uint16_t WSrc, const uint16_t *WRefs) noexcept;
 
 
 // XXX Both Degrain_C8/Degrain_C16 move the pointers passed in pRefs8. This is okay
 // because they are not used after the function is done with them.
 
 template <int radius, int blockWidth, int blockHeight>
-static void Degrain_C8(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t * MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t ** MVU_RESTRICT pRefs8, ptrdiff_t nRefPitch, uint16_t WSrc, const uint16_t * MVU_RESTRICT WRefs) noexcept {
+static void Degrain_C8(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t * MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t ** MVU_RESTRICT pRefs8, uint16_t WSrc, const uint16_t * MVU_RESTRICT WRefs) noexcept {
     const uint16_t wsrc = WSrc;
     uint16_t wref[radius * 2];
     for (int r = 0; r < radius * 2; r++)
@@ -53,12 +53,12 @@ static void Degrain_C8(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const 
         pDst8 += nDstPitch;
         pSrc8 += nSrcPitch;
         for (int r = 0; r < radius * 2; r++)
-            pRefs8[r] += nRefPitch;
+            pRefs8[r] += nSrcPitch;
     }
 }
 
 template <int radius, int blockWidth, int blockHeight>
-static void Degrain_C16(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t * MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t ** MVU_RESTRICT pRefs8, ptrdiff_t nRefPitch, uint16_t WSrc, const uint16_t * MVU_RESTRICT WRefs) noexcept {
+static void Degrain_C16(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t * MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t ** MVU_RESTRICT pRefs8, uint16_t WSrc, const uint16_t * MVU_RESTRICT WRefs) noexcept {
     const int wsrc = WSrc;
     int wref[radius * 2];
     for (int r = 0; r < radius * 2; r++)
@@ -82,12 +82,12 @@ static void Degrain_C16(uint8_t * MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const
         pDst8 += nDstPitch;
         pSrc8 += nSrcPitch;
         for (int r = 0; r < radius * 2; r++)
-            pRefs8[r] += nRefPitch;
+            pRefs8[r] += nSrcPitch;
     }
 }
 
 template <int radius, int blockWidth, int blockHeight>
-static void Degrain_F32(uint8_t *MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t *MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t **MVU_RESTRICT pRefs8, ptrdiff_t nRefPitch, uint16_t WSrc, const uint16_t *MVU_RESTRICT WRefs) noexcept {
+static void Degrain_F32(uint8_t *MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const uint8_t *MVU_RESTRICT pSrc8, ptrdiff_t nSrcPitch, const uint8_t **MVU_RESTRICT pRefs8, uint16_t WSrc, const uint16_t *MVU_RESTRICT WRefs) noexcept {
     const float wsrc = WSrc;
     float wref[radius * 2];
     for (int r = 0; r < radius * 2; r++)
@@ -111,7 +111,7 @@ static void Degrain_F32(uint8_t *MVU_RESTRICT pDst8, ptrdiff_t nDstPitch, const 
         pDst8 += nDstPitch;
         pSrc8 += nSrcPitch;
         for (int r = 0; r < radius * 2; r++)
-            pRefs8[r] += nRefPitch;
+            pRefs8[r] += nSrcPitch;
     }
 }
 
@@ -161,8 +161,8 @@ static inline uint16_t DegrainWeight(int64_t thSAD, int64_t blockSAD) noexcept {
 
 template<typename PixelType>
 static inline void useBlock(const uint8_t *&p, uint16_t &WRef, int isUsable, const std::optional<MotionBlockPyramid> &blocks, int i, const FramePyramidLevel *pPlane, const uint8_t **pSrcCur, int xx, int nLogPel, int plane, int xSubUV, int ySubUV, const int64_t *thSAD) noexcept {
-    // Resolves only the block pointer and its weight; the row stride is identical for every block of a plane
-    // (all come from the same super clip), so the caller computes nRefPitch once instead of per block here.
+    // Resolves only the block pointer and its weight; the row stride is the centre's, shared by every reference
+    // (see DenoiseFunction), so the kernel steps them all with nSrcPitch.
     if (isUsable) {
         const BlockData block = blocks->GetBlock(i);
         int blx = (block.x << nLogPel) + block.vector.x;

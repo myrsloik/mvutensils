@@ -49,6 +49,7 @@ template<int radius>
 struct DegrainData {
     VSNode *node = nullptr;
     VSNode *super = nullptr;
+    VSNode *centerSuper = nullptr;
     VSNode *vectors[radius * 2] = {};
     int deltaFrame[radius * 2] = {};
 
@@ -98,6 +99,8 @@ struct DegrainData {
         }
         if (super)
             vsapi->freeNode(super);
+        if (centerSuper)
+            vsapi->freeNode(centerSuper);
         if (node)
             vsapi->freeNode(node);
     }
@@ -121,7 +124,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             if (n + offB < d->vi->numFrames && n + offB >= 0)
                 vsapi->requestFrameFilter(n + offB, d->super, frameCtx);
 
-            vsapi->requestFrameFilter(n, d->super, frameCtx);
+            vsapi->requestFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx);
 
             // Forward
             int offF = d->deltaFrame[r + 1];
@@ -180,7 +183,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
 
             int nLogPel = (fgops[0]->nPel == 4) ? 2 : (fgops[0]->nPel == 2) ? 1 : 0;
 
-            FramePyramid pSrcFrame(vsapi->getFrameFilter(n, d->super, frameCtx), 1, d->prefix, vsapi);
+            FramePyramid pSrcFrame(vsapi->getFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx), 1, d->prefix, vsapi);
             const auto &srcLevel = pSrcFrame.GetLevel(0);
 
             for (int i = 0; i < d->vi->format.numPlanes; i++) {
@@ -233,7 +236,8 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                 if (!d->process[plane])
                     continue;
 
-                const ptrdiff_t nRefPitch = nSrcPitches[plane];
+                for (int r = 0; r < radius * 2; r++) // the kernel steps the references with the centre's stride
+                    assert(!pPlanes[r] || pPlanes[r]->planes[plane].nPitch == nSrcPitches[plane]);
 
                 if (nOverlapX[0] == 0 && nOverlapY[0] == 0) {
                     const int frameW = vsapi->getFrameWidth(dst, plane);
@@ -263,11 +267,11 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                             if (validW == nBlkSizeX[plane] && validH == nBlkSizeY[plane]) {
                                 // Block fits entirely — write directly
                                 d->DEGRAIN[plane](pDstCur[plane] + xx, nDstPitches[plane], pSrcCur[plane] + xx, nSrcPitches[plane],
-                                    pointers, nRefPitch, WSrc, WRefs);
+                                    pointers, WSrc, WRefs);
                             } else if (validW > 0) {
                                 // Edge block — write to tmpBlock, then copy only the valid region
                                 d->DEGRAIN[plane](tmpBlock, tmpBlockPitch, pSrcCur[plane] + xx, nSrcPitches[plane],
-                                    pointers, nRefPitch, WSrc, WRefs);
+                                    pointers, WSrc, WRefs);
                                 mvu_bitblt(pDstCur[plane] + xx, nDstPitches[plane],
                                     tmpBlock, tmpBlockPitch,
                                     validW * bytesPerSample, validH);
@@ -311,8 +315,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                             normaliseWeights<radius>(WSrc, WRefs, d->userWeights);
 
                             d->DEGRAIN[plane](tmpBlock, tmpBlockPitch, pSrcCur[plane] + xx, nSrcPitches[plane],
-                                pointers, nRefPitch,
-                                WSrc, WRefs);
+                                pointers, WSrc, WRefs);
                             // accumulator is 1x pixel width for float, 2x for 8/16-bit integer.
                             constexpr int accRatio = std::is_floating_point_v<PixelType> ? 1 : 2;
                             d->OVERS[plane](DstTemp + xx * accRatio, dstTempPitch, tmpBlock, tmpBlockPitch, winOver, nBlkSizeX[plane]);
@@ -482,6 +485,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         d->nSCD2 = MV_DEFAULT_SCD2;
 
     d->super = vsapi->mapGetNode(in, "super", 0, nullptr);
+    d->centerSuper = vsapi->mapGetNode(in, "centersuper", 0, &err);
 
     const char *prefix = vsapi->mapGetData(in, "prefix", 0, &err);
     if (prefix)
@@ -553,6 +557,9 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
 
         if (!super.IsCompatibleWithSource(d->vi))
             throw std::runtime_error("super clip is not compatible with the source clip");
+
+        if (d->centerSuper && !FramePyramid(d->centerSuper, d->prefix, vsapi).IsCompatible(super))
+            throw std::runtime_error("centersuper must be created with the same Super arguments as super");
 
         int64_t thsadRaw[3], thsad2Raw[3];
         GetHVPairArgument(thsadRaw[0], thsadRaw[1], "thsad", 400, 400, in, vsapi);
@@ -640,11 +647,13 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
 
         selectFunctions<radius>(*d, *vectors[0], super);
 
-        const int numDeps = 2 + radius * 2; // input clip, super, and corresponding backward and forward vectors.
+        const int numDeps = 2 + radius * 2 + (d->centerSuper ? 1 : 0); // input clip, super, and corresponding backward and forward vectors, optional centersuper
         std::vector<VSFilterDependency> deps;
         deps.reserve(numDeps);
         deps.push_back({ d->node, rpStrictSpatial });
         deps.push_back({ d->super, rpGeneral });
+        if (d->centerSuper)
+            deps.push_back({ d->centerSuper, rpStrictSpatial });
         for (int r = 0; r < radius * 2; r++)
             deps.push_back({ d->vectors[r], rpStrictSpatial });
 
@@ -695,6 +704,7 @@ constexpr const char *degrain_args =
     "thscd1:int:opt;"
     "thscd2:float:opt;"
     "weights:int[]:opt;"
+    "centersuper:vnode:opt;"
     "prefix:data:opt;";
 
 // Registers Degrain1 .. DegrainN for the whole 1..kMaxDegrainRadius range.
