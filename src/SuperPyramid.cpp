@@ -264,6 +264,13 @@ static int PlaneDimensionLuma(int numPixels, int ratioUV, int pad) noexcept {
       return (pad >= ratioUV) ? ((numPixels / ratioUV + 1) / 2) * ratioUV : ((numPixels / ratioUV) / 2) * ratioUV;
 }
 
+// Level 0 size: the frame dimension grown to the smallest whole block grid covering it
+static int BlockAlignedDimension(int size, int blkSize, int overlap) noexcept {
+    int step = blkSize - overlap;
+    int size_B = step * ((size - overlap) / step) + overlap;
+    return (size_B < size) ? size_B + step : size;
+}
+
 template<typename PixelType>
 void PyramidPlane::ReducePlane(const PyramidPlane &src, int xRatioUV, int yRatioUV, RFilterParam rFilter, uint8_t *tempBuffer, VSCore *core, const VSAPI *vsapi) noexcept {
     nVPadding = src.nVPadding;
@@ -852,29 +859,11 @@ void FramePyramid::SharedInit(const VSFrame *srcFrame, int levels, int nBlkSizeX
         nHeight[plane] = nRealHeight[plane];
     }
 
-    // Calculate padding needed to make the dimensions fit the block size and overlap, if specified
-
-    if (nBlkSizeX > 0 && nOverlapX >= 0) {
-        int nBlkX = (nRealWidth[0] - nOverlapX) / (nBlkSizeX - nOverlapX);
-        int nWidth_B = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-        if (nWidth_B < nRealWidth[0]) {
-            ++nBlkX;
-            nWidth[0] = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-            nWidth[1] = nWidth[0] / xRatioUV;
-            nWidth[2] = nWidth[0] / xRatioUV;
-        }
-    }
-
-    if (nBlkSizeY > 0 && nOverlapY >= 0) {
-        int nBlkY = (nRealHeight[0] - nOverlapY) / (nBlkSizeY - nOverlapY);
-        int nHeight_B = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-        if (nHeight_B < nRealHeight[0]) {
-            ++nBlkY;
-            nHeight[0] = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-            nHeight[1] = nHeight[0] / yRatioUV;
-            nHeight[2] = nHeight[0] / yRatioUV;
-        }
-    }
+    // Pad level 0 out to a whole block grid
+    nWidth[0] = BlockAlignedDimension(nRealWidth[0], nBlkSizeX, nOverlapX);
+    nHeight[0] = BlockAlignedDimension(nRealHeight[0], nBlkSizeY, nOverlapY);
+    nWidth[1] = nWidth[2] = nWidth[0] / xRatioUV;
+    nHeight[1] = nHeight[2] = nHeight[0] / yRatioUV;
 
     for (int plane = 0; plane < srcFormat->numPlanes; plane++) {
         nBlkSizePadX[plane] = nWidth[plane] - nRealWidth[plane];
@@ -1153,28 +1142,20 @@ bool FramePyramid::IsCompatibleWithSource(const VSVideoInfo *vi) const noexcept 
 }
 
 
-int FramePyramid::GetMaxLevelsForBlockSize(int width, int height, int xRatioUV, int yRatioUV, int blkSizeX, int blkSizeY, int padX, int padY) noexcept {
-    // Calculate the maximum number of levels based on the input dimensions, note that the smallest allowed plane is 2x2 pixels meaning that with 4:2:0 subsampling
-    // the smallest possible dimensions are 4x4 for luma. It is currently not really planned to support more subsampling levels
-    // Alternatively the maximum number of levels can be calculated based on the block size if specified, any level that can't fit
-    // a single block is useless
-    // Note that this function may return 0 levels if the input dimensions are too small
+int FramePyramid::GetMaxLevelsForBlockSize(int width, int height, int xRatioUV, int yRatioUV, int blkSizeX, int blkSizeY, int overlapX, int overlapY, int padX, int padY) noexcept {
+    // Number of levels, level 0 included, that can still hold a whole block; any smaller level is useless.
+    // Counted on the planes SharedInit actually builds, starting from the block aligned level 0. Always at least 1:
+    // level 0 is kept even when the frame is too small for a block, which Analyse then rejects.
+    // Terminates since halving only stalls at ratioUV (<= 2) while every block is at least 4 wide.
+    width = BlockAlignedDimension(width, blkSizeX, overlapX);
+    height = BlockAlignedDimension(height, blkSizeY, overlapY);
 
     int nLevelsMax = 0;
-    int minLevelWidth = (blkSizeX > 0) ? blkSizeX : (xRatioUV * 2);
-    int minLevelHeight = (blkSizeY > 0) ? blkSizeY : (yRatioUV * 2);
-
-    while (true) {
+    while (width >= blkSizeX && height >= blkSizeY) {
+        nLevelsMax++;
         width = PlaneDimensionLuma(width, xRatioUV, padX);
         height = PlaneDimensionLuma(height, yRatioUV, padY);
-        if (height < minLevelHeight || width < minLevelWidth)
-            break;
-        nLevelsMax++;
     }
 
-    // With blocksize specified a single level will always be possible since the input frame will be padded to fit the block size
-    if (blkSizeX > 0 && blkSizeY > 0)
-        return std::max(1, nLevelsMax);
-    else
-        return nLevelsMax;
+    return std::max(1, nLevelsMax);
 }

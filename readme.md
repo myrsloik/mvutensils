@@ -179,7 +179,7 @@ core.mvu.Analyse(vnode super[, int[] blksize=<from super>, int[] overlap=<from s
 | super | vnode | (required) | Super clip from `Super` (built with `onelevel=False`). |
 | blksize | int[] | (super's value) | Block size `[h, v]`. Smaller = more accurate but slower. |
 | overlap | int[] | (super's value) | Block overlap `[h, v]`, ≤ blksize/2. More overlap = smoother field, slower. |
-| levels | int | (0 = all) | Number of hierarchical levels to use. 0 uses all available. |
+| levels | int | (0 = all) | Number of hierarchical levels to use. 0 uses all available: every level that still fits at least one block, as in mvtools. Asking for more levels than fit, or than the super clip has, is an error. |
 | search | int | 0–5 (2) | Search algorithm: 0 = logarithmic/diamond, 1 = exhaustive, 2 = hexagon, 3 = uneven multi-hexagon (UMH), 4 = horizontal, 5 = vertical. |
 | searchparam | int | (2) | Search radius/step for the chosen `search`. |
 | pelsearch | int | (super's pel) | Refinement search radius at the finest (sub-pixel) level. |

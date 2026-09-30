@@ -1410,10 +1410,26 @@ MotionBlockPyramid::MotionBlockPyramid(const FramePyramid &src, int nBlkSizeX, i
     if (nWidth_B > nWidth || nHeight_B > nHeight)
         throw MotionBlockPyramidError("The chosen block size has no multiple that will process the entire frame without exceeding the super clip padding, derive a new suitable super clip and try again");
 
-    int nLevelsMax = FramePyramid::GetMaxLevelsForBlockSize(nWidth, nHeight, xRatioUV, yRatioUV, nBlkSizeX, nBlkSizeY, nHPadding, nVPadding);
-    
-    nLevelCount = nLevels > 0 ? nLevels : nLevelsMax + nLevels;
-    nLevelCount = std::min(nLevelCount, static_cast<int>(src.nLevels));
+    // Every level must hold at least one block of the grid built below, the same rule as mvtools' MAnalyse. It is
+    // counted on the grid itself: the super clip's planes round up when halved while (nWidth_B >> i) rounds
+    // down, and a level without a single block would break the parent->child prediction.
+    int nLevelsMax = 0;
+    while ((nWidth_B >> nLevelsMax) >= nBlkSizeX && (nHeight_B >> nLevelsMax) >= nBlkSizeY)
+        nLevelsMax++;
+
+    if (nLevelsMax < 1)
+        throw MotionBlockPyramidError("the frame is too small to hold a single block at this block size and overlap");
+
+    if (nLevels > 0) {
+        if (nLevels > nLevelsMax)
+            throw MotionBlockPyramidError("levels is " + std::to_string(nLevels) + " but at most " + std::to_string(nLevelsMax) + " levels fit a block at this frame and block size");
+        if (nLevels > src.nLevels)
+            throw MotionBlockPyramidError("levels is " + std::to_string(nLevels) + " but the super clip only has " + std::to_string(src.nLevels) + (src.nLevels == 1 ? " level" : " levels"));
+        nLevelCount = nLevels;
+    } else {
+        // 0 = all, negative = all but that many; bounded by what the super clip provides
+        nLevelCount = std::min(nLevelsMax + nLevels, src.nLevels);
+    }
 
     if (nLevelCount < 1)
         throw MotionBlockPyramidError("the levels argument resolves to a non-positive level count");

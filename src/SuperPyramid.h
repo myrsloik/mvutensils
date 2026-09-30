@@ -202,5 +202,5 @@ public:
     const FramePyramidLevel &GetLevel(int level) const noexcept;
     bool IsCompatible(const FramePyramid &other) const noexcept;
     bool IsCompatibleWithSource(const VSVideoInfo *vi) const noexcept;
-    static int GetMaxLevelsForBlockSize(int width, int height, int xRatioUV, int yRatioUV, int blkSizeX, int blkSizeY, int padX, int padY) noexcept;
+    static int GetMaxLevelsForBlockSize(int width, int height, int xRatioUV, int yRatioUV, int blkSizeX, int blkSizeY, int overlapX, int overlapY, int padX, int padY) noexcept;
 };

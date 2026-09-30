@@ -141,10 +141,7 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
 
         CheckBlkSize(d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->vi.format.subSamplingW, d->vi.format.subSamplingH);
 
-        int nLevelsMax = FramePyramid::GetMaxLevelsForBlockSize(d->vi.width, d->vi.height, xRatioUV, yRatioUV, d->nBlkSizeX, d->nBlkSizeY, d->nHPad, d->nVPad);
-
-        if (nLevelsMax <= 0)
-            throw std::runtime_error("input dimensions are too small to generate a super clip");
+        int nLevelsMax = FramePyramid::GetMaxLevelsForBlockSize(d->vi.width, d->vi.height, xRatioUV, yRatioUV, d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->nHPad, d->nVPad);
 
         if (d->nLevels <= 0 || d->nLevels > nLevelsMax)
             d->nLevels = nLevelsMax;
