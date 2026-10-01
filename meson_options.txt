@@ -1,0 +1,20 @@
+option(
+    'vapoursynth_include',
+    type: 'string',
+    value: '',
+    description: 'Path to the VapourSynth headers (API 4.3); discovered from the Python module when empty',
+)
+
+option(
+    'vulkan_include',
+    type: 'string',
+    value: '',
+    description: 'Path to the Vulkan headers; found through dependency lookup when empty',
+)
+
+option(
+    'plugindir',
+    type: 'string',
+    value: '',
+    description: 'Where meson install puts the plugin; the plugin directory of the VapourSynth Python package when empty',
+)

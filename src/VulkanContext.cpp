@@ -1,0 +1,343 @@
+#include "VulkanContext.h"
+
+#include <algorithm>
+#include <cstring>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+#include "ShaderSources.h"
+
+namespace {
+
+const char *KernelFile(Kernel kernel) {
+    switch (kernel) {
+    case Kernel::Super: return "super.comp";
+    case Kernel::PyrReduce: return "pyr_reduce.comp";
+    case Kernel::PyrTop: return "pyr_top.comp";
+    case Kernel::PyrPass: return "pyr_pass.comp";
+    case Kernel::PyrSeed: return "pyr_seed.comp";
+    case Kernel::Median: return "median.comp";
+    case Kernel::SeedScatter: return "seed_scatter.comp";
+    case Kernel::SeedBuild: return "seed_build.comp";
+    case Kernel::RefineInit: return "refine_init.comp";
+    case Kernel::RefinePass: return "refine_pass.comp";
+    case Kernel::RefineFlag: return "refine_flag.comp";
+    case Kernel::RefineFallback: return "refine_fallback.comp";
+    case Kernel::RefineApply: return "refine_apply.comp";
+    case Kernel::RefineHalfpel: return "refine_halfpel.comp";
+    }
+    return "";
+}
+
+const char *FindSource(const std::string &name) {
+    for (const ShaderSource &s : kShaderSources)
+        if (name == s.name)
+            return s.text;
+    return nullptr;
+}
+
+// A kernel's text with its #include lines replaced by the files they name, recursively, and the
+// include extension dropped: the core's compiler has no include handler
+std::string Expand(const std::string &name, int depth = 0) {
+    if (depth > 8)
+        throw std::runtime_error("shader includes nest too deeply at " + name);
+    const char *text = FindSource(name);
+    if (!text)
+        throw std::runtime_error("no shader source named " + name);
+    std::istringstream in(text);
+    std::string out, line;
+    while (std::getline(in, line)) {
+        if (line.rfind("#extension GL_GOOGLE_include_directive", 0) == 0)
+            continue;
+        if (line.rfind("#include \"", 0) == 0) {
+            const size_t end = line.find('"', 10);
+            if (end == std::string::npos)
+                throw std::runtime_error("malformed #include in " + name);
+            out += Expand(line.substr(10, end - 10), depth + 1);
+            continue;
+        }
+        out += line;
+        out += '\n';
+    }
+    return out;
+}
+
+} // namespace
+
+std::shared_ptr<VulkanContext> VulkanContext::Get(VSCore *core, const VSAPI *vsapi) {
+    static std::mutex mutex;
+    static std::map<VSCore *, std::weak_ptr<VulkanContext>> contexts;
+    std::lock_guard<std::mutex> guard(mutex);
+    for (auto it = contexts.begin(); it != contexts.end();)
+        it = it->second.expired() ? contexts.erase(it) : std::next(it);
+    std::weak_ptr<VulkanContext> &slot = contexts[core];
+    if (std::shared_ptr<VulkanContext> existing = slot.lock())
+        return existing;
+    std::shared_ptr<VulkanContext> created(new VulkanContext(core, vsapi));
+    slot = created;
+    return created;
+}
+
+VulkanContext::VulkanContext(VSCore *core, const VSAPI *vsapi) : core(core) {
+    if (vsapi->getAPIVersion() < VS_MAKE_VERSION(4, 3))
+        throw std::runtime_error("VapourSynth API 4.3 or later is required for GPU frames");
+    vkapi = vsapi->getVulkanAPI();
+    char err[1024] = {};
+    vk = vkapi->getVulkanFunctions(core, err, sizeof(err));
+    if (!vk)
+        throw std::runtime_error(std::string("no usable Vulkan device: ") + err);
+    VSVulkanCoreHandles handles = {};
+    if (vkapi->getVulkanHandles(core, &handles, err, sizeof(err)))
+        throw std::runtime_error(std::string("no usable Vulkan device: ") + err);
+    device = handles.device;
+
+    VkPhysicalDeviceVulkan14Properties p14 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES};
+    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &p14};
+    VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p13};
+    VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+    vk->vkGetPhysicalDeviceProperties2(handles.physicalDevice, &props);
+    limits = props.properties.limits;
+    deviceName = props.properties.deviceName;
+
+    // The kernels run 32-lane subgroups, or 64 where the device offers only that, always full
+    if (!(p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+        throw std::runtime_error(deviceName + " can't set the subgroup size of compute shaders");
+    auto offers = [&](uint32_t s) { return p13.minSubgroupSize <= s && s <= p13.maxSubgroupSize; };
+    if (!offers(32) && !offers(64))
+        throw std::runtime_error(deviceName + " runs neither 32- nor 64-lane subgroups");
+    subgroup = offers(32) ? 32 : 64;
+    const VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                       VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
+    if ((p11.subgroupSupportedOperations & ops) != ops || !(p11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT))
+        throw std::runtime_error(deviceName + " lacks the subgroup operations the kernels use (basic, arithmetic, ballot, shuffle, clustered)");
+    medianLanes = std::min({1024u, p13.maxComputeWorkgroupSubgroups * subgroup, limits.maxComputeWorkGroupInvocations, limits.maxComputeWorkGroupSize[0]});
+    medianLanes -= medianLanes % subgroup;
+    if (medianLanes < subgroup * kFallbackSubgroups)
+        throw std::runtime_error(deviceName + " can't run workgroups of " + std::to_string(subgroup * kFallbackSubgroups) + " lanes");
+    if (p14.maxPushDescriptors < kBindings)
+        throw std::runtime_error(deviceName + " pushes fewer than " + std::to_string(kBindings) + " descriptors");
+
+    // The core enables these where the device has them; the kernels need them
+    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+    vk->vkGetPhysicalDeviceFeatures2(handles.physicalDevice, &features);
+    if (!features.features.shaderInt64)
+        throw std::runtime_error(deviceName + " lacks 64-bit integers in shaders");
+    if (!f12.shaderBufferInt64Atomics)
+        throw std::runtime_error(deviceName + " lacks 64-bit buffer atomics");
+
+    VkDescriptorSetLayoutBinding bindings[kBindings];
+    for (uint32_t i = 0; i < kBindings; ++i)
+        bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+    dslci.bindingCount = kBindings;
+    dslci.pBindings = bindings;
+    if (vk->vkCreateDescriptorSetLayout(device, &dslci, nullptr, &setLayout) != VK_SUCCESS)
+        throw std::runtime_error("vkCreateDescriptorSetLayout failed");
+    const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params)};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &setLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &range;
+    if (vk->vkCreatePipelineLayout(device, &plci, nullptr, &layout) != VK_SUCCESS) {
+        vk->vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+        throw std::runtime_error("vkCreatePipelineLayout failed");
+    }
+}
+
+VulkanContext::~VulkanContext() {
+    for (const auto &[key, pipeline] : pipelines)
+        vk->vkDestroyPipeline(device, pipeline, nullptr);
+    vk->vkDestroyPipelineLayout(device, layout, nullptr);
+    vk->vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+}
+
+VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk) {
+    std::lock_guard<std::mutex> guard(lock);
+    const std::pair<int, int> key(static_cast<int>(kernel), blk);
+    if (auto it = pipelines.find(key); it != pipelines.end())
+        return it->second;
+
+    const std::string source = Expand(KernelFile(kernel));
+    std::vector<char> log(16384);
+    VSGPUShader *shader = vkapi->compileGPUShader(core, slGLSL, source.c_str(), log.data(), static_cast<int>(log.size()));
+    if (!shader)
+        throw std::runtime_error(std::string("compiling ") + KernelFile(kernel) + " failed: " + log.data());
+    size_t bytes = 0;
+    const uint32_t *code = vkapi->getGPUShaderCode(shader, &bytes);
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = bytes;
+    smci.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    const VkResult made = vk->vkCreateShaderModule(device, &smci, nullptr, &module);
+    vkapi->freeGPUShader(shader);
+    if (made != VK_SUCCESS)
+        throw std::runtime_error(std::string("vkCreateShaderModule failed for ") + KernelFile(kernel));
+
+    // refine_common.glsl's kSubgroup (0), the workgroup size of the kernels that spread a block over
+    // one subgroup (1), median.comp's workgroup size (2), the target grid's block size (3) and the
+    // fallback's workgroup size (4)
+    const uint32_t constants[5] = {subgroup, subgroup, medianLanes, static_cast<uint32_t>(blk), subgroup * kFallbackSubgroups};
+    const VkSpecializationMapEntry entries[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
+    const VkSpecializationInfo spec = {5, entries, sizeof(constants), constants};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    size.requiredSubgroupSize = subgroup;
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.pNext = &size;
+    cpci.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = module;
+    cpci.stage.pName = "main";
+    cpci.stage.pSpecializationInfo = &spec;
+    cpci.layout = layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult created = vk->vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline);
+    vk->vkDestroyShaderModule(device, module, nullptr);
+    if (created != VK_SUCCESS)
+        throw std::runtime_error(std::string("vkCreateComputePipelines failed for ") + KernelFile(kernel));
+    pipelines[key] = pipeline;
+    return pipeline;
+}
+
+VSGPUBuffer *VulkanContext::Upload(VSCore *core, VSGPUExecPool *pool, const void *data, VkDeviceSize size, VSVulkanBufferInfo &info) const {
+    char err[1024] = {};
+    VSVulkanBufferInfo stagingInfo = {};
+    VSGPUBuffer *staging = vkapi->createGPUBuffer(core, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0,
+                                                  &stagingInfo, err, sizeof(err));
+    if (!staging)
+        throw std::runtime_error(std::string("failed to allocate a staging buffer: ") + err);
+    memcpy(stagingInfo.mapped, data, size);
+    VSGPUBuffer *buffer = vkapi->createGPUBuffer(core, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                 &info, err, sizeof(err));
+    if (!buffer) {
+        vkapi->destroyGPUBuffer(staging);
+        throw std::runtime_error(std::string("failed to allocate a GPU buffer: ") + err);
+    }
+    VSGPUExecContext *ctx = vkapi->gpuExecAcquire(pool, err, sizeof(err));
+    if (!ctx) {
+        vkapi->destroyGPUBuffer(staging);
+        vkapi->destroyGPUBuffer(buffer);
+        throw std::runtime_error(err);
+    }
+    VkBufferCopy2 region = {VK_STRUCTURE_TYPE_BUFFER_COPY_2};
+    region.size = size;
+    VkCopyBufferInfo2 copy = {VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2};
+    copy.srcBuffer = stagingInfo.buffer;
+    copy.dstBuffer = info.buffer;
+    copy.regionCount = 1;
+    copy.pRegions = &region;
+    vk->vkCmdCopyBuffer2(vkapi->gpuExecCommandBuffer(ctx), &copy);
+    vkapi->gpuExecUsesBuffer(ctx, staging);
+    if (vkapi->gpuExecSubmit(ctx, nullptr, err, sizeof(err))) {
+        // The context released the staging buffer; the copy never ran, so the buffer is unused
+        vkapi->destroyGPUBuffer(buffer);
+        throw std::runtime_error(err);
+    }
+    const int drained = vkapi->gpuExecPoolWaitIdle(pool, err, sizeof(err));
+    if (drained != gdDrained) {
+        if (vsGPUDrainSafeToDestroy(drained))
+            vkapi->destroyGPUBuffer(buffer);
+        throw std::runtime_error(std::string("uploading a table failed: ") + err);
+    }
+    return buffer;
+}
+
+Recorder::Recorder(const VulkanContext &vc, VkCommandBuffer cmd, VkBuffer dummy) : vc(vc), cmd(cmd) {
+    for (VkDescriptorBufferInfo &info : infos)
+        info = {dummy, 0, VK_WHOLE_SIZE};
+}
+
+void Recorder::Bind(int binding, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
+    infos[binding] = {buffer, offset, range};
+    dirty = true;
+}
+
+void Recorder::Prepare(VkPipeline pipeline, const Params &pc) {
+    vc.vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    // Every pipeline shares the layout, so pushed descriptors stay bound across pipelines
+    if (dirty) {
+        VkWriteDescriptorSet writes[kBindings];
+        for (uint32_t i = 0; i < kBindings; ++i) {
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &infos[i];
+        }
+        vc.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vc.layout, 0, kBindings, writes);
+        dirty = false;
+    }
+    VkPushConstantsInfo push = {VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO};
+    push.layout = vc.layout;
+    push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push.offset = 0;
+    push.size = sizeof(Params);
+    push.pValues = &pc;
+    vc.vk->vkCmdPushConstants2(cmd, &push);
+}
+
+void Recorder::Dispatch(VkPipeline pipeline, const Params &pc, uint32_t x, uint32_t y, uint32_t z) {
+    if (!x || !y || !z)
+        return;
+    Prepare(pipeline, pc);
+    vc.vk->vkCmdDispatch(cmd, x, y, z);
+}
+
+void Recorder::DispatchIndirect(VkPipeline pipeline, const Params &pc, VkBuffer args, VkDeviceSize offset) {
+    Prepare(pipeline, pc);
+    vc.vk->vkCmdDispatchIndirect(cmd, args, offset);
+}
+
+void Recorder::Fill(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t value) {
+    vc.vk->vkCmdFillBuffer(cmd, buffer, offset, size, value);
+}
+
+void Recorder::Copy(VkBuffer src, VkDeviceSize srcOffset, VkBuffer dst, VkDeviceSize dstOffset, VkDeviceSize size) {
+    VkBufferCopy2 region = {VK_STRUCTURE_TYPE_BUFFER_COPY_2};
+    region.srcOffset = srcOffset;
+    region.dstOffset = dstOffset;
+    region.size = size;
+    VkCopyBufferInfo2 info = {VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2};
+    info.srcBuffer = src;
+    info.dstBuffer = dst;
+    info.regionCount = 1;
+    info.pRegions = &region;
+    vc.vk->vkCmdCopyBuffer2(cmd, &info);
+}
+
+void Recorder::Barrier(VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+    VkMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = srcStage;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstStageMask = dstStage;
+    barrier.dstAccessMask = dstAccess;
+    VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vc.vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+void Recorder::ComputeBarrier() {
+    Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}
+
+void Recorder::IndirectBarrier() {
+    Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}
+
+void Recorder::ComputeToTransfer() {
+    Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+}
+
+void Recorder::TransferToCompute() {
+    Barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}

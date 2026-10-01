@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define BLOCKS_PER_WORKGROUP 1
+#define LEVEL_BLOCKS
+#extension GL_EXT_shader_subgroup_extended_types_int64 : require
+#include "pyr_common.glsl"
+
+layout(local_size_x_id = 1) in;
+
+// The exhaustive search at the top level (pc.level): every position within +-topRadius px that
+// keeps the reference block within the level's padding; the lowest SAD wins, ties to the shorter
+// vector and then to the earlier position in scan order, as Pyramid::Search. One block per
+// workgroup of one subgroup, its positions spread over the lanes, each lane keeping the least key
+// SAD << 40 | length << 20 | position; dispatched as (nbx, nby, fields in the batch) of the level.
+void main() {
+    Level lv = levels[pc.level];
+    uint lane = gl_SubgroupInvocationID;
+    int bx = int(gl_WorkGroupID.x), by = int(gl_WorkGroupID.y);
+    SetupField(int(gl_WorkGroupID.z));
+    LoadLevelBlock(0, int(lane), kSubgroup, lv, bx, by, true);
+    barrier();
+
+    ivec2 lo = LevelBound(lv, ivec2(-pc.topRadius)), hi = LevelBound(lv, ivec2(pc.topRadius));
+    int nx = hi.x - lo.x + 1, total = nx * (hi.y - lo.y + 1);
+    uint64_t mine = ~0ul;
+    for (int k = int(lane); k < total; k += kSubgroup) {
+        ivec2 v = lo + ivec2(k % nx, k / nx);
+        uint64_t key = (uint64_t(LevelSadOf(lv, v)) << 40) | (uint64_t(v.x * v.x + v.y * v.y) << 20) | uint64_t(k);
+        mine = min(mine, key);
+    }
+    uint64_t best = subgroupMin(mine);
+    if (lane == 0u) {
+        int k = int(best & 0xFFFFFul);
+        int b = gFieldBase + lv.fieldOff + by * lv.nbx + bx;
+        levelVec[b] = lo + ivec2(k % nx, k / nx);
+        levelSad[b] = int(best >> 40);
+    }
+}

@@ -1,3 +1,39 @@
+# MVGPUtensils
+
+MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's Vulkan GPU frames
+(API 4.3): every clip it takes and returns is GPU resident. The goal is a drop-in replacement for
+`mvu`, the same functions with the same arguments; so far there are `Super`, `Analyse` and
+`AnalyseMany`. The rest of this file documents MVUtensils, which the GPU filters follow.
+
+```python
+clip = core.bs.VideoSource('video.mkv', gpu=True)
+sup = core.mvgpu.Super(clip, blksize=16, overlap=8)
+vectors = core.mvgpu.AnalyseMany(sup, radius=2, badsad=1000, badrange=40)
+```
+
+## Status
+
+* Implemented so far: 8-bit YUV420, `pel=2`, square blocks of 8×8 or 16×16 with any overlap
+  MVUtensils accepts, and its extended grids. Values not implemented yet (`satd`, `fields`,
+  `chroma=False`, other `pel`, `sharp` or `rfilter` values, `pelclip`, an Analyse grid other than
+  the super's) are errors.
+* `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
+  checkerboard passes under mvu's cost (`mvlambda`, `lsad`), a wide search for the blocks still
+  above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
+  half-pel step. `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`,
+  `globalmv`, `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
+  mvu's default `badsad` of 10000 rarely triggers the wide search; around 1000 suits it better.
+* `AnalyseMany` also seeds each field from the fields refined before it (chained and inverted
+  vectors), which separate `Analyse` calls can't.
+* The super and the vectors travel as GPU frames in frame properties, laid out for the GPU, under
+  the prefix `MVGPUtensils` by default. A vector frame holds a 32-bit record (x, y, SAD, 0) per
+  block, vectors in half-pels.
+* The results are bit-identical to the CPU reference implementation of the search
+  (`test/check_reference.py`).
+* Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics.
+  Building needs the Vulkan headers (`-Dvulkan_include=` for meson, the Vulkan SDK for
+  `msvc/MVGPUtensils.slnx`); nothing is linked, the core hands out every entry point.
+
 # MVUtensils
 
 MVUtensils (namespace `mvu`) is a large refactoring and cleanup of the original

@@ -1,17 +1,17 @@
 [build-system]
-requires = ["meson-python", "VapourSynth>=74"]
+requires = ["meson-python", "VapourSynth>=80"]
 build-backend = "mesonpy"
 
 [project]
-name = "vapoursynth-mvutensils"
-description = "Motion estimation and denoising filter for VapourSynth"
+name = "vapoursynth-mvgputensils"
+description = "Motion estimation and denoising filter for VapourSynth, on the GPU"
 readme = "readme.md"
 requires-python = ">=3.12"
 license = "GPL-2.0"
 license-files = ["LICENSE"]
-keywords = ["video", "motion estimation", "denoising"]
+keywords = ["video", "motion estimation", "denoising", "vulkan", "gpu"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 2 - Pre-Alpha",
     "Environment :: Plugins",
     "Natural Language :: English",
     "Operating System :: MacOS",
@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: C++",
     "Topic :: Multimedia :: Video",
 ]
-dependencies = ["VapourSynth"]
+dependencies = ["VapourSynth>=80"]
 dynamic = ["version"]
 
 [project.urls]

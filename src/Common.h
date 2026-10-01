@@ -49,6 +49,9 @@ static constexpr const int MV_DEFAULT_SCD1 = 400;
 static constexpr const float MV_DEFAULT_SCD2 = 51.0f;
 
 static constexpr char DEFAULT_MVUTENSILS_PREFIX[] = "MVUtensils";
+// mvgpu's frames carry GPU frames in their properties, laid out for the GPU, so they get their own
+// prefix: an mvu clip and an mvgpu clip never mistake each other's properties
+static constexpr char DEFAULT_MVGPUTENSILS_PREFIX[] = "MVGPUtensils";
 
 static inline void mvu_bitblt(void *dstp, ptrdiff_t dst_stride, const void *srcp, ptrdiff_t src_stride, size_t row_size, size_t height) {
     if (height) {

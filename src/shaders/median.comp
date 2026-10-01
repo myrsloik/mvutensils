@@ -1,0 +1,63 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define NO_BLOCK_CACHE
+#include "pyr_common.glsl"
+
+layout(local_size_x_id = 2) in;
+
+// The median of level pc.level's vectors, as Sim::Median takes it (the value at index count / 2 of
+// the sorted values), times medianScale, into the field's medianSlot; x, then y. One workgroup of
+// up to 1024 lanes (specialization constant 2): the values are counted into a histogram in shared
+// memory, each lane sums a run of bins, a scan over the lanes finds the run the median falls in,
+// and that lane walks it. Vectors stay within +-kHistHalf (SuperLayout.cpp checks the levels' sizes),
+// and the histogram fits the 32 KB of shared memory Vulkan guarantees. One workgroup per field of
+// the batch; dispatched as (1, 1, fields).
+const int kHistHalf = 4064, kBins = 2 * kHistHalf;
+shared uint sHist[kBins];
+shared uint sTotals[32]; // per subgroup: at most 1024 lanes in subgroups of at least 32
+
+void main() {
+    Level lv = levels[pc.level];
+    SetupField(int(gl_WorkGroupID.z));
+    int lanes = int(gl_WorkGroupSize.x);
+    int t = int(WorkgroupLane());
+    int run = (kBins + lanes - 1) / lanes;
+    int count = lv.nbx * lv.nby;
+    uint k = uint(count) / 2u;
+    for (int comp = 0; comp < 2; ++comp) {
+        for (int i = t; i < kBins; i += lanes)
+            sHist[i] = 0u;
+        barrier();
+        for (int b = t; b < count; b += lanes) {
+            ivec2 v = levelVec[gFieldBase + lv.fieldOff + b];
+            atomicAdd(sHist[(comp == 0 ? v.x : v.y) + kHistHalf], 1u);
+        }
+        barrier();
+        uint sum = 0u;
+        for (int i = t * run; i < min(t * run + run, kBins); ++i)
+            sum += sHist[i];
+        uint inSubgroup = subgroupInclusiveAdd(sum);
+        if (gl_SubgroupInvocationID == gl_SubgroupSize - 1u)
+            sTotals[gl_SubgroupID] = inSubgroup;
+        barrier();
+        uint after = inSubgroup;
+        for (uint s = 0u; s < gl_SubgroupID; ++s)
+            after += sTotals[s];
+        uint before = after - sum;
+        if (before <= k && k < after) {
+            uint seen = before;
+            for (int i = t * run; i < min(t * run + run, kBins); ++i) {
+                seen += sHist[i];
+                if (seen > k) {
+                    int value = (i - kHistHalf) * pc.medianScale;
+                    if (comp == 0)
+                        medians[gMedianBase + pc.medianSlot].x = value;
+                    else
+                        medians[gMedianBase + pc.medianSlot].y = value;
+                    break;
+                }
+            }
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,44 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "refine_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// The field's output: the vector frame mvgpu.Analyse attaches, a record (x, y, SAD, 0) per
+// block, rows pc.recStride records apart
+layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; };
+
+// The 8 half-pel positions around each block's vector, against its final neighbours: 8 blocks per
+// workgroup in a row, lane i of a block's group measuring position i, the best by one minimum of
+// CandidateKey over the group. Reads field A and writes the output, so every block sees its
+// neighbours as the passes left them. Dispatched as ((nbx + 7) / 8, nby) workgroups.
+void main() {
+    uint lane = WorkgroupLane();
+    int group = int(lane >> 3u), sub = int(lane & 7u);
+    int by = int(gl_WorkGroupID.y), bx = int(gl_WorkGroupID.x) * 8 + group;
+    bool live = bx < pc.nbx;
+    bx = min(bx, pc.nbx - 1);
+    int b = by * pc.nbx + bx;
+    LoadBlock(group, sub, 8, bx, by, live);
+    barrier();
+
+    ivec2 p;
+    int64_t lambda;
+    Context(b, p, lambda);
+    ivec2 c0 = vecA[b];
+    ivec2 best = c0;
+    int bestSad = sadA[b];
+    int64_t bestCost = Cost(bestSad, best, p, lambda);
+    ivec2 v = ClampVec(c0 + Around(sub, 1));
+    int s = live ? LaneSad(v) : 0;
+    uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
+    int owner = KeyLane(win);
+    ivec2 wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
+    int ws = FromLane(s, owner, 8);
+    if (win != kNoKey && KeyCost(win) < bestCost) {
+        best = wv;
+        bestSad = ws;
+    }
+    if (live && sub == 0)
+        outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
+}

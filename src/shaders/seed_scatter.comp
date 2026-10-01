@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_atomic_int64 : require
+#define NO_BLOCK_CACHE
+#include "pyr_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// The inverted field (n + d, -d), d > 0, scattered onto field (n, d)'s grid as BuildSeeds does:
+// the block of frame n + d at p matched p + u in frame n, so the block of frame n nearest to
+// p + u moves by -u. Each block of the stored field claims that target with key SAD << 32 | its
+// index; the lowest SAD wins, ties to the lower index, as the CPU's loop over the blocks in order.
+// invKey is all ones beforehand: filled once, then reset by seed_build.comp as it reads it. One
+// lane per block; dispatched as ((nbx * nby + 63) / 64, 1).
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= pc.nbx * pc.nby)
+        return;
+    ivec4 r = invRec[RecIndex(b)];
+    ivec2 u = r.xy;
+    int tx = RoundDiv(2 * (b % pc.nbx) * pc.step + u.x, 2 * pc.step), ty = RoundDiv(2 * (b / pc.nbx) * pc.step + u.y, 2 * pc.step);
+    if (tx < 0 || ty < 0 || tx >= pc.nbx || ty >= pc.nby)
+        return;
+    atomicMin(invKey[ty * pc.nbx + tx], (uint64_t(r.z) << 32) | uint64_t(b));
+}

@@ -1,0 +1,139 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{3b7c9e42-5d1a-4f8e-9c6b-2a71e0d4f913}</ProjectGuid>
+    <RootNamespace>MVGPUtensils</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>MVGPUtensils</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <EnableASAN>false</EnableASAN>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>ClangCL</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+    <EnableASAN>false</EnableASAN>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros">
+    <VulkanInclude Condition="'$(VULKAN_SDK)' != ''">$(VULKAN_SDK)\Include</VulkanInclude>
+    <VulkanInclude Condition="'$(VULKAN_SDK)' == ''">C:\VulkanSDK\1.4.357.0\Include</VulkanInclude>
+  </PropertyGroup>
+  <!-- The VapourSynth headers (API 4.3), the Vulkan SDK's headers (nothing is linked: the core
+       hands out every entry point) and the generated ShaderSources.h -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;$(VulkanInclude);$(IntDir);$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;$(VulkanInclude);$(IntDir);$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <Manifest>
+      <EnableSegmentHeap>true</EnableSegmentHeap>
+    </Manifest>
+    <PreBuildEvent>
+      <Command>py -3 "$(ProjectDir)..\src\shaders\embed_shaders.py" "$(IntDir)ShaderSources.h" "$(ProjectDir)..\src\shaders"</Command>
+      <Message>Embedding the GLSL kernels</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <Manifest>
+      <EnableSegmentHeap>true</EnableSegmentHeap>
+    </Manifest>
+    <PreBuildEvent>
+      <Command>py -3 "$(ProjectDir)..\src\shaders\embed_shaders.py" "$(IntDir)ShaderSources.h" "$(ProjectDir)..\src\shaders"</Command>
+      <Message>Embedding the GLSL kernels</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="..\src\Common.h" />
+    <ClInclude Include="..\src\SuperLayout.h" />
+    <ClInclude Include="..\src\VulkanContext.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\src\Analyse.cpp" />
+    <ClCompile Include="..\src\EntryPoint.cpp" />
+    <ClCompile Include="..\src\Super.cpp" />
+    <ClCompile Include="..\src\SuperLayout.cpp" />
+    <ClCompile Include="..\src\VulkanContext.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\src\shaders\embed_shaders.py" />
+    <None Include="..\src\shaders\median.comp" />
+    <None Include="..\src\shaders\pyr_common.glsl" />
+    <None Include="..\src\shaders\pyr_pass.comp" />
+    <None Include="..\src\shaders\pyr_reduce.comp" />
+    <None Include="..\src\shaders\pyr_seed.comp" />
+    <None Include="..\src\shaders\pyr_top.comp" />
+    <None Include="..\src\shaders\refine_apply.comp" />
+    <None Include="..\src\shaders\refine_common.glsl" />
+    <None Include="..\src\shaders\refine_fallback.comp" />
+    <None Include="..\src\shaders\refine_flag.comp" />
+    <None Include="..\src\shaders\refine_halfpel.comp" />
+    <None Include="..\src\shaders\refine_init.comp" />
+    <None Include="..\src\shaders\refine_pass.comp" />
+    <None Include="..\src\shaders\seed_build.comp" />
+    <None Include="..\src\shaders\seed_scatter.comp" />
+    <None Include="..\src\shaders\super.comp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

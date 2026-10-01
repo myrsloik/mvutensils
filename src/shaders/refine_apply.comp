@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define NO_BLOCK_CACHE
+#include "refine_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
+
+// The fallback's results into field A: entry i of field B belongs to listed block i. Run once every
+// listed block is searched, since the search reads A. Dispatched with the fallback's indirect
+// arguments, one workgroup per listed block, its first lane working.
+void main() {
+    if (gl_LocalInvocationIndex != 0u)
+        return;
+    uint i = gl_WorkGroupID.x;
+    int b = int(flagged[i]);
+    vecA[b] = vecB[i];
+    sadA[b] = sadB[i];
+}

@@ -1,0 +1,55 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define LEVEL_BLOCKS
+#include "pyr_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// Candidate i of the lane's block at level L from level L + 1, in Pyramid::Search's order: 0-4
+// the parent block and its four neighbours, doubled; 5 zero; 6 the median of level L + 1, doubled;
+// each kept within the padding. Neighbours outside the parent grid aren't candidates. The CPU drops
+// duplicates; here they are measured again but can't win, as their first copy came earlier with
+// the same SAD and only a lower SAD replaces the best.
+ivec2 Candidate(int i, Level lv, Level up, ivec2 parent, out bool valid) {
+    valid = true;
+    ivec2 v = ivec2(0);
+    if (i < 5) {
+        ivec2 a = parent + kAround5[i];
+        valid = a.x >= 0 && a.y >= 0 && a.x < up.nbx && a.y < up.nby;
+        if (valid)
+            v = 2 * levelVec[gFieldBase + up.fieldOff + a.y * up.nbx + a.x];
+    } else if (i == 6) {
+        v = medians[gMedianBase + pc.level];
+    }
+    return LevelBound(lv, v);
+}
+
+// Seeds level pc.level from the level above: each block takes the candidate with the lowest SAD,
+// ties to the earlier, by one minimum over the group (the SAD in CandidateKey's cost place). 8
+// blocks of a row per workgroup, 8 lanes per block, lane i measuring candidate i; dispatched as
+// ((nbx + 7) / 8, nby, fields in the batch) of the level.
+void main() {
+    Level lv = levels[pc.level], up = levels[pc.level + 1];
+    uint lane = WorkgroupLane();
+    int group = int(lane >> 3u), sub = int(lane & 7u);
+    int by = int(gl_WorkGroupID.y), bx = int(gl_WorkGroupID.x) * 8 + group;
+    bool live = bx < lv.nbx;
+    bx = min(bx, lv.nbx - 1);
+    int b = by * lv.nbx + bx;
+    SetupField(int(gl_WorkGroupID.z));
+    LoadLevelBlock(group, sub, 8, lv, bx, by, live);
+    barrier();
+
+    ivec2 parent = ivec2(min(bx / 2, up.nbx - 1), min(by / 2, up.nby - 1));
+    bool valid;
+    ivec2 v = Candidate(min(sub, 6), lv, up, parent, valid);
+    int s = live && sub < 7 && valid ? LevelSadOf(lv, v) : 0;
+    uint64_t win = subgroupClusteredMin(live && sub < 7 && valid ? CandidateKey(int64_t(s), sub) : kNoKey, 8u);
+    int owner = KeyLane(win);
+    ivec2 best = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
+    int bestSad = FromLane(s, owner, 8);
+    if (live && sub == 0) {
+        levelVec[gFieldBase + lv.fieldOff + b] = best;
+        levelSad[gFieldBase + lv.fieldOff + b] = bestSad;
+    }
+}

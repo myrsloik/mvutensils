@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#define NO_BLOCK_CACHE
+#define SEED_BUILD
+#include "pyr_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// At most zero, the median, the chained, the inverted and 5 coarse vectors
+const int kMaxList = 9;
+ivec2 gList[kMaxList]; // the lane's seeds so far, indexed by constants only so they stay in registers
+int gCount;
+
+// Appends v, kept within the range ValidateVectors accepts, unless the block has it already
+void Add(ivec2 v) {
+    v = ClampVec(v);
+    bool dup = false;
+    [[unroll]] for (int i = 0; i < kMaxList; ++i)
+        dup = dup || (i < gCount && gList[i] == v);
+    if (dup)
+        return;
+    [[unroll]] for (int i = 0; i < kMaxList; ++i)
+        if (i == gCount)
+            gList[i] = v;
+    ++gCount;
+}
+
+// Every full-size block's seeds, in BuildSeeds' order: zero; the field's median (from the finest
+// pyramid level, scaled); the chained vector when pc.flags & 1 (the block's vector in (n, +-1)
+// plus the vector of the block of (n +- 1, d -+ 1) nearest to where it lands); the inverted vector
+// when pc.flags & 2 (seed_scatter.comp, whose key is reset here for the next field); the vectors of
+// the finest level's block covering the block's centre and its four neighbours, scaled to
+// half-pels at full size. The median and the finest level come from the field's coarse result
+// (binding 28). One lane per block; dispatched as ((nbx * nby + 63) / 64, 1).
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= pc.nbx * pc.nby)
+        return;
+    gX = (b % pc.nbx) * pc.step;
+    gY = (b / pc.nbx) * pc.step;
+    gCount = 0;
+    Add(ivec2(0));
+    Add(coarse[0]);
+    if ((pc.flags & 1) != 0) {
+        ivec2 v1 = stepRec[RecIndex(b)].xy;
+        int tx = clamp(RoundDiv(2 * gX + v1.x, 2 * pc.step), 0, pc.nbx - 1);
+        int ty = clamp(RoundDiv(2 * gY + v1.y, 2 * pc.step), 0, pc.nby - 1);
+        Add(v1 + restRec[ty * pc.recStride + tx].xy);
+    }
+    if ((pc.flags & 2) != 0) {
+        uint64_t key = invKey[b];
+        if (key != ~0ul) {
+            Add(-invRec[RecIndex(int(uint(key & 0xFFFFFFFFul)))].xy);
+            invKey[b] = ~0ul;
+        }
+    }
+    Level co = levels[pc.finest];
+    int span = 8 << pc.finest, scale = 2 << pc.finest;
+    ivec2 centre = ivec2(min((gX + kBlk / 2) / span, co.nbx - 1), min((gY + kBlk / 2) / span, co.nby - 1));
+    [[unroll]] for (int i = 0; i < 5; ++i) {
+        ivec2 a = centre + kAround5[i];
+        if (a.x >= 0 && a.y >= 0 && a.x < co.nbx && a.y < co.nby)
+            Add(coarse[1 + a.y * co.nbx + a.x] * scale);
+    }
+    [[unroll]] for (int i = 0; i < kMaxList; ++i)
+        if (i < gCount)
+            seeds[b * pc.maxSeeds + i] = gList[i];
+    seedCount[b] = gCount;
+}

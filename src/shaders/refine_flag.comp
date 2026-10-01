@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define NO_BLOCK_CACHE
+#include "refine_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// The blocks the fallback searches: those whose SAD is still above badSad, appended to a list
+// whose length is also the fallback's indirect dispatch size. One lane per block; dispatched as
+// ((nbx * nby + 63) / 64, 1) workgroups.
+layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= uint(pc.nbx * pc.nby) || sadA[b] <= pc.badSad)
+        return;
+    flagged[atomicAdd(dispatchX, 1u)] = b;
+}

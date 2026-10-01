@@ -1,0 +1,102 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "refine_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// One checkerboard pass over the blocks of colour pc.colour, (bx + by) % 2 == colour: each tries
+// its seeds, its four neighbours' vectors and then the 8 positions one pixel around the winner,
+// under Analyse's cost. Neighbours are of the other colour, so nothing read here changes during the
+// dispatch. 8 blocks of the colour per workgroup in a row, 8 lanes per block: lane i costs seeds i
+// and i + 8 and measures and costs neighbour i (lanes 0-3), then position i around the winner, and
+// each step's best comes from one minimum of CandidateKey over the group, in the CPU's order of
+// seeds, then neighbours, then positions. Blocks whose inputs haven't changed since their last
+// evaluation are skipped (see LastChange). Dispatched as (((nbx + 1) / 2 + 7) / 8, nby).
+void main() {
+    uint lane = WorkgroupLane();
+    int group = int(lane >> 3u), sub = int(lane & 7u);
+    int by = int(gl_WorkGroupID.y);
+    int bx = 2 * (int(gl_WorkGroupID.x) * 8 + group) + ((by + pc.colour) & 1);
+    bool live = bx < pc.nbx;
+    bx = min(bx, pc.nbx - 1);
+    int b = by * pc.nbx + bx;
+    if (live) {
+        int seen = lastEval[b];
+        bool dirty = lastChange[b] >= seen;
+        if (bx > 0) dirty = dirty || lastChange[b - 1] > seen;
+        if (bx + 1 < pc.nbx) dirty = dirty || lastChange[b + 1] > seen;
+        if (by > 0) dirty = dirty || lastChange[b - pc.nbx] > seen;
+        if (by + 1 < pc.nby) dirty = dirty || lastChange[b + pc.nbx] > seen;
+        live = dirty;
+    }
+    LoadBlock(group, sub, 8, bx, by, live);
+    barrier();
+
+    ivec2 p;
+    int64_t lambda;
+    Context(b, p, lambda);
+    ivec2 best = vecA[b];
+    int bestSad = sadA[b];
+    int64_t bestCost = Cost(bestSad, best, p, lambda);
+
+    // The seeds (SADs measured at init), then the neighbours' vectors: one minimum. A neighbour
+    // equal to the best so far, which the CPU skips, has its cost and can't win either.
+    int count = live ? seedCount[b] : 0;
+    uint64_t mine = kNoKey;
+    ivec2 myV = ivec2(0);
+    int myS = 0;
+    for (int k = sub; k < count; k += 8) {
+        ivec2 v = seeds[b * pc.maxSeeds + k];
+        int s = seedSad[b * pc.maxSeeds + k];
+        uint64_t key = CandidateKey(Cost(s, v, p, lambda), k);
+        if (key < mine) {
+            mine = key;
+            myV = v;
+            myS = s;
+        }
+    }
+    int nbs[4] = int[4](bx > 0 ? b - 1 : -1, bx + 1 < pc.nbx ? b + 1 : -1, by > 0 ? b - pc.nbx : -1, by + 1 < pc.nby ? b + pc.nbx : -1);
+    if (live && sub < 4 && nbs[sub] >= 0) {
+        ivec2 v = ClampVec(vecA[nbs[sub]]);
+        int s = LaneSad(v);
+        uint64_t key = CandidateKey(Cost(s, v, p, lambda), count + sub);
+        if (key < mine) {
+            mine = key;
+            myV = v;
+            myS = s;
+        }
+    }
+    uint64_t win = subgroupClusteredMin(mine, 8u);
+    int owner = KeyLane(win);
+    ivec2 wv = ivec2(FromLane(myV.x, owner, 8), FromLane(myV.y, owner, 8));
+    int ws = FromLane(myS, owner, 8);
+    if (win != kNoKey && KeyCost(win) < bestCost) {
+        bestCost = KeyCost(win);
+        best = wv;
+        bestSad = ws;
+    }
+
+    // The 8 positions one pixel around the winner
+    ivec2 c0 = best;
+    ivec2 v = ClampVec(c0 + Around(sub, 2));
+    int s = live ? LaneSad(v) : 0;
+    win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
+    owner = KeyLane(win);
+    wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
+    ws = FromLane(s, owner, 8);
+    if (win != kNoKey && KeyCost(win) < bestCost) {
+        bestCost = KeyCost(win);
+        best = wv;
+        bestSad = ws;
+    }
+    if (live && sub == 0) {
+        atomicAdd(counters[2 * pc.stamp], 1u);
+        if (best != vecA[b]) {
+            lastChange[b] = pc.stamp;
+            atomicAdd(counters[2 * pc.stamp + 1], 1u);
+        }
+        lastEval[b] = pc.stamp;
+        vecA[b] = best;
+        sadA[b] = bestSad;
+    }
+}
