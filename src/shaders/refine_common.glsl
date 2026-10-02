@@ -6,8 +6,8 @@
 // each lane measuring one candidate vector of its block; in the fallback a workgroup of one
 // subgroup works on one block and spreads the positions it searches over its lanes. A block's
 // group picks its best candidate with one clustered minimum (CandidateKey). Planes, SAD, clamp,
-// predictor and cost follow the CPU reference (probe/seedrefine.cpp) exactly, so the result is
-// bit-identical to it, whatever the subgroup size. The SAD reads whole words and works on 4 pixels
+// predictor and cost follow the CPU reference (test/reference/reference.cpp) exactly, so the result
+// is bit-identical to it, whatever the subgroup size. The SAD reads whole words and works on 4 pixels
 // at a time (LaneSad).
 //
 // VulkanContext.cpp expands the #include lines before compiling, since the core's compiler has
@@ -44,20 +44,9 @@ uint WorkgroupLane() {
 // frames' strides, whole words, so every row starts on a word. LaneSad reads the reference frame's
 // planes as 32-bit words, up to two past a row's last pixel, so the storage frames carry a spare row
 // at the end.
-// super.comp builds them, so it writes them; every other kernel only reads them.
-#ifdef SUPER_BUILD
-#define PLANE_ACCESS
-#else
-#define PLANE_ACCESS readonly
-#endif
-layout(std430, set = 0, binding = 0) PLANE_ACCESS buffer CurLuma { uint8_t curY[]; };
+layout(std430, set = 0, binding = 0) readonly buffer CurLuma { uint8_t curY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer RefLuma { uint refY[]; };
-layout(std430, set = 0, binding = 2) PLANE_ACCESS buffer CurChroma { uint8_t curC[]; };
-#ifdef SUPER_BUILD
-// super.comp also reads and writes them as whole words: every row starts on one
-layout(std430, set = 0, binding = 0) buffer CurLumaWords { uint curYW[]; };
-layout(std430, set = 0, binding = 2) buffer CurChromaWords { uint curCW[]; };
-#endif
+layout(std430, set = 0, binding = 2) readonly buffer CurChroma { uint8_t curC[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint refC[]; };
 // Up to maxSeeds seed vectors per block (half-pels), their count, and their SADs once measured;
 // seed_build.comp writes the seeds, the other kernels only read them
@@ -87,7 +76,7 @@ layout(std430, set = 0, binding = 13) buffer LastEval { int lastEval[]; };
 layout(std430, set = 0, binding = 14) buffer Counters { uint counters[]; };
 // Binding 15 is the fallback's block list (refine_flag.comp, refine_fallback.comp); 16 to 28
 // belong to the coarse search and seed building (pyr_common.glsl), 26 is the output field
-// (refine_halfpel.comp) and 29 to 31 the frame super.comp builds from
+// (refine_halfpel.comp, refine_qpel.comp)
 
 // Matches the Params struct in VulkanContext.h
 layout(push_constant) uniform Params {
@@ -109,9 +98,14 @@ layout(push_constant) uniform Params {
     int coarseBase;  // seed building: where the field's coarse result starts in Coarse, in vectors
 } pc;
 
-// The target grid's block size, 8 or 16 (specialization constant 3): luma kBlk x kBlk, U and V
+// The target grid's block size, 8, 16 or 32 (specialization constant 3): luma kBlk x kBlk, U and V
 // kBlk / 2 square. The pyramid's levels always use 8x8 blocks (pyr_common.glsl).
 layout(constant_id = 3) const int kBlk = 8;
+
+// The search's variant (specialization constant 6): bit 0 set when the SAD is luma's alone
+// (Analyse's chroma=False), at every level
+layout(constant_id = 6) const int kVariant = 0;
+const bool kChroma = (kVariant & 1) == 0;
 
 // The vectors' units per pixel, the super's pel, 2 or 4 (specialization constant 5). The super
 // holds luma's four half-pel planes either way, and chroma's four at pel 2 or its quarter-pel image
@@ -125,8 +119,7 @@ const int kRowWords = kBlk / 4;                        // words of 4 pixels in a
 const int kRowWordsC = kBlk / 8;                       // and in a chroma row
 const int kLumaWords = kBlk * kRowWords;
 const int kChromaWords = kBlk / 2 * kRowWordsC;        // per chroma plane
-const int kBlockWords = kLumaWords + 2 * kChromaWords;
-const int kCurStride = 2 * kBlockWords;                // sCur entries per block
+const int kBlockWords = kLumaWords + (kChroma ? 2 * kChromaWords : 0);
 
 // Where V's samples start, past U's
 uint ChromaV() {
@@ -142,22 +135,43 @@ int ChromaRow() {
     return kPel == 4 ? 16 * pc.wc : pc.wc;
 }
 
-// The current pixels of the workgroup's blocks, kCurStride entries per block (see LoadBlock), or
-// kLevelStride for the pyramid's 8x8 blocks (LoadLevelBlock, in kernels that define LEVEL_BLOCKS).
-// Sized to what the kernel uses, BLOCKS_PER_WORKGROUP blocks (8 unless the kernel says 1), since a
-// larger array would hold fewer workgroups on a compute unit. Kernels that measure no SADs define
+// The current pixels of the workgroup's blocks, kBlockWords words of 4 pixels per block (see
+// LoadBlock), or kLevelWords for the pyramid's 8x8 blocks (LoadLevelBlock, in kernels that define
+// LEVEL_BLOCKS), kCurWords entries each: expanded, two words of 16-bit halves holding c * 256 + 255
+// each, the form PackedStep compares; or packed, the 4 pixels themselves, expanded where
+// PackedStep reads them, which costs a few instructions per word and halves the cache. Only the
+// 32x32 blocks' kernels that cache 8 blocks pack it: expanded, their 24 KB held so few workgroups on
+// a compute unit that init, the passes and the half-pel step ran 31-48% slower; at 8x8 and 16x16,
+// or with one block per workgroup, the expanded form ran 2-27% faster (RX 6900 XT). Sized to what
+// the kernel uses, BLOCKS_PER_WORKGROUP blocks (8 unless the kernel says 1), since a larger array
+// would hold fewer workgroups on a compute unit. Kernels that measure no SADs define
 // NO_BLOCK_CACHE and go without it, and without the functions using it: the core compiles without
 // an optimizer, so an unused shared array would stay and count against the kernel's shared memory.
-const int kLevelStride = 48;
+const int kLevelWords = 24;
 #ifndef BLOCKS_PER_WORKGROUP
 #define BLOCKS_PER_WORKGROUP 8
 #endif
+#if defined(LEVEL_BLOCKS) || BLOCKS_PER_WORKGROUP == 1
+const int kCurWords = 2;
+#else
+const int kCurWords = kBlk >= 32 ? 1 : 2;
+#endif
 #ifndef NO_BLOCK_CACHE
 #ifdef LEVEL_BLOCKS
-shared int sCur[BLOCKS_PER_WORKGROUP * kLevelStride];
+shared int sCur[BLOCKS_PER_WORKGROUP * kCurWords * kLevelWords];
 #else
-shared int sCur[BLOCKS_PER_WORKGROUP * kCurStride];
+shared int sCur[BLOCKS_PER_WORKGROUP * kCurWords * kBlockWords];
 #endif
+
+// Word k of the cache (counted over the workgroup's blocks), pixels b0 .. b3, in the kernel's form
+void StoreWord(int k, uint b0, uint b1, uint b2, uint b3) {
+    if (kCurWords == 2) {
+        sCur[2 * k] = int(0x00FF00FFu | (b0 << 8u) | (b2 << 24u));
+        sCur[2 * k + 1] = int(0x00FF00FFu | (b1 << 8u) | (b3 << 24u));
+    } else {
+        sCur[k] = int(b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u));
+    }
+}
 #endif
 
 int gGroup;   // the lane's block within the workgroup
@@ -166,9 +180,8 @@ uint gSumCur; // the sum of the block's current pixels (LaneSad)
 
 #ifndef NO_BLOCK_CACHE
 // Sets up the lane's block; the lanes of each group copy its current pixels to shared memory, as
-// kBlockWords words of 4 pixels: the luma rows, kRowWords words each, then U's rows, then V's.
-// Word k is kept as two entries at 2k: its pixels 0 and 2, then 1 and 3, each in a 16-bit half as
-// c * 256 + 255, the form PackedStep takes. The pixels' sum goes to every lane of the group. Every
+// kBlockWords words of 4 pixels: the luma rows, kRowWords words each, then U's rows, then V's
+// (without chroma, the luma rows alone). The pixels' sum goes to every lane of the group. Every
 // lane of the workgroup must call it and then barrier().
 void LoadBlock(int group, int sub, int lanesPerBlock, int bx, int by, bool live) {
     gGroup = group;
@@ -189,8 +202,7 @@ void LoadBlock(int group, int sub, int lanesPerBlock, int bx, int by, bool live)
                 }
                 partial += b[i];
             }
-            sCur[group * kCurStride + 2 * k] = int(0x00FF00FFu | (b[0] << 8u) | (b[2] << 24u));
-            sCur[group * kCurStride + 2 * k + 1] = int(0x00FF00FFu | (b[1] << 8u) | (b[3] << 24u));
+            StoreWord(group * kBlockWords + k, b[0], b[1], b[2], b[3]);
         }
     }
     gSumCur = lanesPerBlock == 8 ? subgroupClusteredAdd(partial, 8u) : subgroupAdd(partial);
@@ -280,16 +292,25 @@ void RunC(uint a, out uint r[kRowWordsC]) {
 }
 
 // The SAD as sum(a) + sum(c) - 2 * sum(min(a, c)) over the reference pixels a and the current
-// pixels c, exact in integers. One word r of 4 reference pixels against the block's word at
-// sCur[e], sCur[e + 1] (LoadBlock): r's pixel sum into sa with one 4 x 8-bit dot product, and the
-// sum of the 4 minimums into sm. The minimums come two at a time from 16-bit minimums: with a
-// reference pixel in the high byte of a 16-bit half (anything below it) and the current pixel kept
-// as c * 256 + 255, the high byte of the minimum is min(a, c) whatever the low byte holds; a dot
-// product weighting only the high bytes adds them up.
-void PackedStep(uint r, int e, inout uint sa, inout uint sm) {
+// pixels c, exact in integers. One word r of 4 reference pixels against word k of the cache
+// (LoadBlock): r's pixel sum into sa with one 4 x 8-bit dot product, and the sum of the 4 minimums
+// into sm. The minimums come two at a time from 16-bit minimums: with a reference pixel in the high
+// byte of a 16-bit half (anything below it) and the current pixel as c * 256 + 255, the high byte
+// of the minimum is min(a, c) whatever the low byte holds; a dot product weighting only the high
+// bytes adds them up.
+void PackedStep(uint r, int k, inout uint sa, inout uint sm) {
+    uint ce, co;
+    if (kCurWords == 2) {
+        ce = uint(sCur[2 * k]);
+        co = uint(sCur[2 * k + 1]);
+    } else {
+        uint c = uint(sCur[k]);
+        ce = ((c << 8u) & 0xFF00FF00u) | 0x00FF00FFu;
+        co = (c & 0xFF00FF00u) | 0x00FF00FFu;
+    }
     sa = dotPacked4x8AccSatEXT(r, 0x01010101u, sa);
-    uint even = pack32(min(unpack16(r << 8u), unpack16(uint(sCur[e]))));
-    uint odd = pack32(min(unpack16(r), unpack16(uint(sCur[e + 1]))));
+    uint even = pack32(min(unpack16(r << 8u), unpack16(ce)));
+    uint odd = pack32(min(unpack16(r), unpack16(co)));
     sm = dotPacked4x8AccSatEXT(even, 0x01000100u, sm);
     sm = dotPacked4x8AccSatEXT(odd, 0x01000100u, sm);
 }
@@ -303,7 +324,8 @@ const int kRowChunk = 4;
 const int kLumaChunk = 32 / kBlk, kChromaChunk = 32 / kBlk;
 
 #ifndef NO_BLOCK_CACHE
-// MVUtensils' SAD of the lane's block for vector v: luma kBlk x kBlk plus U and V at half that.
+// MVUtensils' SAD of the lane's block for vector v: luma kBlk x kBlk plus U and V at half that, or
+// luma alone without chroma.
 // Each reference row comes as whole words, aligned with funnel shifts. The rows start on whole
 // words (the storage frames' strides are), so every row of the block sits at the same offset in its
 // words. At pel 4 the luma vector is on the half-pel grid (ClampHalf, ClampFull), and the chroma
@@ -317,7 +339,7 @@ int LaneSad(ivec2 v) {
     int idx = (X & 1) | ((Y & 1) << 1);
     uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
     uint w = a >> 2u, shift = (a & 3u) << 3u, stride = uint(pc.wp) >> 2u;
-    int cur = gGroup * kCurStride;
+    int cur = gGroup * kBlockWords;
     uint sa = 0u, sm = 0u;
     for (int j0 = 0; j0 < pc.blockRows; j0 += kLumaChunk) {
         [[unroll]] for (int jj = 0; jj < kLumaChunk; ++jj) {
@@ -326,13 +348,15 @@ int LaneSad(ivec2 v) {
             uint lo = refY[wj];
             [[unroll]] for (int i = 0; i < kRowWords; ++i) {
                 uint hi = refY[wj + uint(i) + 1u];
-                PackedStep(Bytes4(lo, hi, shift), cur + 2 * (j * kRowWords + i), sa, sm);
+                PackedStep(Bytes4(lo, hi, shift), cur + j * kRowWords + i, sa, sm);
                 lo = hi;
             }
         }
     }
+    if (!kChroma)
+        return int(sa + gSumCur - 2u * sm);
     int Xc = kPel * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = kPel * (gY / 2 + pc.padc) + ChromaComponent(v.y);
-    int curU = cur + 2 * kLumaWords, curV = curU + 2 * kChromaWords;
+    int curU = cur + kLumaWords, curV = curU + kChromaWords;
     uint ac = ChromaAddr(Xc, Yc);
     if (kPel == 4) {
         uint av = ac + ChromaV(), rowC = uint(ChromaRow());
@@ -341,8 +365,8 @@ int LaneSad(ivec2 v) {
                 int j = j0 + jj;
                 uint u = ac + uint(j) * rowC, t = av + uint(j) * rowC;
                 [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-                    PackedStep(Strided4(u + uint(16 * i)), curU + 2 * (j * kRowWordsC + i), sa, sm);
-                    PackedStep(Strided4(t + uint(16 * i)), curV + 2 * (j * kRowWordsC + i), sa, sm);
+                    PackedStep(Strided4(u + uint(16 * i)), curU + j * kRowWordsC + i, sa, sm);
+                    PackedStep(Strided4(t + uint(16 * i)), curV + j * kRowWordsC + i, sa, sm);
                 }
             }
         }
@@ -356,8 +380,8 @@ int LaneSad(ivec2 v) {
             uint loU = refC[u], loV = refC[t];
             [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
                 uint hiU = refC[u + uint(i) + 1u], hiV = refC[t + uint(i) + 1u];
-                PackedStep(Bytes4(loU, hiU, shiftC), curU + 2 * (j * kRowWordsC + i), sa, sm);
-                PackedStep(Bytes4(loV, hiV, shiftC), curV + 2 * (j * kRowWordsC + i), sa, sm);
+                PackedStep(Bytes4(loU, hiU, shiftC), curU + j * kRowWordsC + i, sa, sm);
+                PackedStep(Bytes4(loV, hiV, shiftC), curV + j * kRowWordsC + i, sa, sm);
                 loU = hiU;
                 loV = hiV;
             }

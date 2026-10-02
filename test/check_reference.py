@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """mvgpu.Super + mvgpu.AnalyseMany (or Analyse per delta) against the CPU reference, byte for byte.
 
-The reference is a vector file from the prototype's CPU implementation (probe/seedrefine.cpp,
---out), run on the same raw 8-bit NV12 frames with matching settings, for example
+The reference is test/reference/reference.cpp, the search in plain C++. With --reference the script
+runs it on the frames it gives mvgpu, dumped as raw planar frames, with the same arguments; with
+--ref it reads a vector file the reference wrote before. Every field the reference holds is
+compared: x, y and SAD of every block.
 
-    seedrefine --src noisy.nv12 --size 1920x1080 --frames 52 --grid mvu_full_16_8.bin
-               --blksize 16 --overlap 8 --seeds pyramid --fallback 40 --fallback-step 2
-               --badsad 4000 --pairs 1 --out ref.bin
+    check_reference.py --src noisy.nv12 --size 1920x1080 --frames 52 --reference reference.exe
+                       [--blksize 16] [--overlap 8] [--pel 2] [--pad 16] [--radius 2] [--delta 1]
+                       [--standalone] [--chroma 0] [--plevel 2] [--mvlambda 1000] [--lsad 400]
+                       [--badsad 1000] [--badrange 40] [--badstep 2] [--crop WxH] [--work DIR]
 
-which corresponds to
-
-    check_reference.py --src noisy.nv12 --size 1920x1080 --frames 52 --ref ref.bin
-                       --blksize 16 --overlap 8 --badsad 1000 --badrange 40 --badstep 2
-
-(seedrefine's --badsad is the threshold for the block itself, mvgpu's per 8x8 block, so it is
-scaled by blksize^2 / 64; seedrefine --no-chain matches --standalone, --pel 4 matches --pel 4). Every field the reference
-holds is compared: x, y and SAD of every block.
+--standalone makes an Analyse per delta, without chained or inverted seeds, instead of AnalyseMany.
+--crop crops the frames first, for grids that end inside a block. --work keeps the dumped frames
+and the reference's vectors in that directory instead of a temporary one.
 """
 import argparse
+import os
+import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import vapoursynth as vs
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
+from mvtest import nv12_clip  # noqa: E402
 
 
 def load_fields(path):
@@ -38,21 +42,12 @@ def load_fields(path):
     return out
 
 
-def nv12_clip(core, path, w, h, frames):
-    """Raw NV12 frames as a YUV420P8 clip"""
-    size = w * h * 3 // 2
-    raw = np.memmap(path, np.uint8, 'r', shape=(frames, size))
-    blank = core.std.BlankClip(width=w, height=h, format=vs.YUV420P8, length=frames)
-
-    def fill(n, f):
-        out = f.copy()
-        np.asarray(out[0])[:, :] = raw[n, :w * h].reshape(h, w)
-        uv = raw[n, w * h:].reshape(h // 2, w // 2, 2)
-        np.asarray(out[1])[:, :] = uv[:, :, 0]
-        np.asarray(out[2])[:, :] = uv[:, :, 1]
-        return out
-
-    return core.std.ModifyFrame(blank, blank, fill)
+def dump(clip, path):
+    """The clip's frames as raw planar Y, U, V"""
+    with open(path, 'wb') as f:
+        for frame in clip.frames():
+            for p in range(frame.format.num_planes):
+                f.write(np.asarray(frame[p]).tobytes())
 
 
 def main():
@@ -60,15 +55,27 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
-    ap.add_argument('--ref', required=True, help='the CPU reference vector file')
+    ref = ap.add_mutually_exclusive_group(required=True)
+    ref.add_argument('--reference', help='the reference executable, run with matching arguments')
+    ref.add_argument('--ref', help='a vector file the reference wrote')
     ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--pel', type=int, default=2)
     ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--pel', type=int, default=2)
+    ap.add_argument('--pad', type=int, default=16)
     ap.add_argument('--radius', type=int, default=2)
+    ap.add_argument('--delta', type=int, default=1, help="AnalyseMany's delta, the frames between its fields")
+    ap.add_argument('--standalone', action='store_true', help='an Analyse per delta: no chained or inverted seeds')
+    ap.add_argument('--chroma', type=int, default=1)
+    ap.add_argument('--plevel', type=int, default=1)
+    ap.add_argument('--mvlambda', type=int, default=1000)
+    ap.add_argument('--lsad', type=int, default=400)
     ap.add_argument('--badsad', type=int, default=1000)
     ap.add_argument('--badrange', type=int, default=40)
     ap.add_argument('--badstep', type=int, default=2)
-    ap.add_argument('--standalone', action='store_true', help='an Analyse per delta: no chained or inverted seeds')
+    ap.add_argument('--crop', help='WxH: crop the frames to this size first')
+    ap.add_argument('--work', help='a directory to keep the dumped frames and the reference vectors in')
+    ap.add_argument('--verbose', action='store_true', help='list every field with differing blocks')
+    ap.add_argument('--dump', help="write mvgpu's fields to this file, in the reference's format")
     ap.add_argument('--plugin', help='the MVGPUtensils library to load, unless it autoloads')
     args = ap.parse_args()
 
@@ -76,16 +83,44 @@ def main():
     if args.plugin:
         core.std.LoadPlugin(args.plugin)
     w, h = (int(v) for v in args.size.split('x'))
-    ref = load_fields(args.ref)
-    clip = core.std.GPUUpload(nv12_clip(core, args.src, w, h, args.frames))
-    sup = core.mvgpu.Super(clip, blksize=args.blksize, overlap=args.overlap, pel=args.pel)
-    kw = dict(badsad=args.badsad, badrange=args.badrange, badstep=args.badstep)
-    if args.standalone:
-        fields = [core.mvgpu.Analyse(sup, delta=s * r, **kw) for r in range(1, args.radius + 1) for s in (1, -1)]
+    clip = nv12_clip(core, args.src, w, h, args.frames)
+    if args.crop:
+        w, h = (int(v) for v in args.crop.split('x'))
+        clip = core.std.CropAbs(clip, w, h)
+
+    search = dict(chroma=args.chroma, plevel=args.plevel, mvlambda=args.mvlambda, lsad=args.lsad, badsad=args.badsad, badrange=args.badrange,
+                  badstep=args.badstep)
+    if args.reference:
+        work = args.work or tempfile.mkdtemp(prefix='mvgpu_reference_')
+        os.makedirs(work, exist_ok=True)
+        frames, vectors = os.path.join(work, 'frames.yuv'), os.path.join(work, 'reference.bin')
+        cmd = [args.reference, '--src', frames, '--size', f'{w}x{h}', '--frames', str(args.frames), '--out', vectors, '--format', '420',
+               '--blksize', str(args.blksize), '--overlap', str(args.overlap), '--pel', str(args.pel), '--pad', str(args.pad),
+               '--radius', str(args.radius), '--delta', str(args.delta)] + (['--standalone'] if args.standalone else [])
+        for k, v in search.items():
+            cmd += [f'--{k}', str(v)]
+        try:
+            dump(clip, frames)
+            subprocess.run(cmd, check=True)
+            expected = load_fields(vectors)
+        finally:
+            if not args.work:
+                for f in (frames, vectors):
+                    if os.path.exists(f):
+                        os.remove(f)
+                os.rmdir(work)
     else:
-        fields = core.mvgpu.AnalyseMany(sup, radius=args.radius, **kw)
+        expected = load_fields(args.ref)
+
+    sup = core.mvgpu.Super(core.std.GPUUpload(clip), blksize=args.blksize, overlap=args.overlap, pel=args.pel, pad=args.pad)
+    if args.standalone:
+        fields = [core.mvgpu.Analyse(sup, delta=s * r * args.delta, **search) for r in range(1, args.radius + 1) for s in (1, -1)]
+    else:
+        fields = core.mvgpu.AnalyseMany(sup, radius=args.radius, delta=args.delta, **search)
 
     compared = differ = blocks = missing = 0
+    first = None
+    dumped = open(args.dump, 'wb') if args.dump else None
     for an in fields:
         delta = an.get_frame(0).props['MVGPUtensilsAnalysisDeltaFrame']
         # Frames whose reference frame is outside the clip carry no vectors, and PropToClip takes
@@ -93,16 +128,30 @@ def main():
         start, end = max(0, -delta), min(args.frames, args.frames - delta)
         vectors = core.std.GPUDownload(core.std.PropToClip(an[start:end], prop='MVGPUtensilsAnalysisVectors'))
         for n in range(start, end):
-            if (n, delta) not in ref:
+            if (n, delta) not in expected:
                 missing += 1
                 continue
-            nbx, nby, expected = ref[(n, delta)]
+            nbx, nby, exp = expected[(n, delta)]
             rec = np.asarray(vectors.get_frame(n - start)[0]).view(np.int32)[:, :4 * nbx].reshape(nby * nbx, 4)
-            differ += int(np.count_nonzero((rec[:, :3].T != expected).any(axis=0)))
+            if dumped:
+                dumped.write(np.array([n, delta, nbx, nby, args.pel, 1], np.int32).tobytes())
+                dumped.write(np.ascontiguousarray(rec[:, :3].T).tobytes())
+            bad = (rec[:, :3].T != exp).any(axis=0)
+            if bad.any() and first is None:
+                b = int(np.argmax(bad))
+                first = (n, delta, b % nbx, b // nbx, tuple(int(v) for v in rec[b, :3]), tuple(int(v) for v in exp[:, b]))
+            differ += int(np.count_nonzero(bad))
+            if args.verbose and bad.any():
+                b = int(np.argmax(bad))
+                print(f'field ({n}, {delta:+d}): {int(np.count_nonzero(bad))} blocks differ, first ({b % nbx}, {b // nbx}): mvgpu {tuple(int(v) for v in rec[b, :3])}, '
+                      f'reference {tuple(int(v) for v in exp[:, b])}')
             blocks += nbx * nby
             compared += 1
-    print(f'{compared} fields, {differ} of {blocks} blocks differ' + (f', {missing} fields missing from the reference' if missing else ''))
-    sys.exit(0 if differ == 0 and compared > 0 else 1)
+    if dumped:
+        dumped.close()
+    print(f'{compared} fields, {differ} of {blocks} blocks differ' + (f', {missing} fields missing from the reference' if missing else '')
+          + (f'; first in field ({first[0]}, {first[1]:+d}) at block ({first[2]}, {first[3]}): mvgpu {first[4]}, reference {first[5]}' if first else ''))
+    sys.exit(0 if differ == 0 and missing == 0 and compared > 0 else 1)
 
 
 if __name__ == '__main__':

@@ -32,20 +32,21 @@
 //   and the half-pel step stay, and the fallback stays on the full-pel grid; the quarter samples are
 //   computed from the super's half-pel planes (SuperLayout.h).
 //
-// The result is the CPU reference's (probe/seedrefine.cpp) bit for bit. The output frame is the
-// super frame with mvu.Analyse's properties and a vector frame (SuperLayout.h's ExportAnalysis).
+// The result is the CPU reference's (test/reference/reference.cpp) bit for bit. The output frame is
+// the super frame with mvu.Analyse's properties and a vector frame (SuperLayout.h's ExportAnalysis).
 //
 // AnalyseMany wires each field to the fields its seeds come from: (n, d) chains (n, u) and
 // (n + u, d - u), u the step toward d, and for d > 0 inverts (n + d, -d); Analyse on its own
 // seeds from the coarse search only.
 //
-// Implemented: chroma, mvlambda, lsad, badsad and badrange (the fallback's threshold and radius),
-// delta, prefix, plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults
-// are the tested ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which
-// this search would almost never reach, and badrange 24). search, searchparam,
-// pelsearch, levels, pnew, pzero, pglobal, globalmv, meander and trymany tune mvu's search, which
-// this one doesn't use; they are checked and otherwise ignored. satd, fields and chroma=False
-// aren't implemented yet, and blksize and overlap must be the super's.
+// Implemented: chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
+// scales it per level), badsad and badrange (the fallback's threshold and radius), delta, prefix,
+// plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults are the tested
+// ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which this search would
+// almost never reach, and badrange 24). search, searchparam, pelsearch, levels, pnew, pzero,
+// pglobal, globalmv, meander and trymany tune mvu's search, which this one doesn't use; they are
+// checked and otherwise ignored. satd and fields aren't implemented yet, and blksize and overlap
+// must be the super's.
 
 namespace {
 
@@ -56,9 +57,15 @@ constexpr int kPairs = 1;         // checkerboard pass pairs before the fallback
 constexpr int kTopRadius = 32;    // the exhaustive search's radius at the top level, px
 constexpr int kLevelPairs = 2;    // checkerboard pass pairs at every coarse level
 
-// Entries of the full-size grid's lambda table: (largest SAD of a block with chroma) >> 1, plus one
-constexpr int LambdaEntries(int blk) {
-    return blk * blk * 3 / 2 * 255 / 2 + 1;
+// Entries of the full-size grid's lambda table: (largest SAD of a block) >> 1, plus one
+constexpr int LambdaEntries(int blk, bool chroma) {
+    return blk * blk * (chroma ? 3 : 2) / 2 * 255 / 2 + 1;
+}
+
+// The search kernels' variant (specialization constant 6, refine_common.glsl): bit 0 for SADs of
+// luma alone
+int SearchVariant(bool chroma) {
+    return chroma ? 0 : 1;
 }
 
 struct Region {
@@ -343,6 +350,7 @@ struct AnalyseData {
     SuperLayout layout;
 
     int deltaFrame = 1;
+    bool chroma = true; // the SADs count chroma
     int badSad = 0;
     int fallbackRadius = 0;
     int fallbackStep = 1;
@@ -532,7 +540,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
 
         if (!hasRef) {
             VSFrame *dst = vsapi->copyFrame(src, core);
-            ExportAnalysis(dst, L, d->deltaFrame, nullptr, d->prefix, vsapi);
+            ExportAnalysis(dst, L, d->deltaFrame, d->chroma, nullptr, d->prefix, vsapi);
             vsapi->freeFrame(src);
             return dst;
         }
@@ -676,7 +684,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
         VSFrame *dst = vsapi->copyFrame(src, core);
-        ExportAnalysis(dst, L, d->deltaFrame, vectors, d->prefix, vsapi);
+        ExportAnalysis(dst, L, d->deltaFrame, d->chroma, vectors, d->prefix, vsapi);
         release();
         return dst;
     }
@@ -693,6 +701,8 @@ struct AnalyseArgs {
     SuperLayout layout;
     std::string prefix;
     int deltaFrame = 1;
+    bool chroma = true;
+    int plevel = 1;
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
     int badrange = 40, badstep = 2;
 
@@ -748,9 +758,9 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (pelSearch <= 0)
             throw std::runtime_error("pelsearch must be positive");
 
-        bool chroma = !!vsapi->mapGetInt(in, "chroma", 0, &err);
+        a.chroma = !!vsapi->mapGetInt(in, "chroma", 0, &err);
         if (err)
-            chroma = true;
+            a.chroma = true;
 
         a.deltaFrame = vsapi->mapGetIntSaturated(in, "delta", 0, &err);
         if (err)
@@ -766,9 +776,9 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (err)
             a.lsad = 400;
 
-        int plevel = vsapi->mapGetIntSaturated(in, "plevel", 0, &err);
+        a.plevel = vsapi->mapGetIntSaturated(in, "plevel", 0, &err);
         if (err)
-            plevel = 1;
+            a.plevel = 1;
 
         vsapi->mapGetInt(in, "globalmv", 0, &err);
 
@@ -805,7 +815,7 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (searchType < 0 || searchType > 5)
             throw std::runtime_error("search must be between 0 and 5");
 
-        if (plevel < 0 || plevel > 2)
+        if (a.plevel < 0 || a.plevel > 2)
             throw std::runtime_error("plevel must be between 0 and 2");
 
         if (pnew < 0 || pnew > 256)
@@ -831,10 +841,6 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
             throw std::runtime_error("blksize and overlap must be the super clip's; analysing another grid isn't implemented yet");
         if (useSatd)
             throw std::runtime_error("satd isn't implemented yet");
-        if (!chroma)
-            throw std::runtime_error("chroma=False isn't implemented yet");
-        if (plevel != 1)
-            throw std::runtime_error("only plevel=1 is implemented so far");
         if (fields)
             throw std::runtime_error("fields isn't implemented yet");
     } catch (...) {
@@ -858,18 +864,19 @@ VSNode *CreateCoarse(const AnalyseArgs &a, const std::vector<int> &deltas, VSCor
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    d->pyrTop = vc.Pipeline(Kernel::PyrTop, L.blk, 2);
-    d->pyrPass = vc.Pipeline(Kernel::PyrPass, L.blk, 2);
-    d->pyrSeed = vc.Pipeline(Kernel::PyrSeed, L.blk, 2);
+    const int variant = SearchVariant(a.chroma);
+    d->pyrTop = vc.Pipeline(Kernel::PyrTop, L.blk, 2, variant);
+    d->pyrPass = vc.Pipeline(Kernel::PyrPass, L.blk, 2, variant);
+    d->pyrSeed = vc.Pipeline(Kernel::PyrSeed, L.blk, 2, variant);
     d->median = vc.Pipeline(Kernel::Median, L.blk, 2);
 
-    // lambda for every (worst neighbour SAD) >> 1 per coarse level, mvlambda * 2^level relaxed by
-    // lsad as the CPU reference does in double precision
+    // lambda for every (worst neighbour SAD) >> 1 per coarse level, mvlambda * 2^(plevel * level)
+    // relaxed by lsad as the CPU reference does in double precision
     std::vector<int64_t> levelLambda(static_cast<size_t>(L.topLevel + 1) * SuperLayout::kLambdaEntries);
     for (int level = 0; level <= L.topLevel; ++level)
         for (int i = 0; i < SuperLayout::kLambdaEntries; ++i) {
             const double sc = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + i, 1);
-            levelLambda[static_cast<size_t>(level) * SuperLayout::kLambdaEntries + i] = static_cast<int64_t>((s.lambdaBlock << level) * sc * sc);
+            levelLambda[static_cast<size_t>(level) * SuperLayout::kLambdaEntries + i] = static_cast<int64_t>((s.lambdaBlock << (a.plevel * level)) * sc * sc);
         }
     Regions constants(vc);
     constants.Place(d->levelLambda, levelLambda.size() * 8);
@@ -921,6 +928,7 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     d->layout = a.layout;
     d->prefix = a.prefix;
     d->deltaFrame = delta;
+    d->chroma = a.chroma;
     if (stepNode && restNode) {
         d->stepNode = vsapi->addNodeRef(stepNode);
         d->restNode = vsapi->addNodeRef(restNode);
@@ -938,21 +946,21 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    const int pel = L.pel;
+    const int pel = L.pel, variant = SearchVariant(a.chroma);
     d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel);
     d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel);
-    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel);
-    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel);
+    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel, variant);
+    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel, variant);
     d->flag = vc.Pipeline(Kernel::RefineFlag, blk, pel);
-    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel);
+    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel, variant);
     d->apply = vc.Pipeline(Kernel::RefineApply, blk, pel);
-    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel);
+    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel, variant);
     if (pel == 4)
-        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel);
+        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel, variant);
 
     // lambda for every (worst neighbour SAD) >> 1, relaxed by lsad as the CPU reference does in
     // double precision
-    std::vector<int64_t> lambda(LambdaEntries(blk));
+    std::vector<int64_t> lambda(LambdaEntries(blk, a.chroma));
     for (size_t i = 0; i < lambda.size(); ++i) {
         const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + static_cast<int64_t>(i), 1);
         lambda[i] = static_cast<int64_t>(s.lambda0 * scale * scale);

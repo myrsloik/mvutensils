@@ -20,16 +20,18 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
   (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
   the GPU search's own, reduced with `rfilter`'s filter.
-* `Analyse` so far takes 8-bit 4:2:0 supers at `pel=2` or `pel=4` with square blocks of 8×8 or
-  16×16, and `Degrain`, `FlowInter` and `FlowFPS` 8-bit 4:2:0 and 4:4:4 supers at `pel=2` or
-  `pel=4` with square blocks of 8×8, 16×16 or 32×32; all with the same overlap and padding
-  horizontally and vertically, MVUtensils' extended grids included. Other supers, and the Analyse values not implemented yet (`satd`,
-  `fields`, `chroma=False`, an Analyse grid other than the super's), are errors.
+* `Analyse` so far takes 8-bit 4:2:0 supers, and `Degrain`, `FlowInter` and `FlowFPS` 8-bit 4:2:0
+  and 4:4:4 supers, at `pel=2` or `pel=4` with square blocks of 8×8, 16×16 or 32×32; all with the
+  same overlap and padding horizontally and vertically, MVUtensils' extended grids included. Other
+  supers, and the Analyse values not implemented yet (`satd`, `fields`, an Analyse grid other than
+  the super's), are errors.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
-  checkerboard passes under mvu's cost (`mvlambda`, `lsad`), a wide search for the blocks still
+  checkerboard passes under mvu's cost (`mvlambda`, `lsad`; `plevel` scales the coarse levels'
+  lambda as mvu scales it per level), a wide search for the blocks still
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
   half-pel step. At `pel=4` the seeds and the passes stay on the half-pel grid (chained and
   inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the half-pel one.
+  With `chroma=False` every SAD is luma's alone, at every level.
   `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`, `globalmv`,
   `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
   The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
@@ -61,13 +63,15 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   vectors, mvu.Analyse's, or constant fields with scene changes in between). mvu resizes the blocks'
   vectors and occlusion masks to the pixels with zimg's bilinear resize, in 64×64 tiles; the GPU
   does the same arithmetic, the taps computed for each tile as zimg computes them.
-* `test/matrix.py` runs the checks over their case matrices (`super`, `degrain`, `flow`) on a
-  directory of raw test clips.
+* `test/matrix.py` runs the checks over their case matrices (`super`, `analyse`, `degrain`, `flow`)
+  on a directory of raw test clips.
 * With the environment variable `MVGPU_PROFILE=1`, `Super`, `Analyse`, `Degrain`, `FlowInter` and
   `FlowFPS` time their stages on the GPU and print the averages to stderr when the filter is freed.
   They wait for every frame, so they run slower.
-* The search's results are bit-identical to its CPU reference implementation
-  (`test/check_reference.py`).
+* The search's results are bit-identical to its CPU reference implementation,
+  `test/reference/reference.cpp` (built with `meson compile mvgpu_reference`, or on its own with any
+  C++20 compiler); `test/check_reference.py --reference` runs it on the same frames with the same
+  arguments and compares every block.
 * Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics,
   and for `Degrain` 158 storage buffers per kernel (2 · 25 references with three buffers each).
   Building needs the Vulkan headers (`-Dvulkan_include=` for meson, the Vulkan SDK for

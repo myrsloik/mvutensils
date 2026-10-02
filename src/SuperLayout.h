@@ -113,9 +113,9 @@ struct SuperLayout {
     // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
     // compensate motion with its vectors (Degrain)
     enum class Use { Search, Compensation };
-    // What they implement so far: 8-bit at pel 2 or 4, square blocks with the same overlap and
-    // padding either way; the search 4:2:0 with blocks of 8 or 16, the others 4:2:0 or 4:4:4 with
-    // blocks of 8, 16 or 32. Empty when the layout is one of those, else what it lacks.
+    // What they implement so far: 8-bit at pel 2 or 4, square blocks of 8, 16 or 32 with the same
+    // overlap and padding either way, the padding even with subsampled chroma; the search 4:2:0, the
+    // others 4:2:0 or 4:4:4. Empty when the layout is one of those, else what it lacks.
     std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;
@@ -155,8 +155,8 @@ VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *
 
 // The analysis description mvu.Analyse attaches, under the same names, plus the vector frame when
 // there is one: a 32-bit record (x, y, SAD, 0) per block, vectors in 1 / pel pixels, a row of records
-// per row of blocks
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi);
+// per row of blocks. chroma: whether the SADs count chroma.
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi);
 
 // The vector frame attached to an analysis frame, a new reference, or null
 const VSFrame *GetAnalysisVectors(const VSFrame *frame, const std::string &prefix, const VSAPI *vsapi);

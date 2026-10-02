@@ -102,3 +102,10 @@ shared_module('mvgputensils',
     install_dir: plugindir,
     name_prefix: '',
 )
+
+# The search's CPU reference, for test/check_reference.py; built on request (meson compile
+# mvgpu_reference), never installed
+executable('mvgpu_reference', 'test/reference/reference.cpp',
+    build_by_default: false,
+    install: false,
+)

@@ -138,14 +138,16 @@ std::string SuperLayout::Unsupported(Use use) const {
         return "only 8-bit 4:2:0 and 4:4:4 supers are implemented so far";
     if (pel != 2 && pel != 4)
         return "only supers with pel=2 or pel=4 are implemented so far";
-    if (search && (blk != blkY || (blk != 8 && blk != 16)))
-        return "only supers with 8x8 or 16x16 blocks are implemented so far";
     if (blk != blkY || (blk != 8 && blk != 16 && blk != 32))
         return "only supers with 8x8, 16x16 or 32x32 blocks are implemented so far";
     if (overlap != overlapY)
         return "only supers with the same overlap horizontally and vertically are implemented so far";
     if (pad != padY)
         return "only supers with the same padding horizontally and vertically are implemented so far";
+    // Chroma's padding is luma's divided by the subsampling: an odd one leaves the reach of luma's
+    // vectors half a pixel short, where mvu reads outside the planes
+    if (pad % format.xr || padY % format.yr)
+        return "with subsampled chroma the padding must be even, or chroma would be read outside its padding";
     if (nbx < 1 || nby < 1)
         return "the frame is too small to hold a single block at this block size and overlap";
     return {};
@@ -287,7 +289,7 @@ bool SameStorage(const SuperLayout &a, const SuperLayout &b) {
            a.pel == b.pel;
 }
 
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi) {
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi) {
     VSMap *props = vsapi->getFramePropertiesRW(dst);
     auto set = [&](const char *name, int64_t v) { vsapi->mapSetInt(props, (prefix + name).c_str(), v, maReplace); };
     set("AnalysisWidth", layout.aw);
@@ -298,7 +300,7 @@ void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, const VS
     set("AnalysisVPad", layout.padY);
     set("AnalysisPel", layout.pel);
     set("AnalysisLevels", layout.topLevel + 1);
-    set("AnalysisChroma", layout.format.chroma);
+    set("AnalysisChroma", chroma && layout.format.chroma);
     set("AnalysisXRatioUV", layout.format.xr);
     set("AnalysisYRatioUV", layout.format.yr);
     set("AnalysisBlkSizeX", layout.blk);

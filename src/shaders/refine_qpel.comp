@@ -15,9 +15,9 @@ layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; 
 // of its position's neighbours, the two of a coordinate on the grid being the same run: the 8
 // positions around a vector all differ in phase, so reading only what each needs would only make
 // the lanes diverge (probe/qpel_bench.cpp measured it slower). Chroma comes from its quarter-pel
-// image.
+// image, unless the SAD is luma's alone.
 int LaneSadQuarter(ivec2 v) {
-    int cur = gGroup * kCurStride;
+    int cur = gGroup * kBlockWords;
     uint sa = 0u, sm = 0u;
     int X = 4 * (gX + pc.pad) + v.x, Y = 4 * (gY + pc.pad) + v.y;
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
@@ -30,18 +30,20 @@ int LaneSadQuarter(ivec2 v) {
         RunY(ba + o, r2);
         RunY(bb + o, r3);
         [[unroll]] for (int i = 0; i < kRowWords; ++i)
-            PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), cur + 2 * (j * kRowWords + i), sa, sm);
+            PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), cur + j * kRowWords + i, sa, sm);
     }
+    if (!kChroma)
+        return int(sa + gSumCur - 2u * sm);
     int Xc = 4 * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = 4 * (gY / 2 + pc.padc) + ChromaComponent(v.y);
     uint ac = ChromaAddr(Xc, Yc);
-    int curU = cur + 2 * kLumaWords;
+    int curU = cur + kLumaWords;
     for (int j = 0; j < pc.blockRows / 2; ++j) {
         [[unroll]] for (int p = 0; p < 2; ++p) {
             uint r[kRowWordsC];
             RunC(ac + uint(p) * ChromaV() + uint(j * ChromaRow()), r);
-            int at = curU + p * 2 * kChromaWords + 2 * j * kRowWordsC;
+            int at = curU + p * kChromaWords + j * kRowWordsC;
             [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
-                PackedStep(r[i], at + 2 * i, sa, sm);
+                PackedStep(r[i], at + i, sa, sm);
         }
     }
     return int(sa + gSumCur - 2u * sm);

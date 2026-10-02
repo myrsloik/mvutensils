@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """The test matrices: each suite runs one of the check scripts over its cases and counts failures.
 
-    matrix.py super|degrain|flow [--clips DIR] [--plugin MVGPUtensils.dll] [--only TEXT] [--list]
+    matrix.py super|analyse|degrain|flow [--clips DIR] [--plugin MVGPUtensils.dll] [--reference EXE]
+              [--only TEXT] [--list]
 
   super    check_super.py: mvgpu.Super against mvu.Super over formats, pels, filters, pelclips,
            grids and paddings
+  analyse  check_reference.py: mvgpu.AnalyseMany and Analyse against the CPU reference
+           (test/reference/reference.cpp, --reference) over block sizes, overlaps, pels, chroma,
+           plevel, radii, deltas, the fallback's and the cost's arguments and paddings
   degrain  check_degrain.py: mvgpu.Degrain against mvu.Degrain over formats, block sizes, pels,
            radii and every argument; on mvgpu.AnalyseMany's vectors where it searches the grid, on
            mvu.Analyse's elsewhere
@@ -13,7 +17,8 @@
            grid, on mvu.Analyse's elsewhere, and on constant fields with scene changes in between
 
 --clips is the directory of test clips, NAME/noisy.nv12 for the clips in CLIPS below (raw 8-bit
-NV12). --only runs the cases whose label contains TEXT. Each case prints the check's last line.
+NV12). --reference (or MVGPU_REFERENCE) is the built CPU reference, for the analyse suite. --only
+runs the cases whose label contains TEXT. Each case prints the check's last line.
 """
 import argparse
 import os
@@ -60,6 +65,67 @@ def super_cases():
     return [(' '.join(c), 'football_fast_s3', ['--frames', '2'] + c) for c in cases]
 
 
+def analyse_cases():
+    ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
+    cases = []
+    # Every block size and pel, overlap half a block, AnalyseMany with radius 2
+    for blk in (8, 16, 32):
+        for pel in (2, 4):
+            cases.append((f'{blk}/{blk // 2} pel {pel}', ff, ['--frames', '10', '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel)]))
+
+    def grid(blk, overlap, pel=2):
+        return ['--blksize', str(blk), '--overlap', str(overlap), '--pel', str(pel)]
+
+    cases += [
+        # chroma=False and plevel, at every level of the search
+        ('chroma 0 8/4', ff, ['--frames', '10', '--chroma', '0'] + grid(8, 4)),
+        ('chroma 0 16/8 pel 4', ff, ['--frames', '10', '--chroma', '0'] + grid(16, 8, 4)),
+        ('chroma 0 32/16', ff, ['--frames', '10', '--chroma', '0'] + grid(32, 16)),
+        ('chroma 0 32/16 pel 4 standalone', ob, ['--frames', '10', '--chroma', '0', '--standalone'] + grid(32, 16, 4)),
+        ('plevel 0 16/8', ff, ['--frames', '10', '--plevel', '0'] + grid(16, 8)),
+        ('plevel 2 16/8', ff, ['--frames', '10', '--plevel', '2'] + grid(16, 8)),
+        ('plevel 0 32/16 pel 4', ob, ['--frames', '10', '--plevel', '0'] + grid(32, 16, 4)),
+        ('plevel 2 8/4 chroma 0', ff, ['--frames', '10', '--plevel', '2', '--chroma', '0'] + grid(8, 4)),
+        # Analyse per delta, without chained or inverted seeds
+        ('standalone 16/8', ff, ['--frames', '10', '--standalone'] + grid(16, 8)),
+        ('standalone 32/16 pel 4', ff, ['--frames', '10', '--standalone'] + grid(32, 16, 4)),
+        ('standalone 8/4 pel 4 chroma 0', ff, ['--frames', '10', '--standalone', '--chroma', '0'] + grid(8, 4, 4)),
+        # Other overlaps, and grids that end inside a block
+        ('32/0', ff, ['--frames', '10'] + grid(32, 0)),
+        ('32/8 pel 4', ff, ['--frames', '10'] + grid(32, 8, 4)),
+        ('32/12 1906x1070', ff, ['--frames', '10', '--crop', '1906x1070'] + grid(32, 12)),
+        ('32/16 pel 4 1910x1074', ob, ['--frames', '10', '--crop', '1910x1074'] + grid(32, 16, 4)),
+        ('16/4 1914x1074', ff, ['--frames', '10', '--crop', '1914x1074'] + grid(16, 4)),
+        ('16/0 pel 4', ff, ['--frames', '10'] + grid(16, 0, 4)),
+        ('8/2 1910x1078', ff, ['--frames', '10', '--crop', '1910x1078'] + grid(8, 2)),
+        ('8/0 pel 4 1914x1074', ff, ['--frames', '10', '--crop', '1914x1074'] + grid(8, 0, 4)),
+        # Radii and AnalyseMany's delta
+        ('radius 3 16/8', ff, ['--frames', '12', '--radius', '3'] + grid(16, 8)),
+        ('radius 3 32/16 pel 4', ob, ['--frames', '12', '--radius', '3'] + grid(32, 16, 4)),
+        ('radius 1 8/4', ff, ['--frames', '10', '--radius', '1'] + grid(8, 4)),
+        ('delta 2 16/8', ff, ['--frames', '12', '--delta', '2'] + grid(16, 8)),
+        ('delta 3 radius 1 32/16 pel 4', ff, ['--frames', '12', '--delta', '3', '--radius', '1'] + grid(32, 16, 4)),
+        # The fallback's and the cost's arguments, and the padding
+        ('badsad 500 badrange 24 badstep 1 32/16', ff, ['--frames', '10', '--badsad', '500', '--badrange', '24', '--badstep', '1'] + grid(32, 16)),
+        ('badsad 2000 badstep 3 32/16 pel 4', ob, ['--frames', '10', '--badsad', '2000', '--badstep', '3'] + grid(32, 16, 4)),
+        ('badrange 0 16/8', ff, ['--frames', '10', '--badrange', '0'] + grid(16, 8)),
+        ('badrange -40 badstep 4 8/4', ff, ['--frames', '10', '--badrange', '-40', '--badstep', '4'] + grid(8, 4)),
+        ('badsad 200 16/8 pel 4', ob, ['--frames', '10', '--badsad', '200'] + grid(16, 8, 4)),
+        ('mvlambda 0 32/16', ff, ['--frames', '10', '--mvlambda', '0'] + grid(32, 16)),
+        ('mvlambda 4000 lsad 1200 32/16 pel 4', ff, ['--frames', '10', '--mvlambda', '4000', '--lsad', '1200'] + grid(32, 16, 4)),
+        ('lsad 0 16/8', ff, ['--frames', '10', '--lsad', '0'] + grid(16, 8)),
+        ('mvlambda 300 lsad 3000 8/4 pel 4', ob, ['--frames', '10', '--mvlambda', '300', '--lsad', '3000'] + grid(8, 4, 4)),
+        ('pad 8 32/16', ff, ['--frames', '10', '--pad', '8'] + grid(32, 16)),
+        ('pad 24 16/8 pel 4', ff, ['--frames', '10', '--pad', '24'] + grid(16, 8, 4)),
+        ('pad 6 16/8', ff, ['--frames', '10', '--pad', '6'] + grid(16, 8)),
+        # 4K
+        ('4K 32/16 pel 4', k4, ['--frames', '6'] + grid(32, 16, 4)),
+        ('4K 16/8 chroma 0 plevel 2', k4, ['--frames', '6', '--chroma', '0', '--plevel', '2'] + grid(16, 8)),
+        ('4K 8/4 pel 2', k4, ['--frames', '6'] + grid(8, 4)),
+    ]
+    return cases
+
+
 def degrain_cases():
     ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
     cases = []
@@ -67,7 +133,7 @@ def degrain_cases():
     for fmt in ('YUV420P8', 'YUV444P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
-                vec = 'mvgpu' if fmt == 'YUV420P8' and blk <= 16 else 'mvu'
+                vec = 'mvgpu' if fmt == 'YUV420P8' else 'mvu'
                 cases.append((f'{fmt} {blk}/{blk // 2} pel {pel} {vec} vectors', ff,
                               ['--frames', '8', '--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel), '--vectors', vec]))
     cases += [
@@ -134,7 +200,7 @@ def flow_cases():
     for fmt in ('YUV420P8', 'YUV444P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
-                vec = 'mvgpu' if fmt == 'YUV420P8' and blk <= 16 else 'mvu'
+                vec = 'mvgpu' if fmt == 'YUV420P8' else 'mvu'
                 grid = ['--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel), '--vectors', vec]
                 cases.append((f'inter {fmt} {blk}/{blk // 2} pel {pel} {vec} vectors', ff, ['--frames', '8'] + grid))
                 if blk == 16:
@@ -192,7 +258,8 @@ def flow_cases():
     return cases
 
 
-SUITES = {'super': ('check_super.py', super_cases), 'degrain': ('check_degrain.py', degrain_cases), 'flow': ('check_flow.py', flow_cases)}
+SUITES = {'super': ('check_super.py', super_cases), 'analyse': ('check_reference.py', analyse_cases), 'degrain': ('check_degrain.py', degrain_cases),
+          'flow': ('check_flow.py', flow_cases)}
 
 
 def main():
@@ -200,6 +267,7 @@ def main():
     ap.add_argument('suite', choices=sorted(SUITES))
     ap.add_argument('--clips', default=os.environ.get('MVGPU_TEST_CLIPS', ''), help='the test clips directory (or MVGPU_TEST_CLIPS)')
     ap.add_argument('--plugin', help='the MVGPUtensils library to load, unless it autoloads')
+    ap.add_argument('--reference', default=os.environ.get('MVGPU_REFERENCE', ''), help='the CPU reference executable (or MVGPU_REFERENCE), for the analyse suite')
     ap.add_argument('--only', help='run only the cases whose label contains this')
     ap.add_argument('--list', action='store_true', help='list the cases')
     args = ap.parse_args()
@@ -212,12 +280,16 @@ def main():
         return
     if not args.clips:
         ap.error('--clips (or MVGPU_TEST_CLIPS) is needed')
+    if args.suite == 'analyse' and not args.reference:
+        ap.error('the analyse suite needs --reference (or MVGPU_REFERENCE)')
     failed = 0
     for label, clip, extra in cases:
         size, _ = CLIPS[clip]
         cmd = [sys.executable, os.path.join(HERE, script), '--src', os.path.join(args.clips, clip, 'noisy.nv12'), '--size', size] + extra
         if args.plugin:
             cmd += ['--plugin', args.plugin]
+        if args.suite == 'analyse':
+            cmd += ['--reference', args.reference]
         r = subprocess.run(cmd, capture_output=True, text=True)
         lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.strip() and 'API 3' not in ln and 'Version mismatch' not in ln]
         if r.returncode != 0:
