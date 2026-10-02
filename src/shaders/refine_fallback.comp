@@ -76,14 +76,9 @@ int64_t gLam;
 uint gW, gShift, gWU, gWV, gShiftC, gSa, gSm;
 
 void Setup(ivec2 v, ivec2 p, int64_t lambda) {
-    // Half-pel units: at pel 4 the fallback's positions are on the full-pel grid (ClampFull)
-    int X = kPel * (gX + pc.pad) + v.x, Y = kPel * (gY + pc.pad) + v.y;
-    if (kPel == 4) {
-        X >>= 1;
-        Y >>= 1;
-    }
-    int idx = (X & 1) | ((Y & 1) << 1); // the search's positions are whole pels; at pel 2 a clamped one near it may not be
-    uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
+    // The search's positions are whole pels (at pel 4 on the full-pel grid, ClampFull); at pel 2 a
+    // clamped one near it may not be
+    uint a = LumaAddr(kPel * (gX + pc.pad) + v.x, kPel * (gY + pc.pad) + v.y);
     gW = WordOf(a);
     gShift = ShiftOf(a);
     int Xc = kPel * ((gX >> kLogC) + pc.padc) + ChromaComponent(v.x), Yc = kPel * ((gY >> kLogC) + pc.padc) + ChromaComponent(v.y);
@@ -108,9 +103,9 @@ void Unit(int u) {
     [[unroll]] for (int jj = 0; jj < 2; ++jj) {
         int j = 2 * u + jj;
         uint wj = gW + uint(j) * stride;
-        uint lo = refY[wj];
+        uint lo = RefYWord(wj);
         [[unroll]] for (int i = 0; i < kRowWords; ++i) {
-            uint hi = refY[wj + uint(i) + 1u];
+            uint hi = RefYWord(wj + uint(i) + 1u);
             PackedStep(Bytes4(lo, hi, gShift), j * kRowWords + i, gSa, gSm);
             lo = hi;
         }
@@ -130,9 +125,9 @@ void Unit(int u) {
             continue;
         }
         uint ru = gWU + uint(jc) * strideC, rv = gWV + uint(jc) * strideC;
-        uint loU = refC[ru], loV = refC[rv];
+        uint loU = RefCWord(ru), loV = RefCWord(rv);
         [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-            uint hiU = refC[ru + uint(i) + 1u], hiV = refC[rv + uint(i) + 1u];
+            uint hiU = RefCWord(ru + uint(i) + 1u), hiV = RefCWord(rv + uint(i) + 1u);
             PackedStep(Bytes4(loU, hiU, gShiftC), curU + jc * kRowWordsC + i, gSa, gSm);
             PackedStep(Bytes4(loV, hiV, gShiftC), curV + jc * kRowWordsC + i, gSa, gSm);
             loU = hiU;

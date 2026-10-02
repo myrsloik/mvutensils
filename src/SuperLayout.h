@@ -114,9 +114,9 @@ struct SuperLayout {
     // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
     // compensate motion with its vectors (Degrain, FlowInter, FlowFPS)
     enum class Use { Search, Compensation };
-    // What they implement so far, either of them: 4:2:0 or 4:4:4 of 8 to 16-bit samples at pel 2 or
-    // 4, square blocks of 8, 16 or 32 with the same overlap and padding either way, the padding even
-    // with subsampled chroma. Empty when the layout is one of those, else what it lacks.
+    // What they implement so far, either of them: Gray, 4:2:0 or 4:4:4 of 8 to 16-bit or float samples
+    // at any pel, square blocks of 8, 16 or 32 with the same overlap and padding either way, the
+    // padding even with subsampled chroma. Empty when the layout is one of those, else what it lacks.
     std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;

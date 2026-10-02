@@ -1,262 +1,420 @@
-// Pixels flow motion function
-// Copyright(c)2005 A.G.Balakhnin aka Fizick
-
-// See legal notice in Copying.txt for more information
-
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; version 2 of the License.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program; if not, write to the Free Software
-// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
-// http://www.gnu.org/copyleft/gpl.html .
-
-#include <cstdint>
-#include <cstring>
-#include <memory>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include <VapourSynth4.h>
+#include <VSHelper4.h>
+#include <VSVulkan4.h>
 
 #include "Common.h"
-#include "SuperPyramid.h"
-#include "MotionBlockPyramid.h"
-#include "MaskResize.h"
-#include "FlowShared.h" // FlowFetch dispatch (AVX-512/AVX2 vpgatherdd > scalar) + FlowFetch_scalar
+#include "FilterShared.h"
+#include "SuperLayout.h"
+#include "VulkanContext.h"
 
-struct FlowData {
-    VSNode *clip = nullptr;
+// mvu.Flow and mvu.FlowBlur on the GPU, from one source: every pixel of the frame fetched from the
+// reference frame along its own vector (Flow), or averaged with the samples of its own frame along its
+// forward and backward vectors (FlowBlur), the blocks' vectors resized to the pixels by zimg's bilinear
+// resize in 64 x 64 tiles as mvu does it (TileTaps, as for FlowInter). Two kernels per frame: the scene
+// change test's count of badly matched blocks per vector frame (mask_blocks.comp), then every pixel of
+// every plane (flow_fetch.comp, flow_blur.comp), which copies the clip's pixel where the vectors are at
+// a scene change, since the host can't see the count. The result is mvu's bit for bit given the same
+// super and vectors.
+//
+// Implemented: all of their arguments but Flow's fields, on mvgpu.Super's Gray, 4:2:0 and 4:4:4 supers
+// of 8 to 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors made from
+// such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+
+struct FlowFetchData {
+    VSNode *node = nullptr;  // the clip
     VSNode *super = nullptr;
-    VSNode *vectors = nullptr;
+    VSNode *vectors[2] = {}; // Flow: the vectors; FlowBlur: mvfw (delta -off) and mvbw (delta off)
     const VSVideoInfo *vi = nullptr;
-    
-    int deltaFrame;
-    int time256;
-    int fields;
-    int64_t thscd1;
-    float thscd2;
-    bool tff;
-    bool tff_exists;
+    SuperLayout layout;
+    std::string prefix, name;
 
-    MaskResizer maskResizerFull;
-    MaskResizer maskResizerSubSampled;
+    bool blur = false; // FlowBlur, else Flow
+    int delta = 0;     // Flow: the vectors' reference frame is n + delta; FlowBlur: mvfw's delta, -off
+    int time256 = 0;   // Flow's time, FlowBlur's blur256
+    int prec = 1;      // FlowBlur
+    int nbx = 0, nby = 0;
+    SceneChange scd;
 
-    std::string prefix;
+    std::shared_ptr<VulkanContext> vc;
+    VSGPUExecPool *pool = nullptr;
+    VkPipeline count = VK_NULL_HANDLE, pixels = VK_NULL_HANDLE;
+    VSGPUBuffer *taps = nullptr; // the resize's taps (TileTaps), also bound where a frame has nothing
+    VSVulkanBufferInfo tapsInfo = {};
+    int colOff[2] = {}, rowOff[2] = {}; // where luma's and chroma's are in it
+    std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
 
-    FlowData(const VSAPI *vsapi) : vsapi(vsapi) {};
+    FlowFetchData(const VSAPI *vsapi) : vsapi(vsapi) {}
 
-    ~FlowData() {
-        vsapi->freeNode(clip);
+    ~FlowFetchData() {
+        // The pool drains the GPU first, so nothing still uses what follows
+        if (pool)
+            vc->vkapi->freeGPUExecPool(pool);
+        profile.reset();
+        if (taps)
+            vc->vkapi->destroyGPUBuffer(taps);
+        vc.reset();
+        vsapi->freeNode(vectors[0]);
+        vsapi->freeNode(vectors[1]);
         vsapi->freeNode(super);
-        vsapi->freeNode(vectors);
+        vsapi->freeNode(node);
     }
 };
 
-// flowFetch (motion-compensated copy) now lives in FlowShared.h as FlowFetch (dispatch) / FlowFetch_scalar.
-
-template<typename PixelType>
 static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
-    FlowData *d =  reinterpret_cast<FlowData *>(instanceData);
+    FlowFetchData *d = reinterpret_cast<FlowFetchData *>(instanceData);
 
-    int nref = n + d->deltaFrame;
+    // The vector frames and the super frame the pixels come from: Flow's vectors of frame n and the
+    // super of its reference frame; FlowBlur's mvfw of frame n - delta and mvbw of frame n + delta, both
+    // pointing at frame n, and frame n's super
+    const int frames = d->vi->numFrames;
+    const int vecFrame[2] = {d->blur ? n - d->delta : n, n + d->delta};
+    const int superFrame = d->blur ? n : n + d->delta;
+    const bool load = d->blur ? n + d->delta >= 0 && n - d->delta < frames : superFrame >= 0 && superFrame < frames;
+    const int vectorClips = d->blur ? 2 : 1;
 
     if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->clip, frameCtx);
-        vsapi->requestFrameFilter(n, d->vectors, frameCtx);
-
-        if (nref >= 0 && nref < d->vi->numFrames) {
-            if (n < nref) {
-                vsapi->requestFrameFilter(n, d->super, frameCtx);
-                vsapi->requestFrameFilter(nref, d->super, frameCtx);
-            } else {
-                vsapi->requestFrameFilter(nref, d->super, frameCtx);
-                vsapi->requestFrameFilter(n, d->super, frameCtx);
-            }
+        if (load) {
+            for (int i = 0; i < vectorClips; ++i)
+                vsapi->requestFrameFilter(vecFrame[i], d->vectors[i], frameCtx);
+            vsapi->requestFrameFilter(superFrame, d->super, frameCtx);
         }
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
+        const VulkanContext &vc = *d->vc;
+        const VSVULKANAPI *vkapi = vc.vkapi;
+        const SuperLayout &L = d->layout;
+
+        // Everything this frame holds a reference to, released on every way out
+        std::vector<const VSFrame *> held;
         VSFrame *dst = nullptr;
-
-        try {
-            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
-
-            if (nref >= 0 && nref < d->vi->numFrames && vectors.IsUsable(d->thscd1, d->thscd2)) {
-                const VSFrame *propSrc = vsapi->getFrameFilter(n, d->clip, frameCtx);
-                dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, propSrc, core);
-                vsapi->freeFrame(propSrc);
-
-                const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-                FramePyramid refGOF(ref, 1, d->prefix, vsapi);
-
-                int fieldShift = 0;
-                if (d->fields && vectors.nPel > 1 && ((nref - n) % 2 != 0)) {
-                    const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
-                    try {
-                        bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, true, vsapi);
-
-                        bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, true, vsapi);
-                        fieldShift = ComputeFieldShift(src_top_field, ref_top_field, vectors.nPel);
-
-                        vsapi->freeFrame(src);
-                    } catch (const std::exception &) {
-                        vsapi->freeFrame(src);
-                        throw;
-                    }
-                }
-
-                auto smallMasks = vectors.MakeSmallVectorMasks(fieldShift);
-
-                auto tmp = MaskResizer::GetTmpBuffer(std::max(d->maskResizerFull.tmpSize, d->maskResizerSubSampled.tmpSize));
-
-                auto [dstTileVX, dstTileVY] = MaskResizer::GetTileBuffers<2>();
-
-                auto bufVX = MaskResizer::MakeBufferPair(smallMasks->VXSmallY, smallMasks->pitchVSmallY, dstTileVX.get());
-                auto bufVY = MaskResizer::MakeBufferPair(smallMasks->VYSmallY, smallMasks->pitchVSmallY, dstTileVY.get());
-
-                ptrdiff_t dstStrideY = vsapi->getStride(dst, 0);
-                uint8_t *dstPtrY = vsapi->getWritePtr(dst, 0);
-
-                for (auto &tile : d->maskResizerFull.tiles) {
-                    tile.Process(tmp.get(), bufVX, bufVY);
-
-                    FlowFetch<PixelType>(dstPtrY + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideY, dstStrideY, refGOF.GetLevel(0).planes[0],
-                        dstTileVX.get(), dstTileVY.get(), MaskResizer::GetTileBufferStride(),
-                        tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->time256);
-                }
-
-                if (d->vi->format.numPlanes == 3) {
-                    smallMasks->AdjustSmallVectorMaskSubSampling(vectors.nBlkX, vectors.nBlkY, d->vi->format.subSamplingW, d->vi->format.subSamplingH);
-
-                    ptrdiff_t dstStrideU = vsapi->getStride(dst, 1);
-                    ptrdiff_t dstStrideV = vsapi->getStride(dst, 2);
-                    uint8_t *dstPtrU = vsapi->getWritePtr(dst, 1);
-                    uint8_t *dstPtrV = vsapi->getWritePtr(dst, 2);
-
-                    for (auto &tile : (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0) ? d->maskResizerSubSampled.tiles : d->maskResizerFull.tiles) {
-                        tile.Process(tmp.get(), bufVX, bufVY);
-
-                        FlowFetch<PixelType>(dstPtrU + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideU, dstStrideU, refGOF.GetLevel(0).planes[1],
-                            dstTileVX.get(), dstTileVY.get(), MaskResizer::GetTileBufferStride(),
-                            tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->time256);
-
-                        FlowFetch<PixelType>(dstPtrV + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideV, dstStrideV, refGOF.GetLevel(0).planes[2],
-                            dstTileVX.get(), dstTileVY.get(), MaskResizer::GetTileBufferStride(),
-                            tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->time256);
-                    }
-                }
-
-                return dst;
-
-            } else {
-                return vsapi->getFrameFilter(n, d->clip, frameCtx);
-            }
-        } catch (const std::exception &e) {
-            vsapi->setFilterError(("Flow: " + std::string(e.what())).c_str(), frameCtx);
+        VSGPUExecContext *ctx = nullptr;
+        VSGPUBuffer *scratch = nullptr;
+        auto release = [&]() {
+            for (const VSFrame *f : held)
+                vsapi->freeFrame(f);
+            held.clear();
+        };
+        auto fail = [&](const std::string &message) -> const VSFrame * {
+            if (ctx)
+                vkapi->gpuExecAbandon(ctx);
+            else if (scratch)
+                vkapi->destroyGPUBuffer(scratch);
+            release();
             vsapi->freeFrame(dst);
+            vsapi->setFilterError((d->name + ": " + message).c_str(), frameCtx);
             return nullptr;
+        };
+        auto hold = [&](const VSFrame *f) {
+            if (f)
+                held.push_back(f);
+            return f;
+        };
+
+        // The vectors that have vectors, mvu's HasMotionVectors; their scene change test is the GPU's
+        const VSFrame *vec[2] = {};
+        bool have = load;
+        for (int i = 0; i < vectorClips && have; ++i) {
+            vec[i] = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(vecFrame[i], d->vectors[i], frameCtx)), d->prefix, vsapi));
+            have = vec[i] != nullptr;
         }
+        const VSFrame *src = hold(vsapi->getFrameFilter(n, d->node, frameCtx));
+        if (!have) {
+            // The clip's frame, as mvu returns it
+            const VSFrame *f = vsapi->addFrameRef(src);
+            release();
+            return f;
+        }
+
+        SuperFrames sup;
+        if (!GetSuperFrames(hold(vsapi->getFrameFilter(superFrame, d->super, frameCtx)), L, d->prefix, sup, vsapi))
+            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
+        for (const VSFrame *f : {sup.luma, sup.chroma, sup.pyramid})
+            hold(f);
+
+        dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
+        if (!dst)
+            return fail("failed to allocate the output frame");
+
+        const int numPlanes = d->vi->format.numPlanes;
+        const bool chroma = L.format.chroma;
+        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlanes[2] = {}, vecPlanes[2] = {};
+        for (int p = 0; p < numPlanes; ++p)
+            if (vkapi->getGPUPlane(src, p, &clipPlanes[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
+                return fail("the clip's frames aren't GPU resident");
+        if (vkapi->getGPUPlane(sup.luma, 0, &superPlanes[0]) || (chroma && vkapi->getGPUPlane(sup.chroma, 0, &superPlanes[1])))
+            return fail("the super's planes aren't GPU resident");
+        const ptrdiff_t lumaStride = vsapi->getStride(sup.luma, 0), chromaStride = chroma ? vsapi->getStride(sup.chroma, 0) : 0;
+        ptrdiff_t recBytes = 0;
+        for (int i = 0; i < vectorClips; ++i) {
+            if (vkapi->getGPUPlane(vec[i], 0, &vecPlanes[i]))
+                return fail("the vectors aren't GPU resident");
+            const ptrdiff_t stride = vsapi->getStride(vec[i], 0);
+            if (vsapi->getFrameWidth(vec[i], 0) != 4 * d->nbx || vsapi->getFrameHeight(vec[i], 0) != d->nby || stride % 16 || (recBytes && stride != recBytes))
+                return fail("a vector frame doesn't match the super's grid");
+            recBytes = stride;
+        }
+
+        // Scratch: the scene change counts
+        char err[1024] = {};
+        VSVulkanBufferInfo scratchInfo = {};
+        scratch = vkapi->createGPUBuffer(core, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                         &scratchInfo, err, sizeof(err));
+        if (!scratch)
+            return fail(err);
+        ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
+        if (!ctx)
+            return fail(err);
+        vkapi->gpuExecUsesBuffer(ctx, scratch);
+        vkapi->gpuExecReadsFrame(ctx, src);
+        for (const VSFrame *f : {sup.luma, sup.chroma})
+            if (f)
+                vkapi->gpuExecReadsFrame(ctx, f);
+        for (int i = 0; i < vectorClips; ++i)
+            vkapi->gpuExecReadsFrame(ctx, vec[i]);
+        for (int p = 0; p < numPlanes; ++p)
+            vkapi->gpuExecWritesPlane(ctx, dst, p);
+
+        const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
+        Recorder rec(vc, cmd, d->tapsInfo.buffer);
+        const VkQueryPool queries = d->profile ? d->profile->Begin(vc, cmd) : VK_NULL_HANDLE;
+        auto stamp = [&](int stage) {
+            if (d->profile)
+                d->profile->Stamp(vc, cmd, queries, stage);
+        };
+
+        rec.Fill(scratchInfo.buffer, 0, 16, 0);
+        rec.TransferToCompute();
+        for (int i = 0; i < vectorClips; ++i)
+            RecordBadBlockCount(rec, d->count, vecPlanes[i].buffer, static_cast<int>(recBytes / 16), d->nbx, d->nby, d->scd.thscd1, scratchInfo.buffer, i);
+        rec.ComputeBarrier();
+        stamp(1);
+
+        const ptrdiff_t bytes = L.format.Bytes(); // strides in samples
+        FlowParams pc = {};
+        pc.nbx = d->nbx;
+        pc.nby = d->nby;
+        pc.recStride = static_cast<int32_t>(recBytes / 16);
+        pc.pad = L.pad;
+        pc.padY = L.padY;
+        pc.padc = L.padc;
+        pc.padcY = L.padcY;
+        pc.wp = static_cast<int32_t>(lumaStride / bytes);
+        pc.hp = L.hp;
+        pc.wc = static_cast<int32_t>(chromaStride / bytes);
+        pc.hc = L.hc;
+        pc.time256 = d->time256;
+        pc.scdLimit = d->scd.limit;
+        pc.time4096FX = d->prec; // flow_blur.comp's prec
+
+        // Flow reads the reference frame's super as ref, FlowBlur its own frame's as src
+        const int lumaBinding = d->blur ? kFlSrcLuma : kFlRefLuma, chromaBinding = d->blur ? kFlSrcChroma : kFlRefChroma;
+        rec.Bind(kFlTaps, d->tapsInfo.buffer);
+        rec.Bind(lumaBinding, superPlanes[0].buffer);
+        rec.Bind(chromaBinding, chroma ? superPlanes[1].buffer : d->tapsInfo.buffer);
+        rec.Bind(kFlVecF, vecPlanes[0].buffer);
+        rec.Bind(kFlVecB, d->blur ? vecPlanes[1].buffer : d->tapsInfo.buffer);
+        rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
+        for (int p = 0; p < numPlanes; ++p) {
+            pc.plane = p;
+            pc.width = vsapi->getFrameWidth(dst, p);
+            pc.height = vsapi->getFrameHeight(dst, p);
+            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
+            pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
+            pc.colOff = d->colOff[p ? 1 : 0];
+            pc.rowOff = d->rowOff[p ? 1 : 0];
+            rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
+            rec.Bind(kFlOut, outPlanes[p].buffer);
+            rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
+        }
+        stamp(2);
+
+        uint64_t signaled = 0;
+        const int submitted = vkapi->gpuExecSubmit(ctx, &signaled, err, sizeof(err));
+        ctx = nullptr;
+        scratch = nullptr; // the context owned it
+        if (submitted)
+            return fail(err);
+        if (d->profile)
+            d->profile->Finish(vc, d->pool, signaled, queries);
+        release();
+        return dst;
     }
 
     return nullptr;
 }
 
-static void VS_CC flowCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void *userData, VSCore *core, const VSAPI *vsapi) noexcept {
-    std::unique_ptr<FlowData> d = std::make_unique<FlowData>(vsapi);
-
-    int err;
-
-    double time = vsapi->mapGetFloat(in, "time", 0, &err);
-    if (err)
-        time = 100.0;
-
-    d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
-    d->thscd1 = vsapi->mapGetInt(in, "thscd1", 0, &err);
-    if (err)
-        d->thscd1 = MV_DEFAULT_SCD1;
-
-    d->thscd2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
-    if (err)
-        d->thscd2 = MV_DEFAULT_SCD2;
-
-    d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-    d->tff_exists = !err;
+// FlowBlur takes userData 1, Flow null
+static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) noexcept {
+    std::unique_ptr<FlowFetchData> d = std::make_unique<FlowFetchData>(vsapi);
+    d->blur = userData != nullptr;
+    d->name = d->blur ? "FlowBlur" : "Flow";
 
     try {
-
-        if (!std::isfinite(time) || time < 0.0 || time > 100.0)
-            throw std::runtime_error("time must be between 0 and 100%");
-
-        d->time256 = (int)(time * 256.0 / 100.0);
-
+        int err;
+        int64_t thscd1 = vsapi->mapGetInt(in, "thscd1", 0, &err);
+        if (err)
+            thscd1 = MV_DEFAULT_SCD1;
+        float thscd2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
+        if (err)
+            thscd2 = MV_DEFAULT_SCD2;
         const char *prefix = vsapi->mapGetData(in, "prefix", 0, &err);
-        if (prefix)
-            d->prefix = prefix;
-        else
-            d->prefix = DEFAULT_MVUTENSILS_PREFIX;
+        d->prefix = prefix ? prefix : DEFAULT_MVGPUTENSILS_PREFIX;
+
+        if (d->blur) {
+            float blur = vsapi->mapGetFloatSaturated(in, "blur", 0, &err);
+            if (err)
+                blur = 50.0f;
+            d->prec = vsapi->mapGetIntSaturated(in, "prec", 0, &err);
+            if (err)
+                d->prec = 1;
+            if (!std::isfinite(blur) || blur < 0.0f || blur > 200.0f)
+                throw std::runtime_error("blur must be between 0 and 200");
+            if (d->prec < 1)
+                throw std::runtime_error("prec must be at least 1");
+            d->time256 = static_cast<int>(blur * 256.0f / 200.0f);
+        } else {
+            double time = vsapi->mapGetFloat(in, "time", 0, &err);
+            if (err)
+                time = 100.0;
+            if (vsapi->mapGetInt(in, "fields", 0, &err) && !err)
+                throw std::runtime_error("fields=True isn't implemented");
+            if (!std::isfinite(time) || time < 0.0 || time > 100.0)
+                throw std::runtime_error("time must be between 0 and 100%");
+            d->time256 = static_cast<int>(time * 256.0 / 100.0);
+        }
 
         d->super = vsapi->mapGetNode(in, "super", 0, nullptr);
+        d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
+        d->vi = vsapi->getVideoInfo(d->node);
 
-        FramePyramid super(d->super, d->prefix, vsapi);
-
-        d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
-
-        d->clip = vsapi->mapGetNode(in, "clip", 0, nullptr);
-        d->vi = vsapi->getVideoInfo(d->clip);
-
-        if (!super.IsCompatibleWithSource(d->vi))
+        d->layout = ImportSuperLayout(d->super, d->prefix, vsapi);
+        const SuperLayout &L = d->layout;
+        if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
+            throw std::runtime_error(unsupported);
+        if (!vsh::isConstantVideoFormat(d->vi) || d->vi->format.colorFamily != (L.format.chroma ? cfYUV : cfGray) ||
+            d->vi->format.sampleType != (L.format.Kind() == 2 ? stFloat : stInteger) || d->vi->format.bitsPerSample != L.format.bits ||
+            (1 << d->vi->format.subSamplingW) != L.format.xr || (1 << d->vi->format.subSamplingH) != L.format.yr || d->vi->width != L.width ||
+            d->vi->height != L.height)
             throw std::runtime_error("source clip isn't compatible with super clip");
 
-        MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
+        if (d->blur) {
+            if (vsapi->mapNumElements(in, "vectors") != 2)
+                throw std::runtime_error("vectors must have exactly 2 elements");
+            d->vectors[1] = vsapi->mapGetNode(in, "vectors", 0, nullptr); // mvbw
+            d->vectors[0] = vsapi->mapGetNode(in, "vectors", 1, nullptr); // mvfw
+        } else {
+            d->vectors[0] = vsapi->mapGetNode(in, "vectors", 0, nullptr);
+        }
 
-        vectors.ScaleThSCD(d->thscd1, d->thscd2, vectors.bitsPerSample);
+        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
+        // depth (mvu's IsCompatibleWithAnalysis); FlowBlur's both on one grid with opposite deltas. The
+        // grid is theirs, as in mvu; the super only supplies the planes.
+        VectorInfo info[2];
+        for (int i = 0; i < (d->blur ? 2 : 1); ++i) {
+            const VectorInfo &v = info[i] = ReadVectorInfo(d->vectors[i], d->prefix, vsapi);
+            const SuperLayout analysed = ImportSuperLayout(d->vectors[i], d->prefix, vsapi);
+            if (i == 0 && (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
+                           v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
+                throw std::runtime_error("wrong source or super clip frame size");
+            if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
+                v.nby != analysed.nby)
+                throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        }
+        const VectorInfo &v = info[0];
+        if (d->blur) {
+            const VectorInfo &bw = info[1];
+            if (v.width != bw.width || v.height != bw.height || v.realWidth != bw.realWidth || v.realHeight != bw.realHeight || v.blkX != bw.blkX ||
+                v.blkY != bw.blkY || v.overlapX != bw.overlapX || v.overlapY != bw.overlapY || v.nbx != bw.nbx || v.nby != bw.nby || bw.delta != -v.delta ||
+                v.delta > 0 || bw.delta < 0)
+                throw std::runtime_error("mvfw and mvbw must be compatible with each other and have opposite sign delta");
+        }
+        d->delta = v.delta;
+        d->nbx = v.nbx;
+        d->nby = v.nby;
+        d->scd = ScaleSceneChange(v, thscd1, thscd2);
 
-        d->deltaFrame = vectors.nDeltaFrame;
+        d->vc = VulkanContext::Get(core, vsapi);
+        VulkanContext &vc = *d->vc;
+        // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical; bit 2
+        // 16-bit samples, bit 3 float
+        const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
+        d->count = vc.Pipeline(Kernel::MaskBlocks, 0, 0, 0);
+        d->pixels = vc.Pipeline(d->blur ? Kernel::FlowBlur : Kernel::FlowFetch, 0, L.pel, chromaLog | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0));
 
-        if (!vectors.IsCompatibleWithAnalysis(super))
-            throw std::runtime_error("wrong source or super clip frame size");
+        // The resize's taps: luma's columns and rows, then chroma's, its blocks luma's shifted by the
+        // subsampling, as mvu's MaskResizer has them (4:4:4 chroma takes luma's)
+        const int blk = v.blkX, overlap = v.overlapX;
+        std::vector<int32_t> tables;
+        for (int c = 0; c < (L.format.xr > 1 || L.format.yr > 1 ? 2 : 1); ++c) {
+            const int lx = c ? d->vi->format.subSamplingW : 0, ly = c ? d->vi->format.subSamplingH : 0;
+            const int stepX = (blk >> lx) - (overlap >> lx), stepY = (blk >> ly) - (overlap >> ly);
+            const int w = d->vi->width >> lx, h = d->vi->height >> ly;
+            if (!TilesHorizontalFirst(d->nbx, w, stepX, overlap >> lx, d->nby, h, stepY, overlap >> ly))
+                throw std::runtime_error("zimg would resize the vectors vertically first, which isn't implemented");
+            d->colOff[c] = static_cast<int>(tables.size());
+            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, overlap >> lx);
+            tables.insert(tables.end(), cols.begin(), cols.end());
+            d->rowOff[c] = static_cast<int>(tables.size());
+            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, overlap >> ly);
+            tables.insert(tables.end(), rows.begin(), rows.end());
+        }
+        if (L.format.xr == 1 && L.format.yr == 1) {
+            d->colOff[1] = d->colOff[0];
+            d->rowOff[1] = d->rowOff[0];
+        }
+        tables.resize(std::max<size_t>(tables.size(), 64)); // a dummy for the bindings a frame doesn't use too
 
-        d->maskResizerFull.Init(vectors.nBlkX, vectors.nBlkY, vectors.nBlkSizeX, vectors.nBlkSizeY, vectors.nOverlapX, vectors.nOverlapY,
-            d->vi->width, d->vi->height);
-
-        if (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0)
-            d->maskResizerSubSampled.Init(vectors.nBlkX, vectors.nBlkY, vectors.nBlkSizeX >> d->vi->format.subSamplingW, vectors.nBlkSizeY >> d->vi->format.subSamplingH, vectors.nOverlapX >> d->vi->format.subSamplingW, vectors.nOverlapY >> d->vi->format.subSamplingH,
-                d->vi->width >> d->vi->format.subSamplingW, d->vi->height >> d->vi->format.subSamplingH);
-
+        char errMsg[1024] = {};
+        d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
+        if (!d->pool)
+            throw std::runtime_error(errMsg);
+        d->taps = vc.Upload(core, d->pool, tables.data(), tables.size() * sizeof(int32_t), d->tapsInfo);
+        if (StageProfiler::Requested())
+            d->profile = std::make_unique<StageProfiler>(d->name + " (pel " + std::to_string(L.pel) + ")", std::vector<std::string>{"counts", "pixels"});
     } catch (const std::exception &e) {
-        vsapi->mapSetError(out, ("Flow: " + std::string(e.what())).c_str());
+        vsapi->mapSetError(out, (d->name + ": " + e.what()).c_str());
         return;
     }
 
-    VSFilterDependency deps[3] = {
-        {d->clip, rpStrictSpatial},
-        {d->super, rpGeneral},
-        {d->vectors, rpStrictSpatial},
-    };
-
-    vsapi->createVideoFilter(out, "Flow", d->vi, SelectOnBitsPerSample(d->vi->format.bitsPerSample, flowGetFrame<uint8_t>, flowGetFrame<uint16_t>, flowGetFrame<float>), filterFree<FlowData>, fmParallel, deps, ARRAY_SIZE(deps), d.get(), core);
+    std::vector<VSFilterDependency> deps = {{d->node, rpStrictSpatial}, {d->super, rpGeneral}};
+    for (VSNode *v : d->vectors)
+        if (v)
+            deps.push_back({v, d->blur ? rpGeneral : rpStrictSpatial});
+    vsapi->createVideoFilterEx(out, d->name.c_str(), d->vi, flowGetFrame, filterFree<FlowFetchData>, fmParallel, ffGPUOutput, deps.data(), static_cast<int>(deps.size()), d.get(),
+                               core);
     d.release();
 }
 
-void flowRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
+void flowFetchRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
     vspapi->registerFunction("Flow",
-                 "clip:vnode;"
-                 "super:vnode;"
-                 "vectors:vnode;"
-                 "time:float:opt;"
-                 "fields:int:opt;"
-                 "thscd1:int:opt;"
-                 "thscd2:float:opt;"
-                 "tff:int:opt;"
-                 "prefix:data:opt;",
-                 "clip:vnode;",
-                 flowCreate, nullptr, plugin);
+                             "clip:vnode:gpu;"
+                             "super:vnode:gpu;"
+                             "vectors:vnode:gpu;"
+                             "time:float:opt;"
+                             "fields:int:opt;"
+                             "thscd1:int:opt;"
+                             "thscd2:float:opt;"
+                             "tff:int:opt;"
+                             "prefix:data:opt;",
+                             "clip:vnode:gpu;", flowCreate, nullptr, plugin);
+    vspapi->registerFunction("FlowBlur",
+                             "clip:vnode:gpu;"
+                             "super:vnode:gpu;"
+                             "vectors:vnode[]:gpu;"
+                             "blur:float:opt;"
+                             "prec:int:opt;"
+                             "thscd1:int:opt;"
+                             "thscd2:float:opt;"
+                             "prefix:data:opt;",
+                             "clip:vnode:gpu;", flowCreate, reinterpret_cast<void *>(1), plugin);
 }

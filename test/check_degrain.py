@@ -27,7 +27,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
+from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip, plane_pair  # noqa: E402
 
 
 def main():
@@ -104,20 +104,20 @@ def main():
     first = None
     for n in range(args.frames):
         a, b, s = gout.get_frame(n), cout.get_frame(n), clip.get_frame(n)
-        for p in range(3):
-            pa, pb = np.asarray(a[p]).astype(np.int32), np.asarray(b[p]).astype(np.int32)
-            changed += np.count_nonzero(pa != np.asarray(s[p]))
+        for p in range(clip.format.num_planes):
+            pa, pb, dv = plane_pair(a, b, p)
+            changed += np.count_nonzero(np.asarray(a[p]) != np.asarray(s[p]))
             d = np.count_nonzero(pa != pb)
             if d:
                 differ[p] += d
-                worst[p] = max(worst[p], int(np.abs(pa - pb).max()))
+                worst[p] = max(worst[p], dv.max().item())
                 if first is None:
                     ys, xs = np.nonzero(pa != pb)
-                    first = (n, p, int(xs[0]), int(ys[0]), int(pa[ys[0], xs[0]]), int(pb[ys[0], xs[0]]))
+                    first = (n, p, int(xs[0]), int(ys[0]), np.asarray(a[p])[ys[0], xs[0]].item(), np.asarray(b[p])[ys[0], xs[0]].item())
     total = args.frames * w * h
-    total_c = args.frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h)
-    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} {args.frames} frames, {100 * changed / (total + 2 * total_c):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}, '
-          f'U {differ[1]}, V {differ[2]} of {total_c} each'
+    total_c = args.frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h) if clip.format.num_planes == 3 else 0
+    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} {args.frames} frames, {100 * changed / (total + 2 * total_c):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}'
+          + (f', U {differ[1]}, V {differ[2]} of {total_c} each' if total_c else '')
           + (f'; largest difference {worst}; first at frame {first[0]} plane {first[1]} ({first[2]}, {first[3]}): '
              f'mvgpu {first[4]}, mvu {first[5]}' if first else ''))
     sys.exit(0 if sum(differ) == 0 else 1)

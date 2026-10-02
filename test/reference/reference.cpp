@@ -15,8 +15,8 @@
 //   vectors of fields refined before (AnalyseMany only) and the finest level's vectors around the
 //   block (BuildSeeds);
 // - the seeds measured, a pair of checkerboard passes, the wide fallback search for the blocks still
-//   above badsad and one more pair, then the 8 half-pel positions around each vector, and at pel 4
-//   the 8 quarter-pel positions around that (Refine).
+//   above badsad and one more pair, then (but at pel 1) the 8 half-pel positions around each vector,
+//   and at pel 4 the 8 quarter-pel positions around that (Refine).
 //
 // The SAD is MVUtensils': luma plus U and V at the chroma block size, the chroma vector the luma
 // vector divided by the subsampling, toward zero; with --chroma 0 luma only. The cost is
@@ -27,16 +27,20 @@
 //
 // Build:  clang-cl /nologo /O2 /std:c++20 /EHsc reference.cpp   (or meson compile mvgpu_reference)
 //
-// Usage:  reference --src frames.yuv --size WxH --frames N --out vectors.bin [--format 420|444]
+// Usage:  reference --src frames.yuv --size WxH --frames N --out vectors.bin [--format 420|444|gray]
 //                   [--bits 8] [--blksize 16] [--overlap 8] [--pad 16] [--pel 2] [--radius 2]
 //                   [--delta 1] [--standalone] [--chroma 1] [--plevel 1] [--mvlambda 1000]
 //                   [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2] [--threads 16]
 //
 // The arguments are mvgpu.Super's and mvgpu.AnalyseMany's (--standalone: an Analyse per delta,
 // without chained or inverted seeds); badsad is per 8x8 block, as mvgpu takes it. The frames are
-// raw planar Y, U, V, at 4:2:0 or 4:4:4, bytes at 8 bits and 16-bit little-endian samples at 9 to
-// 16 (--bits); with subsampled chroma the padding must be even, as mvgpu has it. The output holds
-// every field (n, d)
+// raw planar Y, U, V, at 4:2:0 or 4:4:4, or Y alone for gray (whose SADs are luma's alone, as
+// with --chroma 0), bytes at 8 bits, 16-bit little-endian samples at 9 to 16 and 32-bit floats at
+// 32 (--bits); with subsampled chroma the padding must be even, as mvgpu has it. Float frames are
+// searched as mvgpu searches them: the super's samples, built in float as mvu.Super builds them,
+// each quantized to the 16-bit sample it stands for (Quantize; luma's 0 .. 1, chroma's -0.5 .. 0.5),
+// then everything as at 16 bits, where mvgpu reads what Super stored: the half-pel planes, and for
+// subsampled chroma at pel 4 its quarter-pel image. The output holds every field (n, d)
 // as six 32-bit ints, n, d, nbx, nby, pel and 1, then the nbx * nby x components, the y components
 // and the SADs.
 //
@@ -66,6 +70,14 @@
 #if defined(_M_X64) || defined(__SSE2__)
 #include <emmintrin.h>
 #define REFERENCE_SSE2
+#endif
+
+// The float arithmetic unfused, each operation rounded, as the GPU's precise operations and
+// mvu.Super's code do it
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(_MSC_VER)
+#pragma fp_contract(off)
 #endif
 
 namespace {
@@ -223,7 +235,137 @@ struct Frame {
     Plane<T> y, u, v;
     // levels[L - 1] holds Y, U, V at 1 / 2^L of the frame's size, L = 1 .. top level
     std::vector<std::array<SmallPlane<T>, 3>> levels;
+    // Float frames with subsampled chroma at pel 4: U's and V's quarter-pel images, sample (4x + fx,
+    // 4y + fy) of padded pixel (x, y) at row 4y + fy, 4 * qw wide (empty otherwise)
+    std::vector<T> qimg[2];
+    int qw = 0;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Float frames: mvu.Super's float planes, then the 16-bit samples the search reads
+
+// The 16-bit sample a float sample stands for (refine_common.glsl's Quantize): luma's 0 .. 1,
+// chroma's -0.5 .. 0.5 offset by 0.5, scaled to 0 .. 65535, clamped (NaN to 0), rounded
+uint16_t Quantize(float x, bool chroma) {
+    float v = chroma ? x + 0.5f : x;
+    v = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
+    const float s = v * 65535.0f + 0.5f;
+    return static_cast<uint16_t>(s);
+}
+
+// mvu.Super's float AveragePixels and Wiener tap, as super_common.glsl's AvgF and WienerF
+float AvgF(float a, float b) {
+    return (a + b) * 0.5f;
+}
+float WienerF(float m0, float m1, float m2, float m3, float m4, float m5) {
+    float t = (m2 + m3) * 4.0f;
+    t = t - (m1 + m4);
+    t = t * 5.0f;
+    const float s = m0 + (m5 + t);
+    return s * (1.0f / 32.0f);
+}
+
+void HorizontalWienerF(float *dst, const float *src, int w, int h) {
+    for (int j = 0; j < h; ++j) {
+        const float *s = src + static_cast<size_t>(j) * w;
+        float *d = dst + static_cast<size_t>(j) * w;
+        d[0] = AvgF(s[0], s[1]);
+        d[1] = AvgF(s[1], s[2]);
+        for (int i = 2; i < w - 4; ++i)
+            d[i] = WienerF(s[i - 2], s[i - 1], s[i], s[i + 1], s[i + 2], s[i + 3]);
+        for (int i = w - 4; i < w - 1; ++i)
+            d[i] = AvgF(s[i], s[i + 1]);
+        d[w - 1] = s[w - 1];
+    }
+}
+
+void VerticalWienerF(float *dst, const float *src, int w, int h) {
+    auto row = [&](const float *base, int j) { return base + static_cast<size_t>(j) * w; };
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < w; ++i)
+            dst[static_cast<size_t>(j) * w + i] = AvgF(row(src, j)[i], row(src, j + 1)[i]);
+    for (int j = 2; j < h - 4; ++j) {
+        const float *r0 = row(src, j - 2), *r1 = row(src, j - 1), *r2 = row(src, j), *r3 = row(src, j + 1), *r4 = row(src, j + 2), *r5 = row(src, j + 3);
+        float *d = dst + static_cast<size_t>(j) * w;
+        for (int i = 0; i < w; ++i)
+            d[i] = WienerF(r0[i], r1[i], r2[i], r3[i], r4[i], r5[i]);
+    }
+    for (int j = h - 4; j < h - 1; ++j)
+        for (int i = 0; i < w; ++i)
+            dst[static_cast<size_t>(j) * w + i] = AvgF(row(src, j)[i], row(src, j + 1)[i]);
+    memcpy(dst + static_cast<size_t>(h - 1) * w, row(src, h - 1), w * sizeof(float));
+}
+
+// MakePlane in float
+Plane<float> MakePlaneF(const float *src, int w, int h, int padX, int padY, int aw, int ah) {
+    Plane<float> pl;
+    pl.w = aw + 2 * padX;
+    pl.h = ah + 2 * padY;
+    for (auto &p : pl.p)
+        p.resize(static_cast<size_t>(pl.w) * pl.h);
+    float *d = pl.p[0].data();
+    for (int y = 0; y < pl.h; ++y) {
+        const int sy = std::clamp(y - padY, 0, h - 1);
+        for (int x = 0; x < pl.w; ++x)
+            d[static_cast<size_t>(y) * pl.w + x] = src[static_cast<size_t>(sy) * w + std::clamp(x - padX, 0, w - 1)];
+    }
+    HorizontalWienerF(pl.p[1].data(), pl.p[0].data(), pl.w, pl.h);
+    VerticalWienerF(pl.p[2].data(), pl.p[0].data(), pl.w, pl.h);
+    HorizontalWienerF(pl.p[3].data(), pl.p[2].data(), pl.w, pl.h);
+    return pl;
+}
+
+// Reduce in float, as pyr_reduce.comp's float rfilter 1
+SmallPlane<float> ReduceF(const SmallPlane<float> &src) {
+    auto at = [&](int x, int y) { return src.p[static_cast<size_t>(std::clamp(y, 0, src.h - 1)) * src.w + std::clamp(x, 0, src.w - 1)]; };
+    SmallPlane<float> d;
+    d.w = (src.w + 1) / 2;
+    d.h = (src.h + 1) / 2;
+    d.p.resize(static_cast<size_t>(d.w) * d.h);
+    std::vector<float> tmp(2 * d.w + 2);
+    for (int y = 0; y < d.h; ++y) {
+        for (int x = 0; x < 2 * d.w + 2; ++x) {
+            if (y == 0 || y == d.h - 1)
+                tmp[x] = (at(x, 2 * y) + at(x, 2 * y + 1)) * 0.5f;
+            else
+                tmp[x] = ((at(x, 2 * y - 1) + (at(x, 2 * y) + at(x, 2 * y + 1)) * 3.0f) + at(x, 2 * y + 2)) * 0.125f;
+        }
+        float *row = d.p.data() + static_cast<size_t>(y) * d.w;
+        for (int x = 0; x < d.w; ++x) {
+            const int c = 2 * x;
+            if (x == 0 || x == d.w - 1)
+                row[x] = (tmp[c] + tmp[c + 1]) * 0.5f;
+            else
+                row[x] = ((tmp[c - 1] + (tmp[c] + tmp[c + 1]) * 3.0f) + tmp[c + 2]) * 0.125f;
+        }
+    }
+    return d;
+}
+
+// The quarter-pel sample (X, Y) of a float plane, as mvu.Super's float quarter planes hold it
+// inside the plane (super_qpel.comp's image), reads clamped to it
+float QuarterF(const Plane<float> &pl, int X, int Y) {
+    auto at = [&](int Xh, int Yh) {
+        const int x = std::clamp(Xh >> 1, 0, pl.w - 1), y = std::clamp(Yh >> 1, 0, pl.h - 1);
+        return pl.p[(Xh & 1) | ((Yh & 1) << 1)][static_cast<size_t>(y) * pl.w + x];
+    };
+    const int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    return AvgF(AvgF(at(Xa, Ya), at(Xa, Yb)), AvgF(at(Xb, Ya), at(Xb, Yb)));
+}
+
+// A float plane's samples, quantized
+template <typename T>
+Plane<T> QuantizePlane(const Plane<float> &f, bool chroma) {
+    Plane<T> q;
+    q.w = f.w;
+    q.h = f.h;
+    for (int i = 0; i < 4; ++i) {
+        q.p[i].resize(f.p[i].size());
+        for (size_t k = 0; k < f.p[i].size(); ++k)
+            q.p[i][k] = static_cast<T>(Quantize(f.p[i][k], chroma));
+    }
+    return q;
+}
 
 // ---------------------------------------------------------------------------------------------
 // SAD
@@ -346,8 +488,11 @@ struct Search {
     }
 
     // One plane's bw x bh block at (X, Y), 1 / pel pixels of the padded plane, against the current
-    // block: read in place when the position is on the half-pel grid, else computed (pel 4)
+    // block: read in place when the position is on the half-pel grid (at pel 1 the full-pel one),
+    // else computed (pel 4)
     int PlaneSad(const T *cur, ptrdiff_t curStride, const Plane<T> &ref, int X, int Y, int bw, int bh) const {
+        if (pel == 1)
+            return BlockSad(cur, curStride, ref.p[0].data() + static_cast<size_t>(Y) * ref.w + X, ref.w, bw, bh);
         if (pel == 2 || ((X | Y) & 1) == 0) {
             const int Xh = pel == 2 ? X : X >> 1, Yh = pel == 2 ? Y : Y >> 1;
             return BlockSad(cur, curStride, ref.p[(Xh & 1) | ((Yh & 1) << 1)].data() + static_cast<size_t>(Yh >> 1) * ref.w + (Xh >> 1), ref.w, bw, bh);
@@ -369,6 +514,19 @@ struct Search {
         // Analyse divides the chroma vector by the subsampling, toward zero
         const int xc = x / xr + padc, yc = y / yr + padcY, Xc = pel * xc + v.x / xr, Yc = pel * yc + v.y / yr;
         const size_t cc = static_cast<size_t>(yc) * cf.u.w + xc;
+        if (!rf.qimg[0].empty()) {
+            // a float frame's subsampled chroma at pel 4, read from its quarter-pel image
+            const int bw = blk / xr, bh = blk / yr;
+            std::vector<T> tmp(static_cast<size_t>(bw) * bh);
+            for (int p = 0; p < 2; ++p) {
+                for (int j = 0; j < bh; ++j)
+                    for (int i = 0; i < bw; ++i)
+                        tmp[j * bw + i] = rf.qimg[p][static_cast<size_t>(Yc + 4 * j) * 4 * rf.qw + Xc + 4 * i];
+                const Plane<T> &c = p ? cf.v : cf.u;
+                sad += BlockSad(c.p[0].data() + cc, c.w, tmp.data(), bw, bw, bh);
+            }
+            return sad;
+        }
         sad += PlaneSad(cf.u.p[0].data() + cc, cf.u.w, rf.u, Xc, Yc, blk / xr, blk / yr);
         sad += PlaneSad(cf.v.p[0].data() + cc, cf.v.w, rf.v, Xc, Yc, blk / xr, blk / yr);
         return sad;
@@ -845,7 +1003,8 @@ Field Refine(const Search<T> &s, int n, int d, const std::vector<std::vector<Vec
         f.v = std::move(outV);
         f.sad = std::move(outSad);
     };
-    subPelStep(s.pel / 2, true);
+    if (s.pel >= 2)
+        subPelStep(s.pel / 2, true);
     if (s.pel == 4)
         subPelStep(1, false);
     return f;
@@ -882,6 +1041,7 @@ int Run(const Options &o) {
     s.w = w;
     s.h = h;
     s.frames = frames;
+    const bool gray = o.format == "gray";
     s.xr = s.yr = o.format == "420" ? 2 : 1;
     if (w % s.xr || h % s.yr)
         Die("4:2:0 frames need even dimensions");
@@ -907,11 +1067,13 @@ int Run(const Options &o) {
     s.radius = o.radius;
     s.delta = o.delta;
     s.standalone = o.standalone;
-    s.chroma = o.chroma;
+    s.chroma = o.chroma && !gray;
     s.plevel = o.plevel;
-    // mvu.Analyse's scaling: to the bit depth, rounded, then to the block size; lambda divided by
-    // pel squared at full size
-    const int pixelMax = (1 << o.bits) - 1;
+    // mvu.Analyse's scaling: to the bit depth (floats searched as 16-bit samples), rounded, then to
+    // the block size; lambda divided by pel squared at full size
+    const bool isFloat = o.bits == 32;
+    const int searchBits = isFloat ? 16 : o.bits;
+    const int pixelMax = (1 << searchBits) - 1;
     auto toDepth = [&](int64_t v) { return static_cast<int64_t>(static_cast<double>(v) * pixelMax / 255.0 + 0.5); };
     const int64_t mvlambda = toDepth(o.mvlambda), lsad = toDepth(o.lsad), badsad = toDepth(o.badsad);
     const int64_t area = static_cast<int64_t>(blk) * blk;
@@ -921,7 +1083,7 @@ int Run(const Options &o) {
     s.badSad = static_cast<int>(std::min<int64_t>(badsad * area / 64, INT32_MAX));
     s.fallbackRadius = std::abs(o.badrange);
     s.fallbackStep = o.badstep;
-    s.depthShift = o.bits - 8;
+    s.depthShift = searchBits - 8;
     for (int cw = w; cw / 2 >= kTopWidth; cw = (cw + 1) / 2)
         ++s.topLevel;
     if (s.topLevel < kFinest)
@@ -929,8 +1091,62 @@ int Run(const Options &o) {
 
     // The frames: the super's planes and the pyramid
     const int wc = w / s.xr, hc = h / s.yr;
-    const size_t lumaSamples = static_cast<size_t>(w) * h, chromaSamples = static_cast<size_t>(wc) * hc, frameSamples = lumaSamples + 2 * chromaSamples;
-    {
+    const size_t lumaSamples = static_cast<size_t>(w) * h, chromaSamples = gray ? 0 : static_cast<size_t>(wc) * hc,
+                 frameSamples = lumaSamples + 2 * chromaSamples;
+    if (isFloat) {
+        if constexpr (sizeof(T) == 2) {
+            std::vector<std::vector<float>> raw(frames, std::vector<float>(frameSamples));
+            FILE *f = fopen(o.srcPath.c_str(), "rb");
+            if (!f)
+                Die("cannot open " + o.srcPath);
+            for (auto &r : raw)
+                if (fread(r.data(), sizeof(float), frameSamples, f) != frameSamples)
+                    Die("the source holds fewer frames");
+            fclose(f);
+            s.clip.resize(frames);
+            const bool image = pel == 4 && !gray && s.xr > 1;
+            ParallelFor(frames, [&](int i) {
+                const float *py = raw[i].data(), *pu = py + lumaSamples, *pv = pu + chromaSamples;
+                Frame<T> &fr = s.clip[i];
+                fr.y = QuantizePlane<T>(MakePlaneF(py, w, h, pad, pad, s.aw, s.ah), false);
+                if (!gray) {
+                    const Plane<float> fu = MakePlaneF(pu, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr);
+                    const Plane<float> fv = MakePlaneF(pv, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr);
+                    fr.u = QuantizePlane<T>(fu, true);
+                    fr.v = QuantizePlane<T>(fv, true);
+                    if (image) {
+                        fr.qw = fu.w;
+                        for (int p = 0; p < 2; ++p) {
+                            const Plane<float> &fp = p ? fv : fu;
+                            fr.qimg[p].resize(static_cast<size_t>(16) * fp.w * fp.h);
+                            for (int Y = 0; Y < 4 * fp.h; ++Y)
+                                for (int X = 0; X < 4 * fp.w; ++X)
+                                    fr.qimg[p][static_cast<size_t>(Y) * 4 * fp.w + X] = static_cast<T>(Quantize(QuarterF(fp, X, Y), true));
+                        }
+                    }
+                }
+                std::array<SmallPlane<float>, 3> level;
+                const float *src[3] = {py, pu, pv};
+                for (int p = 0; p < (gray ? 1 : 3); ++p) {
+                    level[p].w = p ? wc : w;
+                    level[p].h = p ? hc : h;
+                    level[p].p.assign(src[p], src[p] + static_cast<size_t>(level[p].w) * level[p].h);
+                }
+                for (int L = 1; L <= s.topLevel; ++L) {
+                    std::array<SmallPlane<T>, 3> q;
+                    for (int p = 0; p < (gray ? 1 : 3); ++p) {
+                        level[p] = ReduceF(level[p]);
+                        q[p].w = level[p].w;
+                        q[p].h = level[p].h;
+                        q[p].p.resize(level[p].p.size());
+                        for (size_t k = 0; k < level[p].p.size(); ++k)
+                            q[p].p[k] = static_cast<T>(Quantize(level[p].p[k], p > 0));
+                    }
+                    fr.levels.push_back(q);
+                }
+            });
+        }
+    } else {
         std::vector<std::vector<T>> raw(frames, std::vector<T>(frameSamples));
         FILE *f = fopen(o.srcPath.c_str(), "rb");
         if (!f)
@@ -948,18 +1164,20 @@ int Run(const Options &o) {
             const T *py = raw[i].data(), *pu = py + lumaSamples, *pv = pu + chromaSamples;
             Frame<T> &fr = s.clip[i];
             fr.y = MakePlane(py, w, h, pad, pad, s.aw, s.ah, pixelMax);
-            fr.u = MakePlane(pu, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
-            fr.v = MakePlane(pv, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
+            if (!gray) {
+                fr.u = MakePlane(pu, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
+                fr.v = MakePlane(pv, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
+            }
             std::array<SmallPlane<T>, 3> level;
             const T *src[3] = {py, pu, pv};
-            for (int p = 0; p < 3; ++p) {
+            for (int p = 0; p < (gray ? 1 : 3); ++p) {
                 level[p].w = p ? wc : w;
                 level[p].h = p ? hc : h;
                 level[p].p.assign(src[p], src[p] + static_cast<size_t>(level[p].w) * level[p].h);
             }
             for (int L = 1; L <= s.topLevel; ++L) {
-                for (auto &p : level)
-                    p = Reduce(p);
+                for (int p = 0; p < (gray ? 1 : 3); ++p)
+                    level[p] = Reduce(level[p]);
                 fr.levels.push_back(level);
             }
         });
@@ -1051,16 +1269,16 @@ int main(int argc, char **argv) {
     }
     if (o.srcPath.empty() || o.outPath.empty() || o.w < 1 || o.h < 1 || o.frames < 1)
         Die("usage: reference --src frames.yuv --size WxH --frames N --out vectors.bin [options]; see the top of reference.cpp");
-    if (o.format != "420" && o.format != "444")
-        Die("--format takes 420 or 444");
-    if (o.bits < 8 || o.bits > 16)
-        Die("--bits takes 8 to 16");
+    if (o.format != "420" && o.format != "444" && o.format != "gray")
+        Die("--format takes 420, 444 or gray");
+    if ((o.bits < 8 || o.bits > 16) && o.bits != 32)
+        Die("--bits takes 8 to 16, or 32 for floats");
     if (o.blk != 8 && o.blk != 16 && o.blk != 32)
         Die("--blksize takes 8, 16 or 32");
     if (o.overlap < 0 || o.overlap > o.blk / 2 || (o.format == "420" && o.overlap % 2))
         Die("the overlap must be at most half the block size, and even at 4:2:0");
-    if (o.pel != 2 && o.pel != 4)
-        Die("--pel takes 2 or 4");
+    if (o.pel != 1 && o.pel != 2 && o.pel != 4)
+        Die("--pel takes 1, 2 or 4");
     if (o.radius < 1 || o.delta < 1)
         Die("--radius and --delta must be positive");
     if (o.plevel < 0 || o.plevel > 2)

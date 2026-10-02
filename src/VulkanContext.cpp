@@ -35,6 +35,12 @@ const char *KernelFile(Kernel kernel) {
     case Kernel::DegrainPixels: return "degrain.comp";
     case Kernel::FlowPrep: return "flow_prep.comp";
     case Kernel::FlowInter: return "flow_inter.comp";
+    case Kernel::FlowFetch: return "flow_fetch.comp";
+    case Kernel::FlowBlur: return "flow_blur.comp";
+    case Kernel::MaskBlocks: return "mask_blocks.comp";
+    case Kernel::MaskResize: return "mask_resize.comp";
+    case Kernel::Compensate: return "compensate.comp";
+    case Kernel::Recalculate: return "recalc.comp";
     }
     return "";
 }
@@ -171,6 +177,7 @@ VulkanContext::VulkanContext(VSCore *core, const VSAPI *vsapi) : core(core) {
         throw std::runtime_error(deviceName + " lacks 64-bit integers in shaders");
     if (!f12.shaderBufferInt64Atomics)
         throw std::runtime_error(deviceName + " lacks 64-bit buffer atomics");
+    float64 = features.features.shaderFloat64;
 
     for (int l = 0; l < kLayouts; ++l) {
         const bool degrain = l == static_cast<int>(Layout::Degrain);
@@ -231,7 +238,11 @@ VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant)
     if (auto it = pipelines.find(key); it != pipelines.end())
         return it->second;
 
-    const std::string source = Expand(KernelFile(kernel));
+    // MVGPU_FLOAT64 after the #version line: whether the kernel may use doubles, which a module
+    // declaring them can't be made into a pipeline without
+    std::string source = Expand(KernelFile(kernel));
+    const size_t version = source.find('\n');
+    source.insert(version == std::string::npos ? source.size() : version + 1, std::string("#define MVGPU_FLOAT64 ") + (float64 ? "1" : "0") + "\n");
     std::vector<char> log(16384);
     VSGPUShader *shader = vkapi->compileGPUShader(core, slGLSL, source.c_str(), log.data(), static_cast<int>(log.size()));
     if (!shader)
@@ -379,6 +390,33 @@ void Recorder::Dispatch(VkPipeline pipeline, const FlowParams &pc, uint32_t x, u
     vc.vk->vkCmdDispatch(cmd, x, y, z);
 }
 
+void Recorder::Dispatch(VkPipeline pipeline, const MaskParams &pc, uint32_t x, uint32_t y, uint32_t z) {
+    if (!x || !y || !z)
+        return;
+    Prepare(pipeline, &pc, sizeof(pc));
+    vc.vk->vkCmdDispatch(cmd, x, y, z);
+}
+
+void Recorder::Dispatch(VkPipeline pipeline, const RecalcParams &pc, uint32_t x, uint32_t y, uint32_t z) {
+    if (!x || !y || !z)
+        return;
+    Prepare(pipeline, &pc, sizeof(pc));
+    vc.vk->vkCmdDispatch(cmd, x, y, z);
+}
+
+void RecordBadBlockCount(Recorder &rec, VkPipeline count, VkBuffer vectors, int recStride, int nbx, int nby, int thscd1, VkBuffer counts, int slot) {
+    MaskParams pc = {};
+    pc.nbx = nbx;
+    pc.nby = nby;
+    pc.recStride = recStride;
+    pc.kind = 3; // mask_common.glsl's kCount
+    pc.thscd1 = thscd1;
+    pc.countSlot = slot;
+    rec.Bind(kMkVectors, vectors);
+    rec.Bind(kMkCounts, counts);
+    rec.Dispatch(count, pc, static_cast<uint32_t>((nbx * nby + 63) / 64), 1);
+}
+
 void Recorder::DispatchIndirect(VkPipeline pipeline, const Params &pc, VkBuffer args, VkDeviceSize offset) {
     Prepare(pipeline, &pc, sizeof(pc));
     vc.vk->vkCmdDispatchIndirect(cmd, args, offset);
@@ -432,6 +470,10 @@ void Recorder::ComputeToTransfer() {
 void Recorder::TransferToCompute() {
     Barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}
+
+void Recorder::ComputeToHost() {
+    Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
 }
 
 StageProfiler::StageProfiler(std::string name, std::vector<std::string> stages) : name(std::move(name)), stages(std::move(stages)), sums(this->stages.size(), 0.0) {}

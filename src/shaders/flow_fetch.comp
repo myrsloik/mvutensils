@@ -1,0 +1,36 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "flow_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// mvu.Flow's pixel of the plane (FlowShared.h's FlowFetch): the reference frame's sample, from its
+// super bound as ref, at the pixel's vector scaled to pc.time256 and rounded, the vectors resized to
+// the plane as for FlowInter; or the clip's pixel where the vectors are at a scene change (counts[0]
+// above the limit). Dispatched as ((width + 63) / 64, height) workgroups per plane.
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+    if (x >= pc.width)
+        return;
+    uint at = uint(y * pc.outStride + x);
+    if (counts[0] > uint(pc.scdLimit)) {
+        uint c = uint(y * pc.clipStride + x);
+        if (kFloat)
+            outPxF[at] = clipSrcF[c];
+        else if (kWide)
+            outPx16[at] = clipSrc16[c];
+        else
+            outPx[at] = clipSrc[c];
+        return;
+    }
+    Weights(x, y);
+    ivec2 v = VectorAt(0);
+    int t = pc.time256;
+    int X = x * kPel + ((v.x * t + 128) >> 8), Y = y * kPel + ((v.y * t + 128) >> 8);
+    if (kFloat)
+        outPxF[at] = SampleF(true, X, Y);
+    else if (kWide)
+        outPx16[at] = uint16_t(Sample(true, X, Y));
+    else
+        outPx[at] = uint8_t(Sample(true, X, Y));
+}

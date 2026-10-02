@@ -1,0 +1,465 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// mvgpu.Recalculate (Recalculate.cpp): every block of the super's grid gets the vector the old vectors
+// interpolate to at its centre (or the nearest old block's), and where that vector's SAD is above
+// thsad, mvu's search around it, exactly as mvu.Recalculate does it (MotionBlockPyramid.cpp's
+// DoRecalculateMVs and the searches it calls: DiamondSearch, ExpandingSearch, Hex2Search, UMHSearch,
+// the horizontal and vertical ones), which take the same candidates in the same order and keep the
+// first of equal costs, so the vectors are mvu's given the same supers and old vectors. The blocks
+// don't depend on each other: one subgroup takes a block, each lane a share of its pixels, every SAD
+// the subgroup's sum, so that all lanes follow the search together. Float supers are searched as the
+// 16-bit samples they stand for, as mvgpu.Analyse searches them (mvu sums float differences in an
+// order its CPU kernels decide). Dispatched as (nbx, nby) workgroups of one subgroup.
+
+layout(local_size_x_id = 1) in;
+
+layout(constant_id = 0) const int kSubgroup = 32;
+layout(constant_id = 3) const int kBlk = 16;
+layout(constant_id = 5) const int kPel = 2;
+// The variant (specialization constant 6): chroma's subsampling in bits 0 (horizontal) and 1
+// (vertical); bit 2 16-bit samples, bit 3 float; bit 4 the SADs count chroma
+layout(constant_id = 6) const int kVariant = 3;
+const int kLogX = kVariant & 1, kLogY = (kVariant >> 1) & 1;
+const bool kWide = (kVariant & 4) != 0;
+const bool kFloat = (kVariant & 8) != 0;
+const bool kChromaSad = (kVariant & 16) != 0;
+// Subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h). No && or || between
+// specialization constants: the core's compiler makes them short-circuit code in the first function
+// that uses them, which the others then can't see.
+const bool kImage = (kPel == 4 ? kVariant & 3 : 0) != 0;
+const int kBlkCX = kBlk >> kLogX, kBlkCY = kBlk >> kLogY;
+const int kLumaPer = (kBlk * kBlk + kSubgroup - 1) / kSubgroup;    // luma pixels a lane holds
+const int kChromaPer = (kBlkCX * kBlkCY + kSubgroup - 1) / kSubgroup; // and of each chroma plane
+
+// Matches RecalcParams in VulkanContext.h
+layout(push_constant) uniform Params {
+    int nbx, nby, step, recStride;              // the grid, the output's records per row
+    int nbxOld, nbyOld, blkOld, stepOld;        // the old vectors' grid
+    int recStrideOld, pad, padY, padc;          // their records per row; the supers' padding
+    int padcY, wp, hp, wc;                      // the supers' storage strides and rows per plane
+    int hc, aw, ah, lambda;                     // the block-aligned frame; lambda / pel^2
+    int thsad, pnew, search, searchParam;       // the search's arguments (search: mvu's SearchType)
+    int smoothing;                              // interpolate the old vectors (smooth), else take the nearest
+} pc;
+
+// The bindings: the supers' storage of the frame (src) and of its reference frame (ref), luma and
+// chroma, bytes, 16 bits each for 9 to 16-bit supers (kWide) or floats; the old vectors and the new
+// ones, a record (x, y, SAD, 0) per block
+layout(std430, set = 0, binding = 0) readonly buffer SrcLuma { uint8_t srcY[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SrcChroma { uint8_t srcC[]; };
+layout(std430, set = 0, binding = 2) readonly buffer RefLuma { uint8_t refY[]; };
+layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint8_t refC[]; };
+layout(std430, set = 0, binding = 0) readonly buffer SrcLuma16 { uint16_t srcY16[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SrcChroma16 { uint16_t srcC16[]; };
+layout(std430, set = 0, binding = 2) readonly buffer RefLuma16 { uint16_t refY16[]; };
+layout(std430, set = 0, binding = 3) readonly buffer RefChroma16 { uint16_t refC16[]; };
+layout(std430, set = 0, binding = 0) readonly buffer SrcLumaF { float srcYF[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SrcChromaF { float srcCF[]; };
+layout(std430, set = 0, binding = 2) readonly buffer RefLumaF { float refYF[]; };
+layout(std430, set = 0, binding = 3) readonly buffer RefChromaF { float refCF[]; };
+layout(std430, set = 0, binding = 4) readonly buffer OldVectors { ivec4 oldRec[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer NewVectors { ivec4 outRec[]; };
+
+// A float sample as the 16-bit sample it stands for: luma's 0 .. 1 and chroma's -0.5 .. 0.5 scaled to
+// 0 .. 65535, rounded, clamped (refine_common.glsl's)
+uint Quantize(float x, bool chroma) {
+    precise float v = chroma ? x + 0.5 : x;
+    v = v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
+    precise float s = v * 65535.0 + 0.5;
+    return uint(s);
+}
+
+uint LumaAt(bool ref, uint i) {
+    if (kFloat)
+        return Quantize(ref ? refYF[i] : srcYF[i], false);
+    if (kWide)
+        return ref ? uint(refY16[i]) : uint(srcY16[i]);
+    return ref ? uint(refY[i]) : uint(srcY[i]);
+}
+
+uint ChromaAt(bool ref, uint i) {
+    if (kFloat)
+        return Quantize(ref ? refCF[i] : srcCF[i], true);
+    if (kWide)
+        return ref ? uint(refC16[i]) : uint(srcC16[i]);
+    return ref ? uint(refC[i]) : uint(srcC[i]);
+}
+
+// The plane sizes U's planes take before V's: its quarter-pel image, its full-pel plane, or its four
+// half-pel planes
+int ChromaPlanes() {
+    return kImage ? 16 : min(kPel * kPel, 4);
+}
+
+// The rounded average mvu.Super's quarter planes take of two samples
+uint Avg(uint a, uint b) {
+    return (a + b + 1u) >> 1u;
+}
+
+// The address of sample (Xh, Yh) of the half-pel grid of a plane with rows stride samples apart, its
+// four half-pel planes rows rows each
+uint HalfAddr(int Xh, int Yh, int stride, int rows) {
+    return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
+}
+
+// mvu's GetAbsolutePointerPel1/2/4: the reference's sample at (X, Y), 1 / pel pixels of the padded
+// plane, of luma or of chroma plane c (1 U, 2 V); the quarter samples computed from the half-pel ones
+// as mvu.Super makes them (subsampled chroma's from its quarter-pel image)
+uint RefSample(int c, int X, int Y) {
+    bool luma = c == 0;
+    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
+    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
+    if (!luma && kImage)
+        return ChromaAt(true, base + uint(Y * 4 * stride + X));
+    if (kPel == 1)
+        return luma ? LumaAt(true, uint(Y * stride + X)) : ChromaAt(true, base + uint(Y * stride + X));
+    if (kPel == 2)
+        return luma ? LumaAt(true, HalfAddr(X, Y, stride, rows)) : ChromaAt(true, base + HalfAddr(X, Y, stride, rows));
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    uint aa = base + HalfAddr(Xa, Ya, stride, rows), ab = base + HalfAddr(Xa, Yb, stride, rows);
+    uint ba = base + HalfAddr(Xb, Ya, stride, rows), bb = base + HalfAddr(Xb, Yb, stride, rows);
+    if (luma)
+        return Avg(Avg(LumaAt(true, aa), LumaAt(true, ab)), Avg(LumaAt(true, ba), LumaAt(true, bb)));
+    return Avg(Avg(ChromaAt(true, aa), ChromaAt(true, ab)), Avg(ChromaAt(true, ba), ChromaAt(true, bb)));
+}
+
+// The frame's own pixel (x, y) of the padded plane: its full-pel sample
+uint SrcSample(int c, int x, int y) {
+    if (c == 0)
+        return LumaAt(false, uint(y * pc.wp + x));
+    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
+    return ChromaAt(false, base + (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x)));
+}
+
+// The block: its top left pixel in the padded planes, luma's and chroma's, and the pixels this lane
+// holds
+int gX, gY, gXc, gYc;
+uint gSrcY[kLumaPer], gSrcU[kChromaPer], gSrcV[kChromaPer];
+int gLane;
+
+uint AbsDiff(uint a, uint b) {
+    return a > b ? a - b : b - a;
+}
+
+// The block's luma SAD and chroma SAD (U's and V's together) at vector (vx, vy), 1 / pel pixels;
+// chroma at the vector divided by the subsampling, rounded toward zero (mvu's GetRefBlockU)
+uvec2 Sads(int vx, int vy) {
+    uint sl = 0u, sc = 0u;
+    int X0 = gX * kPel + vx, Y0 = gY * kPel + vy;
+    [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
+        int i = gLane + k * kSubgroup;
+        if (i < kBlk * kBlk)
+            sl += AbsDiff(gSrcY[k], RefSample(0, X0 + (i % kBlk) * kPel, Y0 + (i / kBlk) * kPel));
+    }
+    if (kChromaSad) {
+        int cvx = (vx + (vx < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (vy + (vy < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
+        int Xc0 = gXc * kPel + cvx, Yc0 = gYc * kPel + cvy;
+        [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
+            int i = gLane + k * kSubgroup;
+            if (i < kBlkCX * kBlkCY) {
+                int X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
+                sc += AbsDiff(gSrcU[k], RefSample(1, X, Y)) + AbsDiff(gSrcV[k], RefSample(2, X, Y));
+            }
+        }
+    }
+    return subgroupAdd(uvec2(sl, sc));
+}
+
+// The search's state, the same in every lane: the best vector, its SAD and cost; the predictor and
+// lambda the cost measures from; the vectors the planes hold the block for (mvu's nDxMin, nDyMin,
+// nDxMax, nDyMax); CheckMV2's direction
+ivec2 gBest;
+int gBestSad;
+int64_t gMinCost;
+ivec2 gPred;
+int64_t gLambda;
+ivec4 gBounds;
+int gDir;
+
+bool VectorOK(int vx, int vy) {
+    return vx >= gBounds.x && vy >= gBounds.y && vx < gBounds.z && vy < gBounds.w;
+}
+
+// mvu's CheckMV_Template flags: penaltyNew on the SADs, update the direction, update the best vector
+const int kPenalty = 1, kUpdateDir = 2, kUpdateBest = 4;
+
+// mvu's CheckMV_Template and CheckMV_Slow: the candidate replaces the best when its cost, the
+// distortion from the predictor plus the SADs (with penaltyNew), is lower
+void Check(int vx, int vy, int flags, int val) {
+    if (!VectorOK(vx, vy))
+        return;
+    int64_t dx = int64_t(gPred.x - vx), dy = int64_t(gPred.y - vy);
+    int64_t cost = (gLambda * (dx * dx + dy * dy)) >> 8;
+    if (cost >= gMinCost)
+        return;
+    uvec2 s = Sads(vx, vy);
+    bool penalty = (flags & kPenalty) != 0;
+    cost += int64_t(s.x) + (penalty ? (int64_t(pc.pnew) * int64_t(s.x)) >> 8 : 0l);
+    if (cost >= gMinCost)
+        return;
+    if (kChromaSad) {
+        cost += int64_t(s.y) + (penalty ? (int64_t(pc.pnew) * int64_t(s.y)) >> 8 : 0l);
+        if (cost >= gMinCost)
+            return;
+    }
+    if ((flags & kUpdateBest) != 0)
+        gBest = ivec2(vx, vy);
+    gMinCost = cost;
+    gBestSad = int(s.x + s.y);
+    if ((flags & kUpdateDir) != 0)
+        gDir = val;
+}
+
+void CheckMV(int vx, int vy) {
+    Check(vx, vy, kPenalty | kUpdateBest, 0);
+}
+
+void CheckMV2(int vx, int vy, int val) {
+    Check(vx, vy, kPenalty | kUpdateDir | kUpdateBest, val);
+}
+
+void CheckMVdir(int vx, int vy, int val) {
+    Check(vx, vy, kPenalty | kUpdateDir, val);
+}
+
+// mvu's DiamondSearch: directions Right 1, Left 2, Down 4, Up 8
+void DiamondSearch(int length) {
+    int direction = 15;
+    while (direction > 0) {
+        int dx = gBest.x, dy = gBest.y;
+        int lastDirection = direction;
+        direction = 0;
+        gDir = 0;
+        if ((lastDirection & 1) != 0)
+            CheckMV2(dx + length, dy, 1);
+        if ((lastDirection & 2) != 0)
+            CheckMV2(dx - length, dy, 2);
+        if ((lastDirection & 4) != 0)
+            CheckMV2(dx, dy + length, 4);
+        if ((lastDirection & 8) != 0)
+            CheckMV2(dx, dy - length, 8);
+        direction = gDir;
+        if (direction != 0) {
+            lastDirection = direction;
+            dx = gBest.x;
+            dy = gBest.y;
+            if ((lastDirection & 3) != 0) {
+                CheckMV2(dx, dy + length, 4);
+                CheckMV2(dx, dy - length, 8);
+            } else {
+                CheckMV2(dx + length, dy, 1);
+                CheckMV2(dx - length, dy, 2);
+            }
+        } else if (lastDirection == 1) {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx + length, dy - length, 1 + 8);
+        } else if (lastDirection == 2) {
+            CheckMV2(dx - length, dy + length, 2 + 4);
+            CheckMV2(dx - length, dy - length, 2 + 8);
+        } else if (lastDirection == 4) {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx - length, dy + length, 2 + 4);
+        } else if (lastDirection == 8) {
+            CheckMV2(dx + length, dy - length, 1 + 8);
+            CheckMV2(dx - length, dy - length, 2 + 8);
+        } else if (lastDirection == 1 + 4) {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx - length, dy + length, 2 + 4);
+            CheckMV2(dx + length, dy - length, 1 + 8);
+        } else if (lastDirection == 2 + 4) {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx - length, dy + length, 2 + 4);
+            CheckMV2(dx - length, dy - length, 2 + 8);
+        } else if (lastDirection == 1 + 8) {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx - length, dy - length, 2 + 8);
+            CheckMV2(dx + length, dy - length, 1 + 8);
+        } else if (lastDirection == 2 + 8) {
+            CheckMV2(dx - length, dy - length, 2 + 8);
+            CheckMV2(dx - length, dy + length, 2 + 4);
+            CheckMV2(dx + length, dy - length, 1 + 8);
+        } else {
+            CheckMV2(dx + length, dy + length, 1 + 4);
+            CheckMV2(dx - length, dy + length, 2 + 4);
+            CheckMV2(dx + length, dy - length, 1 + 8);
+            CheckMV2(dx - length, dy - length, 2 + 8);
+        }
+        direction = gDir;
+    }
+}
+
+// mvu's ExpandingSearch: the square of radius r around (mvx, mvy), its sides without the corners,
+// then the corners
+void ExpandingSearch(int r, int s, int mvx, int mvy) {
+    for (int i = -r + s; i < r; i += s) {
+        CheckMV(mvx + i, mvy - r);
+        CheckMV(mvx + i, mvy + r);
+    }
+    for (int j = -r + s; j < r; j += s) {
+        CheckMV(mvx - r, mvy + j);
+        CheckMV(mvx + r, mvy + j);
+    }
+    CheckMV(mvx - r, mvy - r);
+    CheckMV(mvx - r, mvy + r);
+    CheckMV(mvx + r, mvy - r);
+    CheckMV(mvx + r, mvy + r);
+}
+
+// mvu's Hex2Search (x264's): the radius 2 hexagon, half hexagons while one improves, then the square
+// of radius 1
+const int kMod6m1[8] = int[](5, 0, 1, 2, 3, 4, 5, 0);
+const ivec2 kHex2[8] = ivec2[](ivec2(-1, -2), ivec2(-2, 0), ivec2(-1, 2), ivec2(1, 2), ivec2(2, 0), ivec2(1, -2), ivec2(-1, -2), ivec2(-2, 0));
+
+void Hex2Search(int range) {
+    int bmx = gBest.x, bmy = gBest.y;
+    if (range > 1) {
+        gDir = -2;
+        CheckMVdir(bmx - 2, bmy, 0);
+        CheckMVdir(bmx - 1, bmy + 2, 1);
+        CheckMVdir(bmx + 1, bmy + 2, 2);
+        CheckMVdir(bmx + 2, bmy, 3);
+        CheckMVdir(bmx + 1, bmy - 2, 4);
+        CheckMVdir(bmx - 1, bmy - 2, 5);
+        int dir = gDir;
+        if (dir != -2) {
+            bmx += kHex2[dir + 1].x;
+            bmy += kHex2[dir + 1].y;
+            for (int i = 1; i < range / 2 && VectorOK(bmx, bmy); i++) {
+                int odir = kMod6m1[dir + 1];
+                gDir = -2;
+                CheckMVdir(bmx + kHex2[odir].x, bmy + kHex2[odir].y, odir - 1);
+                CheckMVdir(bmx + kHex2[odir + 1].x, bmy + kHex2[odir + 1].y, odir);
+                CheckMVdir(bmx + kHex2[odir + 2].x, bmy + kHex2[odir + 2].y, odir + 1);
+                dir = gDir;
+                if (dir == -2)
+                    break;
+                bmx += kHex2[dir + 1].x;
+                bmy += kHex2[dir + 1].y;
+            }
+        }
+        gBest = ivec2(bmx, bmy);
+    }
+    ExpandingSearch(1, 1, bmx, bmy);
+}
+
+// mvu's UMHSearch (x264's uneven multi-hexagon grid): the cross, the hexagon grids of growing
+// radius, then Hex2Search
+const ivec2 kHex4[16] = ivec2[](ivec2(-4, 2), ivec2(-4, 1), ivec2(-4, 0), ivec2(-4, -1), ivec2(-4, -2), ivec2(4, -2), ivec2(4, -1), ivec2(4, 0), ivec2(4, 1),
+                                ivec2(4, 2), ivec2(2, 3), ivec2(0, 4), ivec2(-2, 3), ivec2(-2, -3), ivec2(0, -4), ivec2(2, -3));
+
+void UMHSearch(int range, int omx, int omy) {
+    for (int i = 1; i < range; i += 2) {
+        CheckMV(omx - i, omy);
+        CheckMV(omx + i, omy);
+    }
+    for (int j = 1; j < range; j += 2) {
+        CheckMV(omx, omy - j);
+        CheckMV(omx, omy + j);
+    }
+    int i = 1;
+    do {
+        for (int j = 0; j < 16; j++)
+            CheckMV(omx + kHex4[j].x * i, omy + kHex4[j].y * i);
+    } while (++i <= range / 4);
+    Hex2Search(range);
+}
+
+// C++'s a / b for b > 0, truncated toward zero
+int DivT(int a, int b) {
+    return a >= 0 ? a / b : -(-a / b);
+}
+
+int64_t DivT64(int64_t a, int64_t b) {
+    return a >= 0 ? a / b : -(-a / b);
+}
+
+ivec4 Old(int bx, int by) {
+    return oldRec[by * pc.recStrideOld + bx];
+}
+
+// mvu's predictor for block (bx, by): the old vectors interpolated at its centre (smooth), or the
+// nearest old block's, in mvu's integer arithmetic, clipped to the vectors the planes hold the block for
+ivec2 Predictor(int bx, int by) {
+    int centerX = kBlk / 2 + pc.step * bx, centerY = kBlk / 2 + pc.step * by;
+    int bxOld = DivT(centerX - pc.blkOld / 2, pc.stepOld), byOld = DivT(centerY - pc.blkOld / 2, pc.stepOld);
+    int deltaX = max(0, centerX - (pc.blkOld / 2 + pc.stepOld * bxOld)), deltaY = max(0, centerY - (pc.blkOld / 2 + pc.stepOld * byOld));
+    int bx1 = min(pc.nbxOld - 1, max(0, bxOld)), bx2 = min(pc.nbxOld - 1, max(0, bxOld + 1));
+    int by1 = min(pc.nbyOld - 1, max(0, byOld)), by2 = min(pc.nbyOld - 1, max(0, byOld + 1));
+    ivec2 v;
+    if (pc.smoothing != 0) {
+        ivec2 v1 = Old(bx1, by1).xy, v2 = Old(bx2, by1).xy, v3 = Old(bx1, by2).xy, v4 = Old(bx2, by2).xy;
+        ivec2 a = v1 * pc.stepOld + deltaX * (v2 - v1), b = v3 * pc.stepOld + deltaX * (v4 - v3);
+        v = ivec2(DivT(a.x + DivT(deltaY * (b.x - a.x), pc.stepOld), pc.stepOld), DivT(a.y + DivT(deltaY * (b.y - a.y), pc.stepOld), pc.stepOld));
+    } else {
+        bool right = deltaX * 2 >= pc.stepOld, down = deltaY * 2 >= pc.stepOld;
+        v = Old(right ? bx2 : bx1, down ? by2 : by1).xy;
+    }
+    return clamp(v, gBounds.xy, gBounds.zw - 1);
+}
+
+void main() {
+    int bx = int(gl_WorkGroupID.x), by = int(gl_WorkGroupID.y);
+    gLane = int(gl_SubgroupInvocationID);
+    gX = pc.pad + bx * pc.step;
+    gY = pc.padY + by * pc.step;
+    gXc = pc.padc + bx * (pc.step >> kLogX);
+    gYc = pc.padcY + by * (pc.step >> kLogY);
+    [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
+        int i = gLane + k * kSubgroup;
+        gSrcY[k] = i < kBlk * kBlk ? SrcSample(0, gX + i % kBlk, gY + i / kBlk) : 0u;
+    }
+    [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
+        int i = gLane + k * kSubgroup;
+        bool live = kChromaSad && i < kBlkCX * kBlkCY;
+        gSrcU[k] = live ? SrcSample(1, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+        gSrcV[k] = live ? SrcSample(2, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+    }
+
+    // The vectors the padded planes hold the block for (mvu's search boundaries)
+    int paddedW = pc.aw + 2 * pc.pad, paddedH = pc.ah + 2 * pc.padY;
+    gBounds = ivec4(-gX * kPel, -gY * kPel, (paddedW - gX - kBlk) * kPel, (paddedH - gY - kBlk) * kPel);
+    gPred = Predictor(bx, by);
+    gLambda = by == 0 ? 0l : int64_t(pc.lambda);
+
+    uvec2 s = Sads(gPred.x, gPred.y);
+    gBest = gPred;
+    gBestSad = int(s.x + s.y);
+    gMinCost = int64_t(gBestSad);
+    if (gBestSad > pc.thsad) {
+        if (pc.search == 0) {
+            for (int i = pc.searchParam; i > 0; i /= 2)
+                DiamondSearch(i);
+        } else if (pc.search == 1) {
+            int mvx = gBest.x, mvy = gBest.y;
+            for (int i = 1; i <= pc.searchParam; i++)
+                ExpandingSearch(i, 1, mvx, mvy);
+        } else if (pc.search == 2) {
+            Hex2Search(pc.searchParam);
+        } else if (pc.search == 3) {
+            UMHSearch(pc.searchParam, gBest.x, gBest.y);
+        } else if (pc.search == 4) {
+            int mvx = gBest.x, mvy = gBest.y;
+            for (int i = 1; i <= pc.searchParam; i++) {
+                CheckMV(mvx - i, mvy);
+                CheckMV(mvx + i, mvy);
+            }
+        } else {
+            int mvx = gBest.x, mvy = gBest.y;
+            for (int i = 1; i <= pc.searchParam; i++) {
+                CheckMV(mvx, mvy - i);
+                CheckMV(mvx, mvy + i);
+            }
+        }
+    }
+    if (subgroupElect())
+        outRec[by * pc.recStride + bx] = ivec4(gBest, gBestSad, 0);
+}

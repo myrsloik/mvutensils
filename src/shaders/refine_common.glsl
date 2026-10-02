@@ -43,15 +43,18 @@ uint WorkgroupLane() {
 // frames mvgpu.Super attaches, SuperLayout.h): four planes of hp rows for luma (full, x + 1/2,
 // y + 1/2, both), and for U and V four each of hc rows (U at planes 0-3, V at 4-7), but for
 // subsampled chroma at pel 4, an image each of the quarter-pel grid, 4 hc rows of 4 wc samples. The
-// samples are bytes, or 16 bits each at 9 to 16 bits (kWide), the current frame's planes declared
-// both ways (CurLuma, CurChroma). wp and wc are the storage frames' strides in samples, whole words,
-// so every row starts on a word. LaneSad reads the reference frame's planes as 32-bit words, up to
+// samples are bytes, 16 bits each at 9 to 16 bits (kWide) or floats (kFloatS, read as the 16-bit
+// samples they stand for, Quantize), the current frame's planes declared all three ways (CurLuma,
+// CurChroma). wp and wc are the storage frames' strides in samples, whole words, so every row starts
+// on a word. LaneSad reads the reference frame's planes as 32-bit words (RefYWord, RefCWord), up to
 // two past a row's last pixel, so the storage frames carry a spare row at the end.
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma8 { uint8_t curY[]; };
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma16 { uint16_t curY16[]; };
+layout(std430, set = 0, binding = 0) readonly buffer CurLuma32 { uint curY32[]; };
 layout(std430, set = 0, binding = 1) readonly buffer RefLuma { uint refY[]; };
 layout(std430, set = 0, binding = 2) readonly buffer CurChroma8 { uint8_t curC[]; };
 layout(std430, set = 0, binding = 2) readonly buffer CurChroma16 { uint16_t curC16[]; };
+layout(std430, set = 0, binding = 2) readonly buffer CurChroma32 { uint curC32[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint refC[]; };
 // Up to maxSeeds seed vectors per block (half-pels), their count, and their SADs once measured;
 // seed_build.comp writes the seeds, the other kernels only read them
@@ -111,7 +114,7 @@ layout(constant_id = 3) const int kBlk = 8;
 // (Analyse's chroma=False), at every level; bit 1 set when chroma isn't subsampled (4:4:4, else
 // 4:2:0); bits 2 and 3, only for the kernels that measure 8 candidates per block (init, the passes,
 // the half- and quarter-pel steps), log2 of the lanes measuring each candidate; bits 4 to 7 the bit
-// depth less 8
+// depth less 8 (8 for floats); bit 8 set for float samples
 layout(constant_id = 6) const int kVariant = 0;
 const bool kChroma = (kVariant & 1) == 0;
 const int kLogC = (kVariant & 2) != 0 ? 0 : 1; // chroma's subsampling either way, as a shift
@@ -123,26 +126,51 @@ const int kBlkC = kBlk >> kLogC;
 // too), add their shares up (SadOf), so that each 8 of the group hold every candidate's whole SAD
 // and pick the same best one. A workgroup then works on 8 / kSplit blocks instead of 8, which
 // shrinks its block cache (sCur), so more workgroups fit on a compute unit to hide the SADs' memory
-// reads: Analyse.cpp splits the blocks whose current pixels take 768 bytes or more (RefineSplit),
-// which made 4:4:4 32x32 fields 31-32% faster and 4:2:0 32x32 ones 14-21%.
+// reads: Analyse.cpp gives the blocks whose current pixels take 768 bytes or more 2 lanes per
+// candidate and those taking 3 KB or more 4 (RefineSplit), which made 8-bit 4:4:4 32x32 fields
+// 40% faster and 4:2:0 32x32 ones 14-21%.
 const int kSplit = 1 << ((kVariant >> 2) & 3);
 const int kGroupLanes = 8 * kSplit;  // a block's lanes
 const int kGroupBlocks = 8 / kSplit; // a workgroup's blocks
 
 // The samples: bytes at 8 bits, 16 bits each at 9 to 16 (kWide), 4 or 2 to a 32-bit word. The SADs
 // of 16-bit samples count 2^kDepthShift times as much, so the lambda tables take the worst
-// neighbour SAD in steps that much larger (Context).
+// neighbour SAD in steps that much larger (Context). Float samples (kFloatS) are searched as the
+// 16-bit samples they stand for: luma's 0 .. 1 and chroma's -0.5 .. 0.5 (offset by 0.5) scaled to
+// 0 .. 65535, rounded and clamped (Quantize), each read as it comes, so a plane's word w is the
+// pair of samples 2w and 2w + 1 (RefYWord), everything after the reads as at 16 bits; the CPU
+// reference quantizes the same samples, and the SAD is on the 16-bit scale mvu gives float SADs.
 const int kDepthShift = (kVariant >> 4) & 15;
 const bool kWide = kDepthShift != 0;
+const bool kFloatS = (kVariant & 256) != 0;
 const int kSPW = kWide ? 2 : 4; // samples per word
 const int kLogSPW = kWide ? 1 : 2;
 
+// The 16-bit sample a float sample stands for; NaN as 0
+uint Quantize(float x, bool chroma) {
+    precise float v = chroma ? x + 0.5 : x;
+    v = v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
+    precise float s = v * 65535.0 + 0.5;
+    return uint(s);
+}
+
 // Sample i of the current frame's luma or chroma planes
 uint CurLuma(int i) {
-    return kWide ? uint(curY16[i]) : uint(curY[i]);
+    return kFloatS ? Quantize(uintBitsToFloat(curY32[i]), false) : kWide ? uint(curY16[i]) : uint(curY[i]);
 }
 uint CurChroma(uint i) {
-    return kWide ? uint(curC16[i]) : uint(curC[i]);
+    return kFloatS ? Quantize(uintBitsToFloat(curC32[i]), true) : kWide ? uint(curC16[i]) : uint(curC[i]);
+}
+// Word w of the reference frame's luma or chroma planes read as words
+uint RefYWord(uint w) {
+    if (kFloatS)
+        return Quantize(uintBitsToFloat(refY[2u * w]), false) | (Quantize(uintBitsToFloat(refY[2u * w + 1u]), false) << 16u);
+    return refY[w];
+}
+uint RefCWord(uint w) {
+    if (kFloatS)
+        return Quantize(uintBitsToFloat(refC[2u * w]), true) | (Quantize(uintBitsToFloat(refC[2u * w + 1u]), true) << 16u);
+    return refC[w];
 }
 // The word holding sample a of a plane read as words, and the shift of the sample within it
 uint WordOf(uint a) {
@@ -152,16 +180,18 @@ uint ShiftOf(uint a) {
     return (a & uint(kSPW - 1)) << (kWide ? 4u : 3u);
 }
 
-// The vectors' units per pixel, the super's pel, 2 or 4 (specialization constant 5). The super
-// holds luma's four half-pel planes either way, and chroma's four but for subsampled chroma at pel
-// 4, which has its quarter-pel image instead, as much as sixteen planes (kImage). The seeds, the
+// The vectors' units per pixel, the super's pel, 1, 2 or 4 (specialization constant 5). At pel 1
+// the super holds each plane's full-pel samples alone and the search stays on them (no sub-pel step
+// follows the passes). At pel 2 and 4 it holds luma's four half-pel planes, and chroma's four but
+// for subsampled chroma at pel 4, which has its quarter-pel image instead, as much as sixteen planes
+// (kImage). The seeds, the
 // passes and the half-pel step keep the luma vectors on the half-pel grid (ClampHalf), the fallback
 // on the full-pel grid (ClampFull), and 4:4:4 chroma, which takes the luma vector itself, with them;
 // only the quarter-pel step (refine_qpel.comp) reads between the grid's samples, and computes them
 // there, exactly as mvu.Super's quarter planes hold them.
 layout(constant_id = 5) const int kPel = 2;
 const bool kImage = kPel == 4 && kLogC != 0;
-const int kChromaPlanes = kImage ? 16 : 4;            // U's planes (or image), then V's as many plane sizes on
+const int kChromaPlanes = kImage ? 16 : kPel == 1 ? 1 : 4; // U's planes (or image), then V's as many plane sizes on
 const int kRowWords = kBlk / kSPW;                     // words of kSPW pixels in a luma row,
 const int kRowWordsC = kBlkC / kSPW;                   // and in a chroma row
 const int kLumaWords = kBlk * kRowWords;
@@ -319,8 +349,10 @@ uint HalfAddr(int Xh, int Yh, uint planeBytes, int stride) {
 // U's address of chroma position (Xc, Yc), 1 / pel pixels of the padded plane: at that place of the
 // quarter-pel image (subsampled chroma at pel 4), else in one of the four half-pel planes, the
 // position on the half-pel grid (4:4:4 at pel 4 is read only there here; refine_qpel.comp computes
-// the samples between); V's is ChromaV() on
+// the samples between), or at pel 1 in the full-pel plane; V's is ChromaV() on
 uint ChromaAddr(int Xc, int Yc) {
+    if (kPel == 1)
+        return uint(Yc * pc.wc + Xc);
     if (kImage)
         return uint(Yc * 4 * pc.wc + Xc);
     if (kPel == 4)
@@ -334,17 +366,17 @@ uint ChromaAddr(int Xc, int Yc) {
 uint StridedWord(uint a) {
     uint w = WordOf(a), s = ShiftOf(a);
     if (kWide)
-        return ((refC[w] >> s) & 0xFFFFu) | ((refC[w + 2u] >> s) << 16u);
-    return ((refC[w] >> s) & 0xFFu) | (((refC[w + 1u] >> s) & 0xFFu) << 8u) | (((refC[w + 2u] >> s) & 0xFFu) << 16u) | ((refC[w + 3u] >> s) << 24u);
+        return ((RefCWord(w) >> s) & 0xFFFFu) | ((RefCWord(w + 2u) >> s) << 16u);
+    return ((RefCWord(w) >> s) & 0xFFu) | (((RefCWord(w + 1u) >> s) & 0xFFu) << 8u) | (((RefCWord(w + 2u) >> s) & 0xFFu) << 16u) | ((RefCWord(w + 3u) >> s) << 24u);
 }
 
 // The runs of words a SAD reads: the words' worth of samples of a row starting at sample a, aligned
 // with funnel shifts, kRowWords of them for luma and kRowWordsC for chroma (gathered from the image
 // if chroma has one)
 void RunY(uint a, out uint r[kRowWords]) {
-    uint w = WordOf(a), s = ShiftOf(a), lo = refY[w];
+    uint w = WordOf(a), s = ShiftOf(a), lo = RefYWord(w);
     [[unroll]] for (int i = 0; i < kRowWords; ++i) {
-        uint hi = refY[w + uint(i) + 1u];
+        uint hi = RefYWord(w + uint(i) + 1u);
         r[i] = Bytes4(lo, hi, s);
         lo = hi;
     }
@@ -355,9 +387,9 @@ void RunC(uint a, out uint r[kRowWordsC]) {
             r[i] = StridedWord(a + uint(4 * kSPW * i));
         return;
     }
-    uint w = WordOf(a), s = ShiftOf(a), lo = refC[w];
+    uint w = WordOf(a), s = ShiftOf(a), lo = RefCWord(w);
     [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-        uint hi = refC[w + uint(i) + 1u];
+        uint hi = RefCWord(w + uint(i) + 1u);
         r[i] = Bytes4(lo, hi, s);
         lo = hi;
     }
@@ -413,6 +445,18 @@ const int kRowChunk = 4;
 const int kLumaChunk = 32 / kBlk, kChromaChunk = 32 / kBlk;
 
 #ifndef NO_BLOCK_CACHE
+// The address of luma position (X, Y), 1 / pel pixels of the padded plane, on the half-pel grid at
+// pel 2 and 4 (in the half-pel plane holding it), at pel 1 in the full-pel plane
+uint LumaAddr(int X, int Y) {
+    if (kPel == 1)
+        return uint(Y * pc.wp + X);
+    if (kPel == 4) {
+        X >>= 1;
+        Y >>= 1;
+    }
+    return uint(((X & 1) | ((Y & 1) << 1)) * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
+}
+
 // MVUtensils' SAD of the lane's block for vector v: luma kBlk x kBlk plus U and V kBlkC x kBlkC, or
 // luma alone without chroma; with kSplit 2 the lane measures every other chunk of rows and SadOf
 // adds the other lane's.
@@ -422,13 +466,7 @@ const int kLumaChunk = 32 / kBlk, kChromaChunk = 32 / kBlk;
 // chroma's, and subsampled chroma's anywhere, read from its quarter-pel image, its pixels gathered
 // from a word each.
 int LaneSad(ivec2 v) {
-    int X = kPel * (gX + pc.pad) + v.x, Y = kPel * (gY + pc.pad) + v.y;
-    if (kPel == 4) {
-        X >>= 1;
-        Y >>= 1;
-    }
-    int idx = (X & 1) | ((Y & 1) << 1);
-    uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
+    uint a = LumaAddr(kPel * (gX + pc.pad) + v.x, kPel * (gY + pc.pad) + v.y);
     uint w = WordOf(a), shift = ShiftOf(a), stride = uint(pc.wp) >> uint(kLogSPW);
     int cur = gGroup * kBlockWords;
     uint sa = 0u, sm = 0u;
@@ -436,9 +474,9 @@ int LaneSad(ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kLumaChunk; ++jj) {
             int j = j0 + jj;
             uint wj = w + uint(j) * stride;
-            uint lo = refY[wj];
+            uint lo = RefYWord(wj);
             [[unroll]] for (int i = 0; i < kRowWords; ++i) {
-                uint hi = refY[wj + uint(i) + 1u];
+                uint hi = RefYWord(wj + uint(i) + 1u);
                 PackedStep(Bytes4(lo, hi, shift), cur + j * kRowWords + i, sa, sm);
                 lo = hi;
             }
@@ -468,9 +506,9 @@ int LaneSad(ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kChromaChunk; ++jj) {
             int j = j0 + jj;
             uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;
-            uint loU = refC[u], loV = refC[t];
+            uint loU = RefCWord(u), loV = RefCWord(t);
             [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-                uint hiU = refC[u + uint(i) + 1u], hiV = refC[t + uint(i) + 1u];
+                uint hiU = RefCWord(u + uint(i) + 1u), hiV = RefCWord(t + uint(i) + 1u);
                 PackedStep(Bytes4(loU, hiU, shiftC), curU + j * kRowWordsC + i, sa, sm);
                 PackedStep(Bytes4(loV, hiV, shiftC), curV + j * kRowWordsC + i, sa, sm);
                 loU = hiU;

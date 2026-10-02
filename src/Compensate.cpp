@@ -1,418 +1,350 @@
-// Make a motion compensate temporal denoiser
-// Author: Manao
-// Copyright(c)2006 A.G.Balakhnin aka Fizick (YUY2, overlap, edges processing)
-// See legal notice in Copying.txt for more information
-
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 2 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program; if not, write to the Free Software
-// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
-// http://www.gnu.org/copyleft/gpl.html .
-
-#include <memory>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 #include <VapourSynth4.h>
+#include <VSHelper4.h>
+#include <VSVulkan4.h>
 
-#include "CopyCode.h"
-#include "Overlap.h"
 #include "Common.h"
-#include "SuperPyramid.h"
-#include "MotionBlockPyramid.h"
+#include "FilterShared.h"
+#include "SuperLayout.h"
+#include "VulkanContext.h"
 
-
+// mvu.Compensate on the GPU: every block of the frame replaced by the reference frame's block its
+// vector, scaled to the time, points at (or kept where its SAD isn't under thsad), the blocks blended
+// through their overlap windows. Two kernels per frame: the scene change test's count of badly matched
+// blocks (mask_blocks.comp), then every pixel of every plane (compensate.comp), which copies the clip's
+// pixel where the vectors are at a scene change, since the host can't see the count. The result is
+// mvu's bit for bit given the same super and vectors.
+//
+// Implemented: all of mvu.Compensate's arguments but fields, on mvgpu.Super's Gray, 4:2:0 and 4:4:4
+// supers of 8 to 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors
+// made from such supers, of any of those bit depths, as mvgpu.Analyse makes them.
 
 struct CompensateData {
-    VSNode *node = nullptr;
+    VSNode *node = nullptr; // the clip
     VSNode *super = nullptr;
     VSNode *vectors = nullptr;
-
     const VSVideoInfo *vi = nullptr;
-    const VSVideoInfo *supervi = nullptr;
-
-    int64_t thSAD;
-    bool fields;
-    int time256;
-    int64_t nSCD1;
-    float nSCD2;
-    int tff;
-    int tff_exists;
-    int deltaFrame;
-
-    bool chroma;
-    int xRatioUV;
-    int yRatioUV;
-
-    int dstTempPitch;
-    int dstTempPitchUV;
-
-    OverlapWindows OverWins;
-    OverlapWindows OverWinsUV;
-
-    OverlapsFunction OVERS[3];
-    COPYFunction BLIT[3];
-
+    SuperLayout layout;
     std::string prefix;
+
+    int delta = 0; // the vectors' reference frame is n + delta
+    int time256 = 0;
+    int thsad = 0; // scaled
+    int nbx = 0, nby = 0, step = 0, overlap = 0;
+    SceneChange scd;
+
+    std::shared_ptr<VulkanContext> vc;
+    VSGPUExecPool *pool = nullptr;
+    VkPipeline count = VK_NULL_HANDLE, pixels = VK_NULL_HANDLE;
+    VSGPUBuffer *windows = nullptr; // the overlap windows, also bound where a frame has nothing
+    VSVulkanBufferInfo windowsInfo = {};
+    int winOff[2] = {}; // where luma's and chroma's are in it
+    std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
 
-    CompensateData(const VSAPI *vsapi) : vsapi(vsapi) {};
+    CompensateData(const VSAPI *vsapi) : vsapi(vsapi) {}
 
     ~CompensateData() {
-        vsapi->freeNode(node);
-        vsapi->freeNode(super);
+        // The pool drains the GPU first, so nothing still uses what follows
+        if (pool)
+            vc->vkapi->freeGPUExecPool(pool);
+        profile.reset();
+        if (windows)
+            vc->vkapi->destroyGPUBuffer(windows);
+        vc.reset();
         vsapi->freeNode(vectors);
+        vsapi->freeNode(super);
+        vsapi->freeNode(node);
     }
 };
 
-
-template<typename PixelType>
 static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
     CompensateData *d = reinterpret_cast<CompensateData *>(instanceData);
-    int nref = n + d->deltaFrame;
+    const int nref = n + d->delta;
+    const bool load = nref >= 0 && nref < d->vi->numFrames;
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
-
-        vsapi->requestFrameFilter(n, d->vectors, frameCtx);
-
-        if (nref < n && nref >= 0)
+        if (load) {
+            vsapi->requestFrameFilter(n, d->vectors, frameCtx);
             vsapi->requestFrameFilter(nref, d->super, frameCtx);
-
-        vsapi->requestFrameFilter(n, d->super, frameCtx);
-
-        if (nref >= n && nref < d->vi->numFrames)
-            vsapi->requestFrameFilter(nref, d->super, frameCtx);
+        }
     } else if (activationReason == arAllFramesReady) {
-        uint8_t *pDstCur[3] = {};
-        ptrdiff_t nDstPitches[3] = {};
+        const VulkanContext &vc = *d->vc;
+        const VSVULKANAPI *vkapi = vc.vkapi;
+        const SuperLayout &L = d->layout;
 
+        // Everything this frame holds a reference to, released on every way out
+        std::vector<const VSFrame *> held;
         VSFrame *dst = nullptr;
-
-        try {
-            // Construct (and validate) the vectors inside the try: deserialization can throw on corrupt data.
-            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
-
-            const int ySubUV = ilog2(d->yRatioUV);
-            const int xSubUV = ilog2(d->xRatioUV);
-            const int nWidth[3] = { vectors.nWidth, nWidth[0] >> xSubUV, nWidth[1] };
-            const int nHeight[3] = { vectors.nHeight, nHeight[0] >> ySubUV, nHeight[1] };
-            const int nOverlapX[3] = { vectors.nOverlapX, nOverlapX[0] >> xSubUV, nOverlapX[1] };
-            const int nOverlapY[3] = { vectors.nOverlapY, nOverlapY[0] >> ySubUV, nOverlapY[1] };
-            const int nBlkSizeX[3] = { vectors.nBlkSizeX, nBlkSizeX[0] >> xSubUV, nBlkSizeX[1] };
-            const int nBlkSizeY[3] = { vectors.nBlkSizeY, nBlkSizeY[0] >> ySubUV, nBlkSizeY[1] };
-            const int nBlkX = vectors.nBlkX;
-            const int nBlkY = vectors.nBlkY;
-            const int64_t thSAD = d->thSAD;
-            const int dstTempPitch[3] = { d->dstTempPitch, d->dstTempPitchUV, d->dstTempPitchUV };
-            const bool chroma = d->chroma;
-            const int nPel = vectors.nPel;
-            const int time256 = d->time256;
-
-            int bitsPerSample = d->supervi->format.bitsPerSample;
-
-            int nWidth_B[3] = { nBlkX * (nBlkSizeX[0] - nOverlapX[0]) + nOverlapX[0], nWidth_B[0] >> xSubUV, nWidth_B[1] };
-            int nHeight_B[3] = { nBlkY * (nBlkSizeY[0] - nOverlapY[0]) + nOverlapY[0], nHeight_B[0] >> ySubUV, nHeight_B[1] };
-
-
-            int num_planes = chroma ? 3 : 1;
-
-            const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
-            FramePyramid pSrcGOF(src, 1, d->prefix, vsapi);
-            const auto &pSrcPlanes = pSrcGOF.GetLevel(0).planes;
-
-            if (nref >= 0 && nref < d->vi->numFrames && vectors.IsUsable(d->nSCD1, d->nSCD2)) {
-                const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-                FramePyramid pRefGOF(ref, 1, d->prefix, vsapi);
-                const auto &pRefPlanes = pRefGOF.GetLevel(0).planes;
-
-                const VSFrame *realSrc = vsapi->getFrameFilter(n, d->node, frameCtx);
-                dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, realSrc, core);
-                vsapi->freeFrame(realSrc);
-
-                for (int i = 0; i < d->supervi->format.numPlanes; i++) {
-                    pDstCur[i] = vsapi->getWritePtr(dst, i);
-                    nDstPitches[i] = vsapi->getStride(dst, i);
-                }
-
-                int fieldShift = 0;
-                if (d->fields && nPel > 1 && ((nref - n) % 2 != 0)) {
-                    bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, true, vsapi);
-                    bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, true, vsapi);
-                    fieldShift = ComputeFieldShift(src_top_field, ref_top_field, nPel);
-                }
-
-                if (nOverlapX[0] == 0 && nOverlapY[0] == 0) {
-                    // Uses a more restrictive copy function to the right/bottom when necessary to handle block dimension padded frames
-
-                    size_t blitSizeRight[3] = {};
-                    size_t blitSizeBottom[3] = {};
-
-                    for (int plane = 0; plane < num_planes; plane++) {
-                        blitSizeRight[plane] = (nBlkSizeX[plane] - (pSrcPlanes[plane].nWidth - vsapi->getFrameWidth(dst, plane))) * sizeof(PixelType);
-                        blitSizeBottom[plane] = (nBlkSizeY[plane] - (pSrcPlanes[plane].nHeight - vsapi->getFrameHeight(dst, plane)));
-                    }
-
-                    for (int by = 0; by < nBlkY; by++) {
-                        bool slowBlitY = (by == nBlkY - 1) && (blitSizeBottom[0] > 0);
-                        int xx[3] = {};
-
-                        for (int bx = 0; bx < nBlkX; bx++) {
-                            bool slowBlitX = (bx == nBlkX - 1) && (blitSizeRight[0] > 0);
-                            int i = by * nBlkX + bx;
-                            const BlockData block = vectors.GetBlock(i);
-
-                            int blx[3], bly[3];
-
-                            if (block.vector.sad < thSAD) {
-                                blx[0] = block.x * nPel + block.vector.x * time256 / 256;
-                                bly[0] = block.y * nPel + block.vector.y * time256 / 256 + fieldShift;
-                            } else {
-                                blx[0] = bx * nBlkSizeX[0] * nPel;
-                                bly[0] = by * nBlkSizeY[0] * nPel + fieldShift;
-                            }
-
-                            const auto &pPlanes = (block.vector.sad < thSAD) ? pRefPlanes : pSrcPlanes;
-
-                            blx[1] = blx[2] = blx[0] >> xSubUV;
-                            bly[1] = bly[2] = bly[0] >> ySubUV;
-
-                            if (slowBlitX || slowBlitY) {
-                                for (int plane = 0; plane < num_planes; plane++) {
-                                    mvu_bitblt(pDstCur[plane] + xx[plane], nDstPitches[plane], pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]), pPlanes[plane].nPitch, (slowBlitX && blitSizeRight[plane]) ? blitSizeRight[plane] : (nBlkSizeX[plane] * sizeof(PixelType)), (slowBlitY && blitSizeBottom[plane]) ? blitSizeBottom[plane] : nBlkSizeY[plane]);
-                                    xx[plane] += nBlkSizeX[plane] * sizeof(PixelType);
-                                }
-                            } else {
-                                for (int plane = 0; plane < num_planes; plane++) {
-                                    d->BLIT[plane](pDstCur[plane] + xx[plane], nDstPitches[plane], pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]), pPlanes[plane].nPitch);
-                                    xx[plane] += nBlkSizeX[plane] * sizeof(PixelType);
-                                }
-                            }
-                        }
-
-                        for (int plane = 0; plane < num_planes; plane++)
-                            pDstCur[plane] += nBlkSizeY[plane] * nDstPitches[plane];
-                    }
-                } else { // overlap
-                    uint8_t *DstTemp[3] = {};
-                    MvuAlignedPtr<uint8_t> DstTempBuffers[3] = { {nullptr, mvu_aligned_free}, {nullptr, mvu_aligned_free}, {nullptr, mvu_aligned_free} };
-
-                    // Allocate buffer for only nBlkSizeY rows instead of full frame height
-                    // We'll output finalized rows and reuse the buffer as a sliding window
-                    for (int plane = 0; plane < num_planes; plane++) {
-                        DstTempBuffers[plane] = mvu_make_aligned<uint8_t>(nBlkSizeY[plane] * dstTempPitch[plane]);
-                        DstTemp[plane] = DstTempBuffers[plane].get();
-                    }
-
-                    for (int by = 0; by < nBlkY; by++) {
-                        int wby = (by == 0) ? 0 : (by == nBlkY - 1) ? 6 : 3;
-                        int wbx = 0;
-                        int xx[3] = { 0 };
-
-                        // Clear the non-overlapping region for this block row
-                        for (int plane = 0; plane < num_planes; plane++) {
-                            int clearStart = (by == 0) ? 0 : nOverlapY[plane];
-                            int clearRows = (by == 0) ? nBlkSizeY[plane] : (nBlkSizeY[plane] - nOverlapY[plane]);
-                            memset(DstTemp[plane] + clearStart * dstTempPitch[plane], 0, clearRows * dstTempPitch[plane]);
-                        }
-
-                        for (int bx = 0; bx < nBlkX; bx++) {
-                            wbx = bx == nBlkX - 1 ? 2 : wbx;
-                            const int16_t *winOver[3] = { d->OverWins.GetWindow(wby + wbx) };
-                            if (chroma)
-                                winOver[1] = winOver[2] = d->OverWinsUV.GetWindow(wby + wbx);
-
-                            int i = by * nBlkX + bx;
-                            const BlockData block = vectors.GetBlock(i);
-
-                            int blx[3], bly[3];
-
-                            if (block.vector.sad < thSAD) {
-                                blx[0] = block.x * nPel + block.vector.x * time256 / 256;
-                                bly[0] = block.y * nPel + block.vector.y * time256 / 256 + fieldShift;
-                            } else {
-                                blx[0] = bx * (nBlkSizeX[0] - nOverlapX[0]) * nPel;
-                                bly[0] = by * (nBlkSizeY[0] - nOverlapY[0]) * nPel + fieldShift;
-                            }
-
-                            const auto &pPlanes = (block.vector.sad < thSAD) ? pRefPlanes : pSrcPlanes;
-
-                            blx[1] = blx[2] = blx[0] >> xSubUV;
-                            bly[1] = bly[2] = bly[0] >> ySubUV;
-
-                            for (int plane = 0; plane < num_planes; plane++) {
-                                d->OVERS[plane](DstTemp[plane] + xx[plane] * (std::is_integral_v<PixelType> ? 2 : 1), dstTempPitch[plane], pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]), pPlanes[plane].nPitch, winOver[plane], nBlkSizeX[plane]);
-                                xx[plane] += (nBlkSizeX[plane] - nOverlapX[plane]) * sizeof(PixelType);
-                            }
-                            wbx = 1;
-                        }
-
-                        // Output the finalized rows (non-overlapping portion)
-                        for (int plane = 0; plane < num_planes; plane++) {
-                            int planeRowsToOutput = (by == nBlkY - 1) ? nBlkSizeY[plane] : (nBlkSizeY[plane] - nOverlapY[plane]);
-                            int outputHeight = std::min(planeRowsToOutput, std::min(vsapi->getFrameHeight(dst, plane), nHeight_B[plane]) - by * (nBlkSizeY[plane] - nOverlapY[plane]));
-
-                            if (outputHeight > 0) {
-                                int outputWidth = std::min(vsapi->getFrameWidth(dst, plane), nWidth_B[plane]);
-                                ToPixels<PixelType>(pDstCur[plane], nDstPitches[plane], DstTemp[plane], dstTempPitch[plane], outputWidth, outputHeight, bitsPerSample);
-                            }
-
-                            pDstCur[plane] += nDstPitches[plane] * (nBlkSizeY[plane] - nOverlapY[plane]);
-                        }
-
-                        // Shift the overlapping rows to the beginning of the buffer for next iteration
-                        if (by < nBlkY - 1) {
-                            for (int plane = 0; plane < num_planes; plane++) {
-                                memmove(DstTemp[plane],
-                                    DstTemp[plane] + (nBlkSizeY[plane] - nOverlapY[plane]) * dstTempPitch[plane],
-                                    nOverlapY[plane] * dstTempPitch[plane]);
-                            }
-                        }
-                    }
-                }
-            } else {
-                assert(!dst);
-                return vsapi->getFrameFilter(n, d->node, frameCtx);
-            }
-
-        } catch (const std::exception &e) {
-            vsapi->setFilterError((std::string("Compensate: ") + e.what()).c_str(), frameCtx);
+        VSGPUExecContext *ctx = nullptr;
+        VSGPUBuffer *scratch = nullptr;
+        auto release = [&]() {
+            for (const VSFrame *f : held)
+                vsapi->freeFrame(f);
+            held.clear();
+        };
+        auto fail = [&](const std::string &message) -> const VSFrame * {
+            if (ctx)
+                vkapi->gpuExecAbandon(ctx);
+            else if (scratch)
+                vkapi->destroyGPUBuffer(scratch);
+            release();
             vsapi->freeFrame(dst);
+            vsapi->setFilterError((std::string("Compensate: ") + message).c_str(), frameCtx);
             return nullptr;
+        };
+        auto hold = [&](const VSFrame *f) {
+            if (f)
+                held.push_back(f);
+            return f;
+        };
+
+        const VSFrame *vec = load ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->prefix, vsapi)) : nullptr;
+        const VSFrame *src = hold(vsapi->getFrameFilter(n, d->node, frameCtx));
+        if (!vec) {
+            // The clip's frame, as mvu returns it where the vectors don't serve
+            const VSFrame *f = vsapi->addFrameRef(src);
+            release();
+            return f;
         }
 
+        SuperFrames ref;
+        if (!GetSuperFrames(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), L, d->prefix, ref, vsapi))
+            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
+        for (const VSFrame *f : {ref.luma, ref.chroma, ref.pyramid})
+            hold(f);
+
+        dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
+        if (!dst)
+            return fail("failed to allocate the output frame");
+
+        const int numPlanes = d->vi->format.numPlanes;
+        const bool chroma = L.format.chroma;
+        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlanes[2] = {}, vecPlane = {};
+        for (int p = 0; p < numPlanes; ++p)
+            if (vkapi->getGPUPlane(src, p, &clipPlanes[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
+                return fail("the clip's frames aren't GPU resident");
+        if (vkapi->getGPUPlane(ref.luma, 0, &superPlanes[0]) || (chroma && vkapi->getGPUPlane(ref.chroma, 0, &superPlanes[1])))
+            return fail("the super's planes aren't GPU resident");
+        if (vkapi->getGPUPlane(vec, 0, &vecPlane))
+            return fail("the vectors aren't GPU resident");
+        const ptrdiff_t recBytes = vsapi->getStride(vec, 0);
+        if (vsapi->getFrameWidth(vec, 0) != 4 * d->nbx || vsapi->getFrameHeight(vec, 0) != d->nby || recBytes % 16)
+            return fail("a vector frame doesn't match the super's grid");
+
+        // Scratch: the scene change count
+        char err[1024] = {};
+        VSVulkanBufferInfo scratchInfo = {};
+        scratch = vkapi->createGPUBuffer(core, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                         &scratchInfo, err, sizeof(err));
+        if (!scratch)
+            return fail(err);
+        ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
+        if (!ctx)
+            return fail(err);
+        vkapi->gpuExecUsesBuffer(ctx, scratch);
+        vkapi->gpuExecReadsFrame(ctx, src);
+        for (const VSFrame *f : {ref.luma, ref.chroma})
+            if (f)
+                vkapi->gpuExecReadsFrame(ctx, f);
+        vkapi->gpuExecReadsFrame(ctx, vec);
+        for (int p = 0; p < numPlanes; ++p)
+            vkapi->gpuExecWritesPlane(ctx, dst, p);
+
+        const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
+        Recorder rec(vc, cmd, d->windowsInfo.buffer);
+        const VkQueryPool queries = d->profile ? d->profile->Begin(vc, cmd) : VK_NULL_HANDLE;
+        auto stamp = [&](int stage) {
+            if (d->profile)
+                d->profile->Stamp(vc, cmd, queries, stage);
+        };
+
+        rec.Fill(scratchInfo.buffer, 0, 16, 0);
+        rec.TransferToCompute();
+        RecordBadBlockCount(rec, d->count, vecPlane.buffer, static_cast<int>(recBytes / 16), d->nbx, d->nby, d->scd.thscd1, scratchInfo.buffer, 0);
+        rec.ComputeBarrier();
+        stamp(1);
+
+        const ptrdiff_t bytes = L.format.Bytes(); // strides in samples
+        FlowParams pc = {};
+        pc.nbx = d->nbx;
+        pc.nby = d->nby;
+        pc.recStride = static_cast<int32_t>(recBytes / 16);
+        pc.pad = L.pad;
+        pc.padY = L.padY;
+        pc.padc = L.padc;
+        pc.padcY = L.padcY;
+        pc.wp = static_cast<int32_t>(vsapi->getStride(ref.luma, 0) / bytes);
+        pc.hp = L.hp;
+        pc.wc = chroma ? static_cast<int32_t>(vsapi->getStride(ref.chroma, 0) / bytes) : 0;
+        pc.hc = L.hc;
+        pc.time256 = d->time256;
+        pc.scdLimit = d->scd.limit;
+        // compensate.comp's slots: thsad, the grid's step and overlap, the clip's largest value
+        pc.thscd1 = d->thsad;
+        pc.time4096FX = d->step;
+        pc.time4096FY = d->overlap;
+        pc.time4096BX = L.format.Float() ? 0 : (1 << L.format.bits) - 1;
+
+        rec.Bind(kFlTaps, d->windowsInfo.buffer);
+        rec.Bind(kFlRefLuma, superPlanes[0].buffer);
+        rec.Bind(kFlRefChroma, chroma ? superPlanes[1].buffer : d->windowsInfo.buffer);
+        rec.Bind(kFlVecF, vecPlane.buffer);
+        rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
+        for (int p = 0; p < numPlanes; ++p) {
+            pc.plane = p;
+            pc.width = vsapi->getFrameWidth(dst, p);
+            pc.height = vsapi->getFrameHeight(dst, p);
+            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
+            pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
+            pc.colOff = d->winOff[p ? 1 : 0]; // compensate.comp's windows
+            rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
+            rec.Bind(kFlOut, outPlanes[p].buffer);
+            rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
+        }
+        stamp(2);
+
+        uint64_t signaled = 0;
+        const int submitted = vkapi->gpuExecSubmit(ctx, &signaled, err, sizeof(err));
+        ctx = nullptr;
+        scratch = nullptr; // the context owned it
+        if (submitted)
+            return fail(err);
+        if (d->profile)
+            d->profile->Finish(vc, d->pool, signaled, queries);
+        release();
         return dst;
     }
 
     return nullptr;
 }
 
-
 static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void *userData, VSCore *core, const VSAPI *vsapi) noexcept {
     std::unique_ptr<CompensateData> d = std::make_unique<CompensateData>(vsapi);
-    int err;
-
-    d->thSAD = vsapi->mapGetInt(in, "thsad", 0, &err);
-    if (err)
-        d->thSAD = 10000;
-
-    d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
-    double time = vsapi->mapGetFloat(in, "time", 0, &err);
-    if (err)
-        time = 100.0;
-
-    d->nSCD1 = vsapi->mapGetInt(in, "thscd1", 0, &err);
-    if (err)
-        d->nSCD1 = MV_DEFAULT_SCD1;
-
-    d->nSCD2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
-    if (err)
-        d->nSCD2 = MV_DEFAULT_SCD2;
-
-    d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-    d->tff_exists = !err;
 
     try {
+        int err;
+        int64_t thsad = vsapi->mapGetInt(in, "thsad", 0, &err);
+        if (err)
+            thsad = 10000;
+        if (vsapi->mapGetInt(in, "fields", 0, &err) && !err)
+            throw std::runtime_error("fields=True isn't implemented");
+        double time = vsapi->mapGetFloat(in, "time", 0, &err);
+        if (err)
+            time = 100.0;
+        int64_t thscd1 = vsapi->mapGetInt(in, "thscd1", 0, &err);
+        if (err)
+            thscd1 = MV_DEFAULT_SCD1;
+        float thscd2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
+        if (err)
+            thscd2 = MV_DEFAULT_SCD2;
         if (!std::isfinite(time) || time < 0.0 || time > 100.0)
             throw std::runtime_error("time must be between 0.0 and 100.0");
-
         const char *prefix = vsapi->mapGetData(in, "prefix", 0, &err);
-        if (prefix)
-            d->prefix = prefix;
-        else
-            d->prefix = DEFAULT_MVUTENSILS_PREFIX;
+        d->prefix = prefix ? prefix : DEFAULT_MVGPUTENSILS_PREFIX;
 
         d->super = vsapi->mapGetNode(in, "super", 0, nullptr);
-
-        FramePyramid super(d->super, d->prefix, vsapi);
-
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
-
         d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
         d->vi = vsapi->getVideoInfo(d->node);
 
-        if (!super.IsCompatibleWithSource(d->vi))
+        d->layout = ImportSuperLayout(d->super, d->prefix, vsapi);
+        const SuperLayout &L = d->layout;
+        if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
+            throw std::runtime_error(unsupported);
+        if (!vsh::isConstantVideoFormat(d->vi) || d->vi->format.colorFamily != (L.format.chroma ? cfYUV : cfGray) ||
+            d->vi->format.sampleType != (L.format.Kind() == 2 ? stFloat : stInteger) || d->vi->format.bitsPerSample != L.format.bits ||
+            (1 << d->vi->format.subSamplingW) != L.format.xr || (1 << d->vi->format.subSamplingH) != L.format.yr || d->vi->width != L.width ||
+            d->vi->height != L.height)
             throw std::runtime_error("source clip isn't compatible with super clip");
 
-        d->xRatioUV = super.xRatioUV;
-        d->yRatioUV = super.yRatioUV;
+        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
+        // depth (mvu's IsCompatibleWithAnalysis). The grid is theirs, as in mvu; the super only
+        // supplies the planes.
+        const VectorInfo v = ReadVectorInfo(d->vectors, d->prefix, vsapi);
+        const SuperLayout analysed = ImportSuperLayout(d->vectors, d->prefix, vsapi);
+        if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
+            v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
+            throw std::runtime_error("wrong source or super clip frame size");
+        if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
+            v.nby != analysed.nby)
+            throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        d->delta = v.delta;
+        d->nbx = v.nbx;
+        d->nby = v.nby;
+        d->step = v.blkX - v.overlapX;
+        d->overlap = v.overlapX;
+        d->scd = ScaleSceneChange(v, thscd1, thscd2);
+        // thsad scaled as thscd1 is, truncated as mvu's int64 is; a SAD is never above int's range, so
+        // a larger threshold takes every vector
+        const double scaled = static_cast<double>(thsad) * ThSCDScale(v) + 0.5;
+        constexpr int kMax = std::numeric_limits<int>::max(), kMin = std::numeric_limits<int>::min();
+        d->thsad = scaled >= kMax ? kMax : scaled <= kMin ? kMin : static_cast<int>(static_cast<int64_t>(scaled));
+        d->time256 = static_cast<int>(time * 256 / 100);
 
-        MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
+        d->vc = VulkanContext::Get(core, vsapi);
+        VulkanContext &vc = *d->vc;
+        // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical; bit 2
+        // 16-bit samples, bit 3 float
+        const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
+        d->count = vc.Pipeline(Kernel::MaskBlocks, 0, 0, 0);
+        d->pixels = vc.Pipeline(Kernel::Compensate, 0, L.pel, chromaLog | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0));
 
-        vectors.ScaleThSCD(d->nSCD1, d->nSCD2, vectors.bitsPerSample);
-
-        d->deltaFrame = vectors.nDeltaFrame;
-
-        if (d->fields && vectors.nPel < 2)
-            throw std::runtime_error("fields option requires pel > 1");
-
-        d->thSAD = (int64_t)(d->thSAD * vectors.GetThSCDScaleFactor(vectors.bitsPerSample) + 0.5);
-
-        // accumulator is 1x pixel width for float (bytesPerSample 4), 2x for 8/16-bit integer.
-        const int accRatio = (d->vi->format.bytesPerSample == 4) ? 1 : 2;
-        d->dstTempPitch = ((vectors.nWidth + 15) / 16) * 16 * d->vi->format.bytesPerSample * accRatio;
-        d->dstTempPitchUV = (((vectors.nWidth / d->xRatioUV) + 15) / 16) * 16 * d->vi->format.bytesPerSample * accRatio;
-
-        d->supervi = vsapi->getVideoInfo(d->super);
-
-        if (!vectors.IsCompatibleWithAnalysis(super))
-            throw std::runtime_error("wrong source or super clip frame size");;
-
-        d->chroma = (d->vi->format.colorFamily != cfGray);
-
-        if (vectors.nOverlapX > 0 || vectors.nOverlapY > 0) {
-            d->OverWins.Init(vectors.nBlkSizeX, vectors.nBlkSizeY, vectors.nOverlapX, vectors.nOverlapY);
-            if (d->chroma)
-                d->OverWinsUV.Init(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, vectors.nOverlapX / d->xRatioUV, vectors.nOverlapY / d->yRatioUV);
+        // The overlap windows, luma's and chroma's (mvu's OverWins and OverWinsUV)
+        std::vector<int32_t> tables;
+        if (d->overlap > 0) {
+            const int xr = L.format.xr, yr = L.format.yr, blk = v.blkX;
+            const std::vector<int32_t> lumaWin = MakeOverlapWindows(blk, blk, d->overlap, d->overlap);
+            const std::vector<int32_t> chromaWin = MakeOverlapWindows(blk / xr, blk / yr, d->overlap / xr, d->overlap / yr);
+            d->winOff[0] = static_cast<int>(tables.size());
+            tables.insert(tables.end(), lumaWin.begin(), lumaWin.end());
+            d->winOff[1] = static_cast<int>(tables.size());
+            tables.insert(tables.end(), chromaWin.begin(), chromaWin.end());
         }
+        tables.resize(std::max<size_t>(tables.size(), 64)); // a dummy for the bindings a frame doesn't use too
 
-        const unsigned bits = d->vi->format.bytesPerSample * 8;
-
-        d->OVERS[0] = selectOverlapsFunction(vectors.nBlkSizeX, vectors.nBlkSizeY, bits);
-        d->BLIT[0] = selectCopyFunction(vectors.nBlkSizeX, vectors.nBlkSizeY, bits);
-
-        d->OVERS[1] = d->OVERS[2] = selectOverlapsFunction(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, bits);
-        d->BLIT[1] = d->BLIT[2] = selectCopyFunction(vectors.nBlkSizeX / d->xRatioUV, vectors.nBlkSizeY / d->yRatioUV, bits);
-
-        d->time256 = (int)(time * 256 / 100);
-
+        char errMsg[1024] = {};
+        d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
+        if (!d->pool)
+            throw std::runtime_error(errMsg);
+        d->windows = vc.Upload(core, d->pool, tables.data(), tables.size() * sizeof(int32_t), d->windowsInfo);
+        if (StageProfiler::Requested())
+            d->profile = std::make_unique<StageProfiler>("Compensate (pel " + std::to_string(L.pel) + ")", std::vector<std::string>{"count", "pixels"});
     } catch (const std::exception &e) {
-        vsapi->mapSetError(out, ("Compensate: " + std::string(e.what())).c_str());
+        vsapi->mapSetError(out, (std::string("Compensate: ") + e.what()).c_str());
         return;
     }
 
-    VSFilterDependency deps[3] = { 
+    VSFilterDependency deps[3] = {
         {d->node, rpStrictSpatial},
         {d->super, rpGeneral},
-        {d->vectors, rpNoFrameReuse},
+        {d->vectors, rpStrictSpatial},
     };
-
-    vsapi->createVideoFilter(out, "Compensate", d->vi, SelectOnBitsPerSample(d->vi->format.bitsPerSample, compensateGetFrame<uint8_t>, compensateGetFrame<uint16_t>, compensateGetFrame<float>), filterFree<CompensateData>, fmParallel, deps, ARRAY_SIZE(deps), d.get(), core);
+    vsapi->createVideoFilterEx(out, "Compensate", d->vi, compensateGetFrame, filterFree<CompensateData>, fmParallel, ffGPUOutput, deps, ARRAY_SIZE(deps), d.get(), core);
     d.release();
 }
 
-
 void compensateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
     vspapi->registerFunction("Compensate",
-                 "clip:vnode;"
-                 "super:vnode;"
-                 "vectors:vnode;"
-                 "thsad:int:opt;"
-                 "fields:int:opt;"
-                 "time:float:opt;"
-                 "thscd1:int:opt;"
-                 "thscd2:float:opt;"
-                 "tff:int:opt;"
-                 "prefix:data:opt;",
-                 "clip:vnode;",
-                 compensateCreate, nullptr, plugin);
+                             "clip:vnode:gpu;"
+                             "super:vnode:gpu;"
+                             "vectors:vnode:gpu;"
+                             "thsad:int:opt;"
+                             "fields:int:opt;"
+                             "time:float:opt;"
+                             "thscd1:int:opt;"
+                             "thscd2:float:opt;"
+                             "tff:int:opt;"
+                             "prefix:data:opt;",
+                             "clip:vnode:gpu;", compensateCreate, nullptr, plugin);
 }

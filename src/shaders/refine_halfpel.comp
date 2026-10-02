@@ -8,12 +8,12 @@ layout(local_size_x = 64) in;
 // block, rows pc.recStride records apart
 layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; };
 
-// The 8 half-pel positions around each block's vector, against its final neighbours: kGroupBlocks
-// blocks per workgroup in a row, lane i of each 8 of a block's group measuring position i (kSplit),
-// the best by one minimum of CandidateKey over the group. Reads field A and writes the output, so
-// every block sees its neighbours as the passes left them; at pel 4 it writes field B instead, for
-// the quarter-pel step (refine_qpel.comp). Dispatched as ((nbx + kGroupBlocks - 1) / kGroupBlocks,
-// nby) workgroups.
+// The 8 half-pel positions around each block's vector, against its final neighbours (at pel 1 none,
+// the passes' vectors written out): kGroupBlocks blocks per workgroup in a row, lane i of each 8 of a
+// block's group measuring position i (kSplit), the best by one minimum of CandidateKey over the
+// group. Reads field A and writes the output, so every block sees its neighbours as the passes left
+// them; at pel 4 it writes field B instead, for the quarter-pel step (refine_qpel.comp). Dispatched
+// as ((nbx + kGroupBlocks - 1) / kGroupBlocks, nby) workgroups.
 void main() {
     uint lane = WorkgroupLane();
     int group = int(lane) / kGroupLanes, sub = int(lane & 7u), inGroup = int(lane) & (kGroupLanes - 1);
@@ -32,8 +32,10 @@ void main() {
     ivec2 best = c0;
     int bestSad = sadA[b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
+    // (at pel 1 there are no half pels: every position is c0 itself, and the block's vector goes out
+    // as the passes left it)
     ivec2 v = ClampHalf(c0 + Around(sub, kPel / 2));
-    int s = live ? LaneSad(v) : 0;
+    int s = live && kPel > 1 ? LaneSad(v) : 0;
     uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
     int owner = KeyLane(win);
     ivec2 wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));

@@ -18,6 +18,9 @@
     <ClInclude Include="..\src\Common.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\FilterShared.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\SuperLayout.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -29,13 +32,31 @@
     <ClCompile Include="..\src\Analyse.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\Compensate.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\Degrain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\EntryPoint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\FilterShared.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\Flow.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\FlowInterpolate.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\Mask.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\Recalculate.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\SCDetection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\Super.cpp">
@@ -49,6 +70,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\src\shaders\compensate.comp">
+      <Filter>Shader Files</Filter>
+    </None>
     <None Include="..\src\shaders\degrain.comp">
       <Filter>Shader Files</Filter>
     </None>
@@ -64,13 +88,28 @@
     <None Include="..\src\shaders\embed_shaders.py">
       <Filter>Shader Files</Filter>
     </None>
+    <None Include="..\src\shaders\flow_blur.comp">
+      <Filter>Shader Files</Filter>
+    </None>
     <None Include="..\src\shaders\flow_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\flow_fetch.comp">
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\flow_inter.comp">
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\flow_prep.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\mask_blocks.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\mask_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\mask_resize.comp">
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\median.comp">
@@ -89,6 +128,9 @@
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\pyr_top.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\recalc.comp">
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\refine_apply.comp">

@@ -104,33 +104,47 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\src\Common.h" />
+    <ClInclude Include="..\src\FilterShared.h" />
     <ClInclude Include="..\src\SuperLayout.h" />
     <ClInclude Include="..\src\VulkanContext.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\src\Analyse.cpp" />
+    <ClCompile Include="..\src\Compensate.cpp" />
     <ClCompile Include="..\src\Degrain.cpp" />
     <ClCompile Include="..\src\EntryPoint.cpp" />
+    <ClCompile Include="..\src\FilterShared.cpp" />
+    <ClCompile Include="..\src\Flow.cpp" />
     <ClCompile Include="..\src\FlowInterpolate.cpp" />
+    <ClCompile Include="..\src\Mask.cpp" />
+    <ClCompile Include="..\src\Recalculate.cpp" />
+    <ClCompile Include="..\src\SCDetection.cpp" />
     <ClCompile Include="..\src\Super.cpp" />
     <ClCompile Include="..\src\SuperLayout.cpp" />
     <ClCompile Include="..\src\VulkanContext.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\src\shaders\compensate.comp" />
     <None Include="..\src\shaders\degrain.comp" />
     <None Include="..\src\shaders\degrain_common.glsl" />
     <None Include="..\src\shaders\degrain_count.comp" />
     <None Include="..\src\shaders\degrain_weights.comp" />
     <None Include="..\src\shaders\embed_shaders.py" />
+    <None Include="..\src\shaders\flow_blur.comp" />
     <None Include="..\src\shaders\flow_common.glsl" />
+    <None Include="..\src\shaders\flow_fetch.comp" />
     <None Include="..\src\shaders\flow_inter.comp" />
     <None Include="..\src\shaders\flow_prep.comp" />
+    <None Include="..\src\shaders\mask_blocks.comp" />
+    <None Include="..\src\shaders\mask_common.glsl" />
+    <None Include="..\src\shaders\mask_resize.comp" />
     <None Include="..\src\shaders\median.comp" />
     <None Include="..\src\shaders\pyr_common.glsl" />
     <None Include="..\src\shaders\pyr_pass.comp" />
     <None Include="..\src\shaders\pyr_reduce.comp" />
     <None Include="..\src\shaders\pyr_seed.comp" />
     <None Include="..\src\shaders\pyr_top.comp" />
+    <None Include="..\src\shaders\recalc.comp" />
     <None Include="..\src\shaders\refine_apply.comp" />
     <None Include="..\src\shaders\refine_common.glsl" />
     <None Include="..\src\shaders\refine_fallback.comp" />

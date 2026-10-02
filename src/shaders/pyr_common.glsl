@@ -81,9 +81,19 @@ void SetupField(int z) {
     gMedianBase = z * kMedianSlots;
 }
 
-// Sample i of the current frame's pyramid
-uint PyrSample(int i) {
+// Sample i of the current frame's pyramid, luma's or chroma's
+uint PyrSample(int i, bool chroma) {
+    if (kFloatS)
+        return Quantize(uintBitsToFloat(curPyrW[i]), chroma);
     return (curPyrW[WordOf(uint(i))] >> ShiftOf(uint(i))) & (kWide ? 0xFFFFu : 0xFFu);
+}
+
+// Word w of the lane's field's reference pyramid read as words, in luma's or chroma's planes (see
+// RefYWord)
+uint PyrWord(uint w, bool chroma) {
+    if (kFloatS)
+        return Quantize(uintBitsToFloat(refPyr[gField].w[2u * w]), chroma) | (Quantize(uintBitsToFloat(refPyr[gField].w[2u * w + 1u]), chroma) << 16u);
+    return refPyr[gField].w[w];
 }
 
 // Keeps the reference block within the level's padding, as Pyramid::Bound
@@ -113,7 +123,7 @@ void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int
                     at = (k - kLevelLumaWords < kLevelChromaWords ? lv.offU : lv.offV) + ((gLY >> kLogC) + kc / kLevelRowWordsC) * lv.strideC + (gLX >> kLogC) +
                          (kc % kLevelRowWordsC) * kSPW + i;
                 }
-                b[i] = PyrSample(at);
+                b[i] = PyrSample(at, k >= kLevelLumaWords);
                 partial += b[i];
             }
             StoreWord(group * kLevelWords + k, b[0], b[1], b[2], b[3]);
@@ -135,9 +145,9 @@ int LevelSadOf(Level lv, ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint wj = w + uint(j) * stride;
-            uint lo = refPyr[gField].w[wj];
+            uint lo = PyrWord(wj, false);
             [[unroll]] for (int i = 0; i < kLevelRowWords; ++i) {
-                uint hi = refPyr[gField].w[wj + uint(i) + 1u];
+                uint hi = PyrWord(wj + uint(i) + 1u, false);
                 PackedStep(Bytes4(lo, hi, shift), cur + kLevelRowWords * j + i, sa, sm);
                 lo = hi;
             }
@@ -154,9 +164,9 @@ int LevelSadOf(Level lv, ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;
-            uint loU = refPyr[gField].w[u], loV = refPyr[gField].w[t];
+            uint loU = PyrWord(u, true), loV = PyrWord(t, true);
             [[unroll]] for (int i = 0; i < kLevelRowWordsC; ++i) {
-                uint hiU = refPyr[gField].w[u + uint(i) + 1u], hiV = refPyr[gField].w[t + uint(i) + 1u];
+                uint hiU = PyrWord(u + uint(i) + 1u, true), hiV = PyrWord(t + uint(i) + 1u, true);
                 PackedStep(Bytes4(loU, hiU, shiftU), curU + j * kLevelRowWordsC + i, sa, sm);
                 PackedStep(Bytes4(loV, hiV, shiftV), curV + j * kLevelRowWordsC + i, sa, sm);
                 loU = hiU;

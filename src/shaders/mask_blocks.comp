@@ -1,0 +1,134 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "mask_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// Per block: the scene change test's count of the blocks with a SAD above thscd1
+// (MotionBlockLevel::IsSceneChange), added into counts[pc.countSlot], which starts at zero, and unless pc.kind
+// is kCount, the block's mask value: its own for the vector length and SAD masks, while each block of
+// the occlusion mask takes the largest of the values its neighbours give it, through atomicMax into
+// values zeroed before (floats compare as their bits, never negative). Dispatched as
+// ((nbx * nby + 63) / 64) workgroups.
+
+ivec4 Rec(int bx, int by) {
+    return recs[by * pc.recStride + bx];
+}
+
+// C++'s a / 4096, truncated toward zero
+int Div4096(int a) {
+    return a >= 0 ? a / 4096 : -(-a / 4096);
+}
+
+// A value as the mask stores it: truncated to an integer, as mvu's cast to the pixel type does, or
+// a float's bits
+uint Encode(float v) {
+    return kKind == 2 ? floatBitsToUint(v) : uint(v);
+}
+
+// mvu's MaskLength, in double precision as mvu computes it: dx * dx + dy * dy is exact, (vx^2 + vy^2)
+// / pel^2 here; gamma 1 (halfGamma 0.5, the default) is the square root, gamma 2 the value itself,
+// other gammas PowD. A device without doubles computes in float.
+uint VectorLength(ivec2 v) {
+#if MVGPU_FLOAT64
+    precise double norme = double(int64_t(v.x) * v.x + int64_t(v.y) * v.y) * double(pc.normY);
+    precise double x = norme * double(pc.norm);
+    double p = pc.gamma == 0.5 ? sqrt(x) : pc.gamma == 1.0 ? x : pc.gamma == 0.0 ? 1.0 : PowD(x, double(pc.gamma));
+    precise double l = double(pc.maxVal) * p;
+    l = l > double(pc.maxVal) ? double(pc.maxVal) : l;
+    return kKind == 2 ? floatBitsToUint(float(l)) : uint(l);
+#else
+    precise float norme = float(v.x * v.x + v.y * v.y) * pc.normY;
+    precise float x = norme * pc.norm;
+    float p = pc.gamma == 0.5 ? sqrt(x) : pc.gamma == 1.0 ? x : pc.gamma == 0.0 ? 1.0 : PowF(x, pc.gamma);
+    precise float l = float(pc.maxVal) * p;
+    l = l > float(pc.maxVal) ? float(pc.maxVal) : l;
+    return Encode(l);
+#endif
+}
+
+// mvu's MakeSADMask for block (bx, by) with vector v: the SAD, at 8 bits, of the block the vector
+// reaches back toward at 256 - time (or of the block itself where that is outside the frame), in
+// mvu's float arithmetic (PixelNorm)
+uint SadValue(int bx, int by, ivec2 v) {
+    int bxi = bx - Div4096(v.x * pc.time4096X), byi = by - Div4096(v.y * pc.time4096Y);
+    if (bxi < 0 || bxi >= pc.nbx || byi < 0 || byi >= pc.nby) {
+        bxi = bx;
+        byi = by;
+    }
+    int sad = Rec(bxi, byi).z >> pc.sadShift;
+    precise float x = float(sad) * pc.norm;
+    float p = pc.gamma == 1.0 ? x : pc.gamma == 0.0 ? 1.0 : PowF(x, pc.gamma);
+    precise float l = float(pc.maxVal) * p;
+    l = l > float(pc.maxVal) ? float(pc.maxVal) : l;
+    return Encode(l);
+}
+
+// mvu's ByteOccMask for an occlusion of this many units: min(peak * occlusion * occnorm, peak), or
+// with gamma min(peak * pow(occlusion * occnorm, gamma), peak), in float
+uint OccValue(int occlusion, float occnorm) {
+    float m = float(pc.maxVal);
+    float v;
+    if (pc.gamma == 1.0) {
+        precise float t = m * float(occlusion);
+        precise float u = t * occnorm;
+        v = u;
+    } else {
+        precise float t = float(occlusion) * occnorm;
+        float p = pc.gamma == 0.0 ? 1.0 : PowF(t, pc.gamma);
+        precise float u = m * p;
+        v = u;
+    }
+    return Encode(m < v ? m : v);
+}
+
+// mvu's MakeVectorOcclusionMask from block (bx, by) with vector v: where its right or lower
+// neighbour moves less, the blocks the difference sweeps over at the time get the occlusion's value
+void Occlusion(int bx, int by, ivec2 v) {
+    bool backward = pc.backward != 0;
+    if (bx < pc.nbx - 1) {
+        int vxRight = Rec(bx + 1, by).x;
+        if (vxRight < v.x) {
+            int occlusion = v.x - vxRight;
+            int reach = occlusion * pc.time4096X / 4096;
+            int minb = backward ? max(0, bx + 1 - reach) : bx;
+            int maxb = backward ? bx + 1 : min(bx + 1 - reach, pc.nbx - 1);
+            uint value = OccValue(occlusion, pc.norm);
+            for (int bxi = minb; bxi <= maxb; ++bxi)
+                atomicMax(values[by * pc.nbx + bxi], value);
+        }
+    }
+    if (by < pc.nby - 1) {
+        int vyBelow = Rec(bx, by + 1).y;
+        if (vyBelow < v.y) {
+            int occlusion = v.y - vyBelow;
+            int reach = occlusion * pc.time4096Y / 4096;
+            int minb = backward ? max(0, by + 1 - reach) : by;
+            int maxb = backward ? by + 1 : min(by + 1 - reach, pc.nby - 1);
+            uint value = OccValue(occlusion, pc.normY);
+            for (int byi = minb; byi <= maxb; ++byi)
+                atomicMax(values[byi * pc.nbx + bx], value);
+        }
+    }
+}
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    bool live = b < pc.nbx * pc.nby;
+    int bx = live ? b % pc.nbx : 0, by = live ? b / pc.nbx : 0;
+    ivec4 r = Rec(bx, by);
+    uint sum = subgroupAdd(live && r.z > pc.thscd1 ? 1u : 0u);
+    if (subgroupElect() && sum != 0u)
+        atomicAdd(counts[pc.countSlot], sum);
+    if (!live || pc.kind == kCount)
+        return;
+    if (pc.kind == kLength)
+        values[b] = VectorLength(r.xy);
+    else if (pc.kind == kSad)
+        values[b] = SadValue(bx, by, r.xy);
+    else
+        Occlusion(bx, by, r.xy);
+}

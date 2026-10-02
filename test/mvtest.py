@@ -7,6 +7,8 @@ frame of 32-bit records (x, y, SAD, 0) per block, a row of records per row of bl
 the super clip, whose own properties describe the super (SuperLayout.h). Frames whose reference
 frame lies outside the clip carry no vectors on either side.
 """
+import math
+
 import numpy as np
 import vapoursynth as vs
 
@@ -35,6 +37,16 @@ def format_clip(core, clip, fmt):
     if f.bits_per_sample > 8:
         return core.resize.Bicubic(clip, format=f.id, src_left=0.25, src_top=0.25)
     return clip if f.id == clip.format.id else core.resize.Bicubic(clip, format=f.id)
+
+
+def plane_pair(fa, fb, p):
+    """Plane p of two frames as arrays to compare exactly, integers widened and floats as their bits
+    (bit for bit, signed zeros and NaNs too), and the absolute differences of their values"""
+    a, b = np.asarray(fa[p]), np.asarray(fb[p])
+    if a.dtype.kind == 'f':
+        return a.view(np.uint32), b.view(np.uint32), np.abs(a.astype(np.float64) - b.astype(np.float64))
+    a, b = a.astype(np.int64), b.astype(np.int64)
+    return a, b, np.abs(a - b)
 
 
 def eight_bit(core, clip):
@@ -110,3 +122,63 @@ def gpu_vectors(core, analysis, gsup):
         return g
 
     return core.std.ModifyFrame(gsup, [gsup, records, analysis], attach)
+
+
+def scene_limits(props, thscd1, thscd2):
+    """mvu's scaled thscd1 and the largest count of blocks above it that isn't a scene change
+    (ScaleThSCD, IsSceneChange), for the vectors' bit depth"""
+    blk, nbx, nby = props['MVUtensilsAnalysisBlkSizeX'], props['MVUtensilsAnalysisNBlkX'], props['MVUtensilsAnalysisNBlkY']
+    chroma = props['MVUtensilsAnalysisChroma']
+    ratio = props['MVUtensilsAnalysisXRatioUV'] * props['MVUtensilsAnalysisYRatioUV']
+    depth = ((1 << min(16, props['MVUtensilsAnalysisBitsPerSample'])) - 1) / 255.0
+    scale = blk * props['MVUtensilsAnalysisBlkSizeY'] / 64.0 * ((1.0 + 2.0 / ratio) if chroma else 1.0) * depth
+    th1 = int(thscd1 * scale + 0.5)
+    blocks = np.float32(float(np.float32(thscd2)) * nbx * nby / 100.0)
+    return th1, int(math.floor(blocks))
+
+
+def const_vectors(core, analysis, limit, th1, scd, seed):
+    """analysis (mvu.Analyse's) with every block of a frame given one vector of at most limit in
+    each direction, drawn per frame; by the frame, the SADs below thscd1, at it, or the first scd or
+    scd + 1 blocks just above it (a scene change only then)"""
+    props = analysis.get_frame(0).props
+    nb = props['MVUtensilsAnalysisNBlkX'] * props['MVUtensilsAnalysisNBlkY']
+
+    def modify(n, f):
+        g = f.copy()
+        if 'MVUtensilsAnalysisVectors' in g.props:
+            rng = np.random.default_rng(seed * 1000003 + n)
+            vx, vy = (int(v) for v in rng.integers(-limit, limit + 1, size=2))
+            g.props['MVUtensilsAnalysisVectors'] = [(vx & 0xFFFFFFFF) | (vy << 32)] * nb
+            kind = n % 5
+            sad = np.full(nb, th1 if kind == 1 else th1 // 2, np.int64)
+            if kind >= 3:
+                sad[:scd + (kind - 3)] = th1 + 1
+            g.props['MVUtensilsAnalysisSAD'] = sad.tolist()
+        return g
+
+    return core.std.ModifyFrame(analysis, analysis, modify)
+
+
+def random_vectors(core, analysis, limit, th1, scd, seed):
+    """analysis (mvu.Analyse's) with every block given a vector of its own, at most limit in each
+    direction, drawn per frame, and a SAD up to thscd1; then, by the frame, a few blocks, scd of them
+    or scd + 1 (a scene change only then) given SADs above thscd1, up to four times it"""
+    props = analysis.get_frame(0).props
+    nb = props['MVUtensilsAnalysisNBlkX'] * props['MVUtensilsAnalysisNBlkY']
+
+    def modify(n, f):
+        g = f.copy()
+        if 'MVUtensilsAnalysisVectors' in g.props:
+            rng = np.random.default_rng(seed * 1000003 + n)
+            vx = rng.integers(-limit, limit + 1, size=nb, dtype=np.int64)
+            vy = rng.integers(-limit, limit + 1, size=nb, dtype=np.int64)
+            g.props['MVUtensilsAnalysisVectors'] = ((vx & 0xFFFFFFFF) | (vy << 32)).tolist()
+            sad = rng.integers(0, th1 + 1, size=nb, dtype=np.int64)
+            kind = n % 5
+            above = min(nb, [3, 0, scd // 2, scd, scd + 1][kind])
+            sad[rng.permutation(nb)[:above]] = rng.integers(th1 + 1, 4 * th1 + 2, size=above, dtype=np.int64)
+            g.props['MVUtensilsAnalysisSAD'] = sad.tolist()
+        return g
+
+    return core.std.ModifyFrame(analysis, analysis, modify)

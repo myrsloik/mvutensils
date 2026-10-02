@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""mvgpu.FlowInter and mvgpu.FlowFPS against mvu's, byte for byte.
+"""mvgpu.FlowInter, FlowFPS, Flow, FlowBlur and Compensate against mvu's, byte for byte.
 
-Both interpolate the same 8-bit clip with the same vectors, each side with its own super made with
+Both run the filter on the same clip with the same vectors, each side with its own super made with
 the same settings (mvgpu.Super's planes are mvu.Super's). The vectors:
 
   mvgpu  mvgpu.Analyse's, on a carrier clip for mvu (mvtest.mvu_vectors).
@@ -14,13 +14,15 @@ the same settings (mvgpu.Super's planes are mvu.Super's). The vectors:
 
 Every pixel of every output frame and plane is compared, and FlowFPS's frame durations.
 
-    check_flow.py --src clip.nv12 --size 1920x1080 --frames 30 [--filter inter|fps] [--vectors mvgpu]
-                  [--pel 2] [--blksize 16] [--overlap 8] [--format YUV444P8] [--crop 1914x1074]
-                  [--delta 1] [--time 50] [--num 60 --den 1] [--extramask 0] [--ml 100] [--blend 0]
-                  [--thscd1 400] [--thscd2 51] [--fps 30000/1001]
+    check_flow.py --src clip.nv12 --size 1920x1080 --frames 30 [--filter inter|fps|flow|blur|compensate]
+                  [--vectors mvgpu] [--pel 2] [--blksize 16] [--overlap 8] [--format YUV444P8]
+                  [--crop 1914x1074] [--delta 1] [--time 50] [--num 60 --den 1] [--extramask 0]
+                  [--ml 100] [--blend 0] [--blur 50] [--prec 1] [--thsad 10000] [--thscd1 400] [--thscd2 51]
+                  [--fps 30000/1001]
 
 --format converts the 8-bit 4:2:0 source first (resize.Bicubic). --fps sets the clip's frame rate
-(24 by default), which with --num and --den decides FlowFPS's times.
+(24 by default), which with --num and --den decides FlowFPS's times. Flow and Compensate take the
+vectors of --delta (either sign), the others those of --delta and -delta.
 """
 import argparse
 import math
@@ -32,43 +34,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
-
-
-def scene_limits(props, thscd1, thscd2):
-    """mvu's scaled thscd1 and the largest count of blocks above it that isn't a scene change
-    (ScaleThSCD, IsSceneChange), for the vectors' bit depth"""
-    blk, nbx, nby = props['MVUtensilsAnalysisBlkSizeX'], props['MVUtensilsAnalysisNBlkX'], props['MVUtensilsAnalysisNBlkY']
-    chroma = props['MVUtensilsAnalysisChroma']
-    ratio = props['MVUtensilsAnalysisXRatioUV'] * props['MVUtensilsAnalysisYRatioUV']
-    depth = ((1 << min(16, props['MVUtensilsAnalysisBitsPerSample'])) - 1) / 255.0
-    scale = blk * props['MVUtensilsAnalysisBlkSizeY'] / 64.0 * ((1.0 + 2.0 / ratio) if chroma else 1.0) * depth
-    th1 = int(thscd1 * scale + 0.5)
-    blocks = np.float32(float(np.float32(thscd2)) * nbx * nby / 100.0)
-    return th1, int(math.floor(blocks))
-
-
-def const_vectors(core, analysis, limit, th1, scd, seed):
-    """analysis (mvu.Analyse's) with every block of a frame given one vector of at most limit in
-    each direction, drawn per frame; by the frame, the SADs below thscd1, at it, or the first scd or
-    scd + 1 blocks just above it (a scene change only then)"""
-    props = analysis.get_frame(0).props
-    nb = props['MVUtensilsAnalysisNBlkX'] * props['MVUtensilsAnalysisNBlkY']
-
-    def modify(n, f):
-        g = f.copy()
-        if 'MVUtensilsAnalysisVectors' in g.props:
-            rng = np.random.default_rng(seed * 1000003 + n)
-            vx, vy = (int(v) for v in rng.integers(-limit, limit + 1, size=2))
-            g.props['MVUtensilsAnalysisVectors'] = [(vx & 0xFFFFFFFF) | (vy << 32)] * nb
-            kind = n % 5
-            sad = np.full(nb, th1 if kind == 1 else th1 // 2, np.int64)
-            if kind >= 3:
-                sad[:scd + (kind - 3)] = th1 + 1
-            g.props['MVUtensilsAnalysisSAD'] = sad.tolist()
-        return g
-
-    return core.std.ModifyFrame(analysis, analysis, modify)
+from mvtest import const_vectors, eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip, plane_pair, scene_limits  # noqa: E402
 
 
 def main():
@@ -79,19 +45,22 @@ def main():
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, YUV420P10, ...')
     ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
-    ap.add_argument('--filter', choices=['inter', 'fps'], default='inter')
+    ap.add_argument('--filter', choices=['inter', 'fps', 'flow', 'blur', 'compensate'], default='inter')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu', 'const'], default='mvgpu', help='whose vectors both sides use')
     ap.add_argument('--blksize', type=int, default=16)
     ap.add_argument('--overlap', type=int, default=8)
     ap.add_argument('--pel', type=int, default=2)
     ap.add_argument('--pad', type=int, default=16)
     ap.add_argument('--delta', type=int, default=1, help='the frames the vectors span')
-    ap.add_argument('--time', type=float, help='FlowInter')
+    ap.add_argument('--time', type=float, help='FlowInter, Flow, Compensate')
     ap.add_argument('--num', type=int, help='FlowFPS')
     ap.add_argument('--den', type=int, help='FlowFPS')
     ap.add_argument('--extramask', type=int, help='FlowFPS')
     ap.add_argument('--ml', type=float)
     ap.add_argument('--blend', type=int)
+    ap.add_argument('--blur', type=float, help='FlowBlur')
+    ap.add_argument('--prec', type=int, help='FlowBlur')
+    ap.add_argument('--thsad', type=int, help='Compensate')
     ap.add_argument('--thscd1', type=int)
     ap.add_argument('--thscd2', type=float)
     ap.add_argument('--fps', help="N/D: the clip's frame rate")
@@ -124,7 +93,7 @@ def main():
     casup = core.mvu.Super(aclip, **sk) if args.analyse8 else csup
     thscd1 = 400 if args.thscd1 is None else args.thscd1
     thscd2 = 51.0 if args.thscd2 is None else args.thscd2
-    deltas = (args.delta, -args.delta)  # mvbw, mvfw
+    deltas = (args.delta,) if args.filter in ('flow', 'compensate') else (args.delta, -args.delta)  # mvbw, mvfw
     if args.vectors == 'mvgpu':
         gvec = [core.mvgpu.Analyse(gasup, delta=d) for d in deltas]
         cvec = [mvu_vectors(core, an, clip, args.frames) for an in gvec]
@@ -135,8 +104,22 @@ def main():
             cvec = [const_vectors(core, an, (args.pad - 1) * args.pel, th1, scd, args.seed * 2 + i) for i, an in enumerate(cvec)]
         gvec = [gpu_vectors(core, an, gasup) for an in cvec]
 
-    fk = {k: getattr(args, k) for k in ('ml', 'blend', 'thscd1', 'thscd2') if getattr(args, k) is not None}
-    if args.filter == 'inter':
+    fk = {k: getattr(args, k) for k in ('thscd1', 'thscd2') if getattr(args, k) is not None}
+    if args.filter in ('inter', 'fps'):
+        fk.update({k: getattr(args, k) for k in ('ml', 'blend') if getattr(args, k) is not None})
+    if args.filter == 'flow':
+        fk.update({k: getattr(args, k) for k in ('time',) if getattr(args, k) is not None})
+        gout = core.mvgpu.Flow(gclip, gsup, gvec[0], **fk)
+        cout = core.mvu.Flow(clip, csup, cvec[0], **fk)
+    elif args.filter == 'compensate':
+        fk.update({k: getattr(args, k) for k in ('time', 'thsad') if getattr(args, k) is not None})
+        gout = core.mvgpu.Compensate(gclip, gsup, gvec[0], **fk)
+        cout = core.mvu.Compensate(clip, csup, cvec[0], **fk)
+    elif args.filter == 'blur':
+        fk.update({k: getattr(args, k) for k in ('blur', 'prec') if getattr(args, k) is not None})
+        gout = core.mvgpu.FlowBlur(gclip, gsup, gvec, **fk)
+        cout = core.mvu.FlowBlur(clip, csup, cvec, **fk)
+    elif args.filter == 'inter':
         fk.update({k: getattr(args, k) for k in ('time',) if getattr(args, k) is not None})
         gout = core.mvgpu.FlowInter(gclip, gsup, gvec, **fk)
         cout = core.mvu.FlowInter(clip, csup, cvec, **fk)
@@ -164,26 +147,25 @@ def main():
         for k in ('_DurationNum', '_DurationDen'):
             if a.props.get(k) != b.props.get(k):
                 props_differ += 1
-        for p in range(3):
-            pa, pb = np.asarray(a[p]).astype(np.int32), np.asarray(b[p]).astype(np.int32)
-            changed += np.count_nonzero(pb != np.asarray(before[p]))
-            diff = pa - pb
-            d = np.count_nonzero(diff)
+        for p in range(clip.format.num_planes):
+            pa, pb, dv = plane_pair(a, b, p)
+            changed += np.count_nonzero(np.asarray(b[p]) != np.asarray(before[p]))
+            d = np.count_nonzero(pa != pb)
             if d:
                 differ[p] += d
-                worst[p] = max(worst[p], int(np.abs(diff).max()))
-                sq[p] += float(np.square(diff.astype(np.float64)).sum())
+                worst[p] = max(worst[p], dv.max().item())
+                sq[p] += float(np.square(dv).sum())
                 if first is None:
-                    ys, xs = np.nonzero(diff)
-                    first = (n, p, int(xs[0]), int(ys[0]), int(pa[ys[0], xs[0]]), int(pb[ys[0], xs[0]]))
+                    ys, xs = np.nonzero(pa != pb)
+                    first = (n, p, int(xs[0]), int(ys[0]), np.asarray(a[p])[ys[0], xs[0]].item(), np.asarray(b[p])[ys[0], xs[0]].item())
     total = frames * w * h
-    total_c = frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h)
+    total_c = frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h) if clip.format.num_planes == 3 else 0
     sizes = (total, total_c, total_c)
-    peak = (1 << clip.format.bits_per_sample) - 1
-    psnr = ['inf' if not sq[p] else f'{10 * math.log10(peak * peak * sizes[p] / sq[p]):.1f}' for p in range(3)]
+    peak = 1.0 if clip.format.sample_type == vs.FLOAT else (1 << clip.format.bits_per_sample) - 1
+    psnr = ['inf' if not sq[p] else f'{10 * math.log10(peak * peak * sizes[p] / sq[p]):.1f}' for p in range(clip.format.num_planes)]
     print(f'{args.filter} {args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {args.blksize}/{args.overlap} {args.vectors} vectors, {frames} frames, '
-          f'{100 * changed / (total + 2 * total_c):.1f}% of the pixels changed from the frame before: differing pixels Y {differ[0]} of {total}, '
-          f'U {differ[1]}, V {differ[2]} of {total_c} each'
+          f'{100 * changed / (total + 2 * total_c):.1f}% of the pixels changed from the frame before: differing pixels Y {differ[0]} of {total}'
+          + (f', U {differ[1]}, V {differ[2]} of {total_c} each' if total_c else '')
           + (f'; largest difference {worst}, PSNR {psnr}; first at frame {first[0]} plane {first[1]} ({first[2]}, {first[3]}): '
              f'mvgpu {first[4]}, mvu {first[5]}' if first else '')
           + (f'; {props_differ} duration properties differ' if props_differ else ''))

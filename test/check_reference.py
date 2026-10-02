@@ -99,7 +99,8 @@ def main():
         os.makedirs(work, exist_ok=True)
         frames, vectors = os.path.join(work, 'frames.yuv'), os.path.join(work, 'reference.bin')
         cmd = [args.reference, '--src', frames, '--size', f'{w}x{h}', '--frames', str(args.frames), '--out', vectors,
-               '--format', '420' if clip.format.subsampling_w else '444', '--bits', str(clip.format.bits_per_sample),
+               '--format', 'gray' if clip.format.color_family == vs.GRAY else '420' if clip.format.subsampling_w else '444',
+               '--bits', str(clip.format.bits_per_sample),
                '--blksize', str(args.blksize), '--overlap', str(args.overlap), '--pel', str(args.pel), '--pad', str(args.pad),
                '--radius', str(args.radius), '--delta', str(args.delta)] + (['--standalone'] if args.standalone else [])
         for k, v in search.items():

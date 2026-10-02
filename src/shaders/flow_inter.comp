@@ -4,116 +4,6 @@
 
 layout(local_size_x = 64) in;
 
-// A sample of the plane pc.plane of the frame before (src) or the frame after (ref)
-uint Px(bool ref, uint i) {
-    if (kWide) {
-        if (pc.plane == 0)
-            return ref ? uint(refY16[i]) : uint(srcY16[i]);
-        return ref ? uint(refC16[i]) : uint(srcC16[i]);
-    }
-    if (pc.plane == 0)
-        return ref ? uint(refY[i]) : uint(srcY[i]);
-    return ref ? uint(refC[i]) : uint(srcC[i]);
-}
-
-// A sample of the clip's plane in the frame before or the frame after
-uint ClipPx(bool ref, uint i) {
-    if (kWide)
-        return ref ? uint(clipRef16[i]) : uint(clipSrc16[i]);
-    return ref ? uint(clipRef[i]) : uint(clipSrc[i]);
-}
-
-// The rounded average mvu.Super's quarter planes take of two samples
-uint Avg(uint a, uint b) {
-    return (a + b + 1u) >> 1u;
-}
-
-// The address of sample (Xh, Yh) of the half-pel grid of a plane with rows stride samples apart,
-// its four half-pel planes rows rows each
-uint HalfAddr(int Xh, int Yh, int stride, int rows) {
-    return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
-}
-
-// mvu's PlaneGather: the sample at (X, Y), 1 / pel pixels from the plane's top left pixel, of the
-// super of the frame before or the frame after; between the half-pel samples (luma, and 4:4:4
-// chroma, at pel 4) the rounded average of their neighbours, as mvu.Super's quarter planes hold it;
-// subsampled chroma at pel 4 from its quarter-pel image. The position is clamped to the storage,
-// where mvu reads outside the padding.
-uint Sample(bool ref, int X, int Y) {
-    bool luma = pc.plane == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    X += kPel * (luma ? pc.pad : pc.padc);
-    Y += kPel * (luma ? pc.padY : pc.padcY);
-    uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-    if (!luma && kImage) {
-        X = clamp(X, 0, 4 * stride - 1);
-        Y = clamp(Y, 0, 4 * rows - 1);
-        return Px(ref, base + uint(Y * 4 * stride + X));
-    }
-    if (kPel == 2) {
-        X = clamp(X, 0, 2 * stride - 1);
-        Y = clamp(Y, 0, 2 * rows - 1);
-        return Px(ref, base + HalfAddr(X, Y, stride, rows));
-    }
-    X = clamp(X, 0, 4 * stride - 2);
-    Y = clamp(Y, 0, 4 * rows - 2);
-    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
-    return Avg(Avg(Px(ref, base + HalfAddr(Xa, Ya, stride, rows)), Px(ref, base + HalfAddr(Xa, Yb, stride, rows))),
-               Avg(Px(ref, base + HalfAddr(Xb, Ya, stride, rows)), Px(ref, base + HalfAddr(Xb, Yb, stride, rows))));
-}
-
-// The resize's blocks and weights at the plane's pixel (x, y): blocks gIa and gIb = gIa + 1 of the
-// rows gJa and gJb = gJa + 1, weighted gCa and 16384 - gCa across, gDa and 16384 - gDa down
-int gIa, gIb, gCa, gJa, gJb, gDa;
-
-void Weights(int x, int y) {
-    int cx = taps[pc.colOff + x], ry = taps[pc.rowOff + y];
-    gIa = cx >> 15;
-    gCa = cx & 0x7FFF;
-    gIb = min(gIa + 1, pc.nbx - 1);
-    gJa = ry >> 15;
-    gDa = ry & 0x7FFF;
-    gJb = min(gJa + 1, pc.nby - 1);
-}
-
-// zimg's 16-bit bilinear step, the weights adding up to 1 << 14: its result rounded and offset
-// back (unpack_pixel_u16, pack_pixel_u16), which comes to this
-int Lerp(int a, int b, int c) {
-    return (c * a + (16384 - c) * b + 8192) >> 14;
-}
-
-// The resize of the four blocks' values at the pixel: across each row, then down, each pass rounded
-// to 16 bits, as zimg resizes horizontally first when it scales both ways up (resize_h_first)
-int Interpolate(int aa, int ab, int ba, int bb) {
-    return Lerp(Lerp(aa, ab, gCa), Lerp(ba, bb, gCa), gDa);
-}
-
-// A block's vector as mvu's MakeSmallVectorMasks and AdjustSmallVectorMaskSubSampling keep it:
-// biased into 16 bits, saturated, chroma's then shifted by the subsampling
-ivec2 Biased(ivec4 rec) {
-    ivec2 v = clamp(rec.xy + 32768, 0, 65535);
-    if (pc.plane != 0)
-        v = ((v - 32768) >> ivec2(kLogX, kLogY)) + 32768;
-    return v;
-}
-
-// A vector frame's vector at the pixel, unbiased, in 1 / pel pixels of the plane
-ivec2 VectorAt(int which) {
-    ivec4 raa, rab, rba, rbb;
-    int aa = gJa * pc.recStride + gIa, ab = gJa * pc.recStride + gIb, ba = gJb * pc.recStride + gIa, bb = gJb * pc.recStride + gIb;
-    if (which == 0) {
-        raa = vecF[aa]; rab = vecF[ab]; rba = vecF[ba]; rbb = vecF[bb];
-    } else if (which == 1) {
-        raa = vecB[aa]; rab = vecB[ab]; rba = vecB[ba]; rbb = vecB[bb];
-    } else if (which == 2) {
-        raa = vecFF[aa]; rab = vecFF[ab]; rba = vecFF[ba]; rbb = vecFF[bb];
-    } else {
-        raa = vecBB[aa]; rab = vecBB[ab]; rba = vecBB[ba]; rbb = vecBB[bb];
-    }
-    ivec2 baa = Biased(raa), bab = Biased(rab), bba = Biased(rba), bbb = Biased(rbb);
-    return ivec2(Interpolate(baa.x, bab.x, bba.x, bbb.x), Interpolate(baa.y, bab.y, bba.y, bbb.y)) - 32768;
-}
-
 // An occlusion mask at the pixel, 0 .. 255: F's (base 0) or B's
 int MaskAt(int base) {
     return Interpolate(int(masks[base + gJa * pc.nbx + gIa]), int(masks[base + gJa * pc.nbx + gIb]),
@@ -127,10 +17,76 @@ int MaskAt(int base) {
 // before. FlowInter's inner products reach 256 * 65535 * 256 at 16 bits, past int's range though
 // within uint's (mvu takes int64), so they are unsigned. Dispatched as ((width + 63) / 64, height)
 // workgroups per plane.
+// main()'s pixel of a float clip, mvu's float arithmetic operation for operation: on x86 with
+// AVX-512, where the computation is the most exact, mvu.FlowInter and FlowFPS run FlowInter and
+// FlowInterExtra as the scalar code compiled with AVX-512, its contractible products fused, each
+// (a * b) + c the compiler meets with the left product fused (fma here; precise, so nothing else
+// is), and Blend unfused (SSE2 code). / 256 is exact; the integer path's - 1 isn't taken.
+void MainFloat(int x, int y) {
+    int t = pc.time256;
+    uint limit = uint(pc.scdLimit);
+    bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;
+    float result;
+    if (!fb) {
+        float s = clipSrcF[y * pc.clipStride + x];
+        if ((pc.flags & kBlend) != 0) {
+            precise float a = s * float(256 - t);
+            precise float b = clipRefF[y * pc.clipStride + x] * float(t);
+            precise float sum = a + b;
+            result = sum * (1.0 / 256.0);
+        } else {
+            result = s;
+        }
+    } else {
+        bool extra = (pc.flags & kHaveExtra) != 0 && counts[2] <= limit && counts[3] <= limit;
+        Weights(x, y);
+        ivec2 vF = VectorAt(0), vB = VectorAt(1);
+        int mFi = MaskAt(0), mBi = MaskAt(pc.nbx * pc.nby);
+        float mF = float(mFi), mB = float(mBi), iF = float(256 - mFi), iB = float(256 - mBi);
+        int xBase = x * kPel, yBase = y * kPel;
+        int vxF = (vF.x * t) >> 8, vyF = (vF.y * t) >> 8;
+        int vxB = (vB.x * (256 - t)) >> 8, vyB = (vB.y * (256 - t)) >> 8;
+        float dF = SampleF(false, xBase + vxF, yBase + vyF), dB = SampleF(true, xBase + vxB, yBase + vyB);
+        if (extra) {
+            ivec2 vFF = VectorAt(2), vBB = VectorAt(3);
+            int vxFF = (vFF.x * t) >> 8, vyFF = (vFF.y * t) >> 8;
+            int vxBB = (vBB.x * (256 - t)) >> 8, vyBB = (vBB.y * (256 - t)) >> 8;
+            float dFF = SampleF(false, xBase + vxFF, yBase + vyFF), dBB = SampleF(true, xBase + vxBB, yBase + vyBB);
+            // std::min and std::max: the first argument on ties
+            float minfb = dF < dB ? dF : dB, maxfb = dB < dF ? dF : dB;
+            float lowBB = maxfb < dBB ? maxfb : dBB, lowFF = maxfb < dFF ? maxfb : dFF;
+            float medianBB = minfb < lowBB ? lowBB : minfb, medianFF = minfb < lowFF ? lowFF : minfb;
+            precise float rF = dF * iF;
+            precise float t1 = fma(medianBB, mF, rF) * (1.0 / 256.0);
+            precise float rB = dB * iB;
+            precise float t2 = fma(medianFF, mB, rB) * (1.0 / 256.0);
+            precise float r2 = t2 * float(t);
+            result = fma(t1, float(256 - t), r2) * (1.0 / 256.0);
+        } else {
+            float dF0 = SampleF(false, xBase, yBase), dB0 = SampleF(true, xBase, yBase);
+            precise float pF0 = mB * dF0;
+            precise float innerF = fma(dB, iB, pF0);
+            precise float partF = (mF * innerF) * (1.0 / 256.0);
+            precise float occF = fma(dF, iF, partF) * (1.0 / 256.0);
+            precise float pB0 = mF * dB0;
+            precise float innerB = fma(dF, iF, pB0);
+            precise float partB = (mB * innerB) * (1.0 / 256.0);
+            precise float occB = fma(dB, iB, partB) * (1.0 / 256.0);
+            precise float rB = occB * float(t);
+            result = fma(occF, float(256 - t), rB) * (1.0 / 256.0);
+        }
+    }
+    outPxF[y * pc.outStride + x] = result;
+}
+
 void main() {
     int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= pc.width)
         return;
+    if (kFloat) {
+        MainFloat(x, y);
+        return;
+    }
     int t = pc.time256;
     uint limit = uint(pc.scdLimit);
     bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;

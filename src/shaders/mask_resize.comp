@@ -1,0 +1,69 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "mask_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// Every pixel of the mask: the blocks' values resized to the frame as mvu's PlaneResizer resizes them,
+// zimg's bilinear resize of the whole plane, horizontally first (Mask.cpp checks zimg would), each
+// output sample from source samples left and left + 1 of its column's and its row's taps; or scval
+// where the vectors don't serve (none, or at a scene change). zimg resizes 8-bit masks as 16-bit
+// samples (it promotes bytes to words, values << 8, and converts back with its dither type none,
+// rounding half to even), 9 to 16-bit ones as they are, rounding each pass to 16 bits, and float ones
+// with each product rounded (its AVX-512 kernels keep the two taps' products in two accumulators).
+// Dispatched as ((width + 63) / 64, height) workgroups.
+
+// zimg's 16-bit bilinear step, the weights adding up to 1 << 14 (flow_inter.comp's)
+int Lerp(int a, int b, int c) {
+    return (c * a + (16384 - c) * b + 8192) >> 14;
+}
+
+int Value(int bx, int by) {
+    return int(values[by * pc.nbx + bx]);
+}
+
+float ValueF(int bx, int by) {
+    return uintBitsToFloat(values[by * pc.nbx + bx]);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+    if (x >= pc.width)
+        return;
+    uint at = uint(y * pc.outStride + x);
+    if ((pc.flags & kNoVectors) != 0 || counts[0] > uint(pc.scdLimit)) {
+        if (kKind == 2)
+            outPxF[at] = pc.scvalF;
+        else if (kKind == 1)
+            outPx16[at] = uint16_t(pc.scval);
+        else
+            outPx[at] = uint8_t(pc.scval);
+        return;
+    }
+    ivec4 cx = taps[pc.colOff + x], ry = taps[pc.rowOff + y];
+    int ia = cx.x, ib = min(ia + 1, pc.nbx - 1), ja = ry.x, jb = min(ja + 1, pc.nby - 1);
+    if (kKind == 2) {
+        float c0 = intBitsToFloat(cx.z), c1 = intBitsToFloat(cx.w);
+        precise float a0 = c0 * ValueF(ia, ja);
+        precise float a1 = c1 * ValueF(ib, ja);
+        precise float h0 = a0 + a1;
+        precise float b0 = c0 * ValueF(ia, jb);
+        precise float b1 = c1 * ValueF(ib, jb);
+        precise float h1 = b0 + b1;
+        precise float v0 = intBitsToFloat(ry.z) * h0;
+        precise float v1 = intBitsToFloat(ry.w) * h1;
+        precise float v = v0 + v1;
+        outPxF[at] = v;
+        return;
+    }
+    int shift = kKind == 0 ? 8 : 0;
+    int h0 = Lerp(Value(ia, ja) << shift, Value(ib, ja) << shift, cx.y);
+    int h1 = Lerp(Value(ia, jb) << shift, Value(ib, jb) << shift, cx.y);
+    int v = Lerp(h0, h1, ry.y);
+    if (kKind == 1) {
+        outPx16[at] = uint16_t(v);
+        return;
+    }
+    int q = v >> 8, r = v & 255;
+    outPx[at] = uint8_t(min(q + (r > 128 || (r == 128 && (q & 1) != 0) ? 1 : 0), 255));
+}

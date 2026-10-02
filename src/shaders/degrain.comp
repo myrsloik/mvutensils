@@ -23,6 +23,12 @@ uint RefChromaAt(int r, uint i) {
     return kWide ? uint(refC16[r].px[i]) : uint(refC[r].px[i]);
 }
 
+// mvu.Super's float AveragePixels, (a + b) * 0.5
+float AvgF(float a, float b) {
+    precise float s = a + b;
+    return s * 0.5;
+}
+
 // The address of sample (Xh, Yh) of the half-pel grid of a plane with rows stride samples apart,
 // its four half-pel planes rows rows each
 uint HalfAddrOf(int Xh, int Yh, int stride, int rows) {
@@ -36,9 +42,11 @@ uint HalfAddr(int Xh, int Yh) {
 
 // U's address of chroma position (Xc, Yc), 1 / pel pixels of the padded plane: in its quarter-pel
 // image (subsampled at pel 4, SuperLayout.h), else in one of its four half-pel planes, the position
-// on the half-pel grid (4:4:4 at pel 4 is read between those as luma is); V's is kChromaPlanes plane
-// sizes on
+// on the half-pel grid (4:4:4 at pel 4 is read between those as luma is), or at pel 1 in its
+// full-pel plane; V's is kChromaPlanes plane sizes on
 uint ChromaAddr(int Xc, int Yc) {
+    if (kPel == 1)
+        return uint(Yc * pc.wc + Xc);
     if (kImage)
         return uint(Yc * 4 * pc.wc + Xc);
     return HalfAddrOf(Xc, Yc, pc.wc, pc.hc);
@@ -74,12 +82,144 @@ ivec2 ClampVec(ivec2 v, int bx, int by) {
 // bit depth).
 //
 // The motion compensated pixel is read from the reference's super where its vector puts the block,
-// mvu's GetPointer: luma at pel 2 from its half-pel plane; at pel 4 computed from the half-pel planes
+// mvu's GetPointer: luma at pel 1 from its full-pel plane, at pel 2 from its half-pel plane; at pel 4
+// computed from the half-pel planes
 // exactly as mvu.Super's quarter planes hold it (refine_qpel.comp); chroma at the luma position
 // shifted by its subsampling, rounded down: subsampled from its half-pel planes or quarter-pel image,
 // 4:4:4 as luma is. A lane holds kChunk rows at a time. Dispatched as ((width + 63) / 64, nby)
 // workgroups.
+//
+// Float clips take mvu's float arithmetic operation for operation (Degrain_F32, overlaps_c,
+// ToPixels, LimitChanges_C; precise, so nothing is fused): a block's value the centre's pixel times
+// its weight plus each reference's times its own, in order, then / 256; the windows' products / 64
+// added up in mvu's order, the row above before the block's own and the left column first; then
+// / 32, unclamped. A reference without vectors, out of the clip or at a scene change gives the
+// centre's pixel with weight 0, and none is skipped: a zero product can still turn a sum's sign.
+void MainFloat() {
+    bool luma = pc.plane == 0;
+    int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
+    int Bx = kBlk >> lx, By = kBlk >> ly;
+    int Sx = pc.step >> lx, Sy = pc.step >> ly;
+    int Ox = pc.overlap >> lx, Oy = pc.overlap >> ly;
+    int x = int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
+    int y0 = cy * Sy;
+    int rows = min(cy == pc.nby - 1 ? By : Sy, pc.height - y0);
+    if (x >= pc.width || rows <= 0)
+        return;
+    uint vOffset = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
+    uint curC0 = kImage ? uint(16 * (pc.padc + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padc + y0) * pc.wc + pc.padc + x);
+    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : curC0 + vOffset;
+    uint curStride = uint(luma ? pc.wp : ChromaRow());
+    uint out0 = uint(y0 * pc.outStride + x);
+    int bxA = min(x / Sx, pc.nbx - 1);
+    bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox;
+
+    for (int j0 = 0; j0 < rows; j0 += kChunk) {
+        int n = min(kChunk, rows - j0);
+        float centre[kChunk], acc[kChunk];
+        [[unroll]] for (int j = 0; j < kChunk; ++j) {
+            centre[j] = j < n ? (luma ? curYF[cur + uint(j0 + j) * curStride] : curCF[cur + uint(j0 + j) * curStride]) : 0.0;
+            acc[j] = 0.0;
+        }
+        for (int k = 3; k >= 0; --k) {
+            int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? cy - 1 : cy;
+            int jEnd = (k & 2) != 0 ? clamp(Oy - j0, 0, n) : n;
+            if (!(((k & 1) == 0 || hasLeft) && ((k & 2) == 0 || cy >= 1) && jEnd > 0))
+                continue;
+            int b = by * pc.nbx + bx;
+            uint shift = luma ? 0u : 16u;
+            float wc = float((meta[b] >> shift) & 0xFFFFu);
+            float sum[kChunk];
+            [[unroll]] for (int j = 0; j < kChunk; ++j) {
+                precise float s = centre[j] * wc;
+                sum[j] = s;
+            }
+            int dx = x - bx * Sx, dy = y0 + j0 - by * Sy;
+            for (int r = 0; r < pc.refs; ++r) {
+                float w = float((meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu);
+                float px[kChunk];
+                [[unroll]] for (int j = 0; j < kChunk; ++j)
+                    px[j] = centre[j];
+                if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
+                    ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
+                    if (luma && kPel == 4) {
+                        int X = 4 * (bx * Sx + pc.pad + dx) + v.x, Y = 4 * (by * Sy + pc.pad + dy) + v.y;
+                        int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+                        uint aa = HalfAddr(Xa, Ya), ab = HalfAddr(Xa, Yb), ba = HalfAddr(Xb, Ya), bb = HalfAddr(Xb, Yb);
+                        [[unroll]] for (int j = 0; j < kChunk; ++j) {
+                            uint o = uint(j * pc.wp);
+                            if (j < jEnd)
+                                px[j] = AvgF(AvgF(refYF[r].px[aa + o], refYF[r].px[ab + o]), AvgF(refYF[r].px[ba + o], refYF[r].px[bb + o]));
+                        }
+                    } else if (luma) {
+                        int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                        uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
+                        [[unroll]] for (int j = 0; j < kChunk; ++j)
+                            if (j < jEnd)
+                                px[j] = refYF[r].px[a + uint(j * pc.wp)];
+                    } else {
+                        int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> kLogX);
+                        int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> kLogY);
+                        if (kPel == 4 && !kImage) {
+                            int Xa = Xc >> 1, Xb = Xa + (Xc & 1), Ya = Yc >> 1, Yb = Ya + (Yc & 1);
+                            uint aa = HalfAddrOf(Xa, Ya, pc.wc, pc.hc) + vOffset, ab = HalfAddrOf(Xa, Yb, pc.wc, pc.hc) + vOffset;
+                            uint ba = HalfAddrOf(Xb, Ya, pc.wc, pc.hc) + vOffset, bb = HalfAddrOf(Xb, Yb, pc.wc, pc.hc) + vOffset;
+                            [[unroll]] for (int j = 0; j < kChunk; ++j) {
+                                uint o = uint(j * pc.wc);
+                                if (j < jEnd)
+                                    px[j] = AvgF(AvgF(refCF[r].px[aa + o], refCF[r].px[ab + o]), AvgF(refCF[r].px[ba + o], refCF[r].px[bb + o]));
+                            }
+                        } else {
+                            uint a = ChromaAddr(Xc, Yc) + vOffset;
+                            [[unroll]] for (int j = 0; j < kChunk; ++j)
+                                if (j < jEnd)
+                                    px[j] = refCF[r].px[a + uint(j * ChromaRow())];
+                        }
+                    }
+                }
+                [[unroll]] for (int j = 0; j < kChunk; ++j) {
+                    precise float t = px[j] * w;
+                    precise float s = sum[j] + t;
+                    sum[j] = s;
+                }
+            }
+            [[unroll]] for (int j = 0; j < kChunk; ++j) {
+                if (j < jEnd) {
+                    precise float value = sum[j] * (1.0 / 256.0);
+                    if (pc.overlap == 0) {
+                        acc[j] = value;
+                    } else {
+                        int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
+                        int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
+                        float win = float(tables[pc.winOff + ((wby + wbx) * By + dy + j) * Bx + dx]);
+                        precise float t = value * win;
+                        precise float u = t * (1.0 / 64.0);
+                        precise float a = acc[j] + u;
+                        acc[j] = a;
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (int j = 0; j < kChunk; ++j) {
+            if (j < n) {
+                precise float v = pc.overlap == 0 ? acc[j] : acc[j] * (1.0 / 32.0);
+                if (pc.limit >= 0) {
+                    precise float lo = centre[j] - pc.limitF;
+                    precise float hi = centre[j] + pc.limitF;
+                    v = v < lo ? lo : (hi < v ? hi : v); // std::clamp
+                }
+                outPlaneF[pc.plane].px[out0 + uint((j0 + j) * pc.outStride)] = v;
+            }
+        }
+    }
+}
+
 void main() {
+    if (kFloat) {
+        MainFloat();
+        return;
+    }
     bool luma = pc.plane == 0;
     int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
     int Bx = kBlk >> lx, By = kBlk >> ly;                     // the plane's block size,
@@ -141,8 +281,8 @@ void main() {
                         }
                     }
                 } else if (luma) {
-                    int X = 2 * (bx * Sx + pc.pad + dx) + v.x, Y = 2 * (by * Sy + pc.pad + dy) + v.y;
-                    uint a = HalfAddr(X, Y);
+                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                    uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
                     [[unroll]] for (int j = 0; j < kChunk; ++j)
                         if (j < jEnd)
                             sum[j] += RefLumaAt(r, a + uint(j * pc.wp)) * w;

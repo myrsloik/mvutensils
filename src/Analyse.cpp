@@ -39,8 +39,9 @@
 // (n + u, d - u), u the step toward d, and for d > 0 inverts (n + d, -d); Analyse on its own
 // seeds from the coarse search only.
 //
-// Implemented, on 8 to 16-bit supers (mvlambda, lsad and badsad scaled to the depth as mvu scales
-// them): chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
+// Implemented, on Gray, 4:2:0 and 4:4:4 supers of 8 to 16-bit or float samples (mvlambda, lsad and
+// badsad scaled to the depth as mvu scales them, floats searched as 16-bit samples, a Gray super's
+// SADs luma's): chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
 // scales it per level), badsad and badrange (the fallback's threshold and radius), delta, prefix,
 // plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults are the tested
 // ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which this search would
@@ -63,28 +64,37 @@ int BlockPixels(const SuperLayout &L, bool chroma) {
     return L.blk * L.blk + (chroma ? 2 * (L.blk / L.format.xr) * (L.blk / L.format.yr) : 0);
 }
 
+// The bit depth the search works at: the samples', but 16 for floats, which it searches as the
+// 16-bit samples they stand for (refine_common.glsl's Quantize), as mvu scales float SADs
+int SearchBits(const SuperLayout &L) {
+    return L.format.Kind() == 2 ? 16 : L.format.bits;
+}
+
 // Entries of the full-size grid's lambda table: (largest SAD of a block) >> (1 + bits - 8), plus one
 int LambdaEntries(const SuperLayout &L, bool chroma) {
-    return static_cast<int>(((static_cast<int64_t>(BlockPixels(L, chroma)) * ((1 << L.format.bits) - 1)) >> (L.format.bits - 7)) + 1);
+    const int bits = SearchBits(L);
+    return static_cast<int>(((static_cast<int64_t>(BlockPixels(L, chroma)) * ((1 << bits) - 1)) >> (bits - 7)) + 1);
 }
 
 // The search kernels' variant (specialization constant 6, refine_common.glsl): bit 0 for SADs of
-// luma alone, bit 1 for chroma that isn't subsampled, bits 4 to 7 the bit depth less 8
+// luma alone, bit 1 for chroma that isn't subsampled, bits 4 to 7 the search's bit depth less 8,
+// bit 8 for float samples
 int SearchVariant(const SuperLayout &L, bool chroma) {
-    return (chroma ? 0 : 1) | (L.format.xr == 1 ? 2 : 0) | ((L.format.bits - 8) << 4);
+    return (chroma ? 0 : 1) | (L.format.xr == 1 ? 2 : 0) | ((SearchBits(L) - 8) << 4) | (L.format.Kind() == 2 ? 256 : 0);
 }
 
 // Lanes per candidate in the kernels that measure 8 candidates per block, init, the passes and the
 // half- and quarter-pel steps (refine_common.glsl's kSplit, log2 of it their variant's bits 2 and
 // 3): 2, and 4 blocks per workgroup instead of 8, for blocks whose current pixels take kSplitBytes
-// or more; 4, and 2 blocks, for those taking kSplit4Bytes or more (16-bit 4:4:4 32x32 blocks), which
-// keeps the workgroup's block cache within 12 KB. Measured against 8 blocks per workgroup at 8 bits
-// (RX 6900 XT, radius 3, serialized profiles), the fields' GPU time: 4:4:4 32x32 -31..-32% (init,
-// the passes and the half-pel step -45..-51%), 4:2:0 32x32 -14..-21%, luma-only 32x32 -3..-7%,
-// 4:4:4 16x16 -2..-4%.
-constexpr int kSplitBytes = 768, kSplit4Bytes = 6144;
+// or more; 4, and 2 blocks, for those taking kSplit4Bytes or more (32x32 blocks with 4:4:4 chroma, or
+// of 16-bit samples). Measured (RX 6900 XT, radius 3, serialized profiles), the fields' GPU time
+// against 8 blocks per workgroup: 4:4:4 32x32 -31..-32%, 4:2:0 32x32 -14..-21%, luma-only 32x32
+// -3..-7%, 4:4:4 16x16 -2..-4%, 16-bit 4:4:4 16x16 -17%, 16-bit 4:2:0 16x16 +-3%; split 4 against 2:
+// 4:4:4 32x32 -12..-13%, 16-bit 4:2:0 32x32 -18..-21%, 16-bit 4:4:4 32x32 -35..-36%, but blocks of
+// 1.5 KB (4:2:0 32x32, 16-bit 4:4:4 16x16) +6..7%.
+constexpr int kSplitBytes = 768, kSplit4Bytes = 3072;
 int RefineSplit(const SuperLayout &L, bool chroma) {
-    const int bytes = BlockPixels(L, chroma) * L.format.Bytes();
+    const int bytes = BlockPixels(L, chroma) * (L.format.Kind() == 0 ? 1 : 2); // floats are cached as 16-bit samples
     return bytes >= kSplit4Bytes ? 4 : bytes >= kSplitBytes ? 2 : 1;
 }
 
@@ -624,9 +634,11 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         };
         const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0);
 
-        const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = vsapi->getStride(cur.chroma, 0);
+        // A Gray super has no chroma frame
+        const bool chroma = L.format.chroma;
+        const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = chroma ? vsapi->getStride(cur.chroma, 0) : 0;
         const ptrdiff_t bytes = L.format.Bytes();
-        if (lumaStride != vsapi->getStride(rf.luma, 0) || chromaStride != vsapi->getStride(rf.chroma, 0) || lumaStride % (4 * bytes) ||
+        if (lumaStride != vsapi->getStride(rf.luma, 0) || (chroma && chromaStride != vsapi->getStride(rf.chroma, 0)) || lumaStride % (4 * bytes) ||
             chromaStride % (4 * bytes))
             return fail("the super frames' storage strides differ");
         const ptrdiff_t coarseRowBytes = vsapi->getStride(coarse, 0);
@@ -634,9 +646,9 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             return fail("the coarse search's rows don't start on whole vectors");
 
         // The buffers every binding names
-        VSVulkanPlaneInfo curLuma, curChroma, refLuma, refChroma, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
-        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || vkapi->getGPUPlane(cur.chroma, 0, &curChroma) || vkapi->getGPUPlane(rf.luma, 0, &refLuma) ||
-            vkapi->getGPUPlane(rf.chroma, 0, &refChroma) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) || vkapi->getGPUPlane(vectors, 0, &outRec) ||
+        VSVulkanPlaneInfo curLuma, curChroma = {}, refLuma, refChroma = {}, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
+        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || (chroma && vkapi->getGPUPlane(cur.chroma, 0, &curChroma)) || vkapi->getGPUPlane(rf.luma, 0, &refLuma) ||
+            (chroma && vkapi->getGPUPlane(rf.chroma, 0, &refChroma)) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) || vkapi->getGPUPlane(vectors, 0, &outRec) ||
             ((flags & 1) && (vkapi->getGPUPlane(stepVec, 0, &stepRec) || vkapi->getGPUPlane(restVec, 0, &restRec))) ||
             ((flags & 2) && vkapi->getGPUPlane(invVec, 0, &invRec)))
             return fail("a frame the analysis reads isn't GPU resident");
@@ -654,7 +666,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
         for (const VSFrame *f : {cur.luma, cur.chroma, rf.luma, rf.chroma, coarse})
-            vkapi->gpuExecReadsFrame(ctx, f);
+            if (f)
+                vkapi->gpuExecReadsFrame(ctx, f);
         if (flags & 1) {
             vkapi->gpuExecReadsFrame(ctx, stepVec);
             vkapi->gpuExecReadsFrame(ctx, restVec);
@@ -669,8 +682,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
         rec.Bind(kCurLuma, curLuma.buffer);
         rec.Bind(kRefLuma, refLuma.buffer);
-        rec.Bind(kCurChroma, curChroma.buffer);
-        rec.Bind(kRefChroma, refChroma.buffer);
+        rec.Bind(kCurChroma, chroma ? curChroma.buffer : constants); // never read without chroma
+        rec.Bind(kRefChroma, chroma ? refChroma.buffer : constants);
         rec.Bind(kCoarse, coarsePlane.buffer);
         rec.Bind(kLambda, constants, d->lambda.offset, d->lambda.size);
         rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
@@ -734,7 +747,7 @@ struct AnalyseArgs {
 
     Scaled Scale() const {
         const int64_t area = static_cast<int64_t>(layout.blk) * layout.blk;
-        const int pixelMax = (1 << layout.format.bits) - 1;
+        const int pixelMax = (1 << SearchBits(layout)) - 1;
         auto toDepth = [&](int64_t v) { return static_cast<int64_t>(static_cast<double>(v) * pixelMax / 255.0 + 0.5); };
         const int64_t mvl = toDepth(mvlambda), ls = toDepth(lsad), bs = toDepth(badsad);
         return {mvl * area / 64 / (layout.pel * layout.pel), ls * area / 64, mvl * area / 64, std::min<int64_t>(bs * area / 64, INT32_MAX)};
@@ -790,6 +803,8 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         a.chroma = !!vsapi->mapGetInt(in, "chroma", 0, &err);
         if (err)
             a.chroma = true;
+        if (!a.layout.format.chroma) // a Gray super's SADs are luma's alone, as in mvu
+            a.chroma = false;
 
         a.deltaFrame = vsapi->mapGetIntSaturated(in, "delta", 0, &err);
         if (err)
@@ -901,7 +916,7 @@ VSNode *CreateCoarse(const AnalyseArgs &a, const std::vector<int> &deltas, VSCor
 
     // lambda for every (worst neighbour SAD) >> (1 + bits - 8) per coarse level, mvlambda *
     // 2^(plevel * level) relaxed by lsad as the CPU reference does in double precision
-    const int depthShift = L.format.bits - 8;
+    const int depthShift = SearchBits(L) - 8;
     std::vector<int64_t> levelLambda(static_cast<size_t>(L.topLevel + 1) * SuperLayout::kLambdaEntries);
     for (int level = 0; level <= L.topLevel; ++level)
         for (int i = 0; i < SuperLayout::kLambdaEntries; ++i) {
@@ -993,7 +1008,7 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     // double precision
     std::vector<int64_t> lambda(LambdaEntries(L, a.chroma));
     for (size_t i = 0; i < lambda.size(); ++i) {
-        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << (L.format.bits - 8)), 1);
+        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << (SearchBits(L) - 8)), 1);
         lambda[i] = static_cast<int64_t>(s.lambda0 * scale * scale);
     }
     Regions constants(vc);

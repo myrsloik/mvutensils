@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -12,6 +11,7 @@
 #include <VSVulkan4.h>
 
 #include "Common.h"
+#include "FilterShared.h"
 #include "SuperLayout.h"
 #include "VulkanContext.h"
 
@@ -23,139 +23,17 @@
 // (or copying the first) when the vectors are at a scene change. The result is mvu's bit for bit
 // given the same super and vectors: the blocks' vectors and masks reach the pixels through zimg's
 // bilinear resize in mvu, in 64 x 64 tiles, which flow_inter.comp reproduces with the taps zimg
-// computes for each tile (ResizeTaps).
+// computes for each tile (TileTaps).
 //
-// Implemented: all of their arguments, on mvgpu.Super's 4:2:0 and 4:4:4 supers of 8 to 16-bit
-// samples at pel 2 and 4 with square blocks of 8, 16 or 32, and vectors made from such supers, of
-// any of those bit depths, as mvgpu.Analyse makes them.
+// Implemented: all of their arguments, on mvgpu.Super's Gray, 4:2:0 and 4:4:4 supers of 8 to
+// 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors made from
+// such supers, of any of those bit depths, as mvgpu.Analyse makes them.
 
 namespace {
 
 // FlowParams' flags, flow_common.glsl's: F and B have vectors, FF and BB have, blend the clip's
 // frames where F and B don't serve
 constexpr int kHaveFB = 1, kHaveExtra = 2, kBlend = 4;
-
-// The taps of zimg's bilinear filter for one tile of dstDim samples from srcDim, mvu's MaskResizer
-// asking for the source's samples from shift on, width of them (the active region): compute_filter
-// and matrix_to_filter in zimg's resize/filter.cpp, in the same double arithmetic, with the matrix's
-// sparse rows as RowMatrix keeps them. Each output sample takes source samples left and left + 1,
-// weighted c and (1 << 14) - c (an upscale has two taps, which matrix_to_filter's correction makes
-// add up to 1 << 14); out gets (left << 15) | c.
-void TileTaps(unsigned srcDim, unsigned dstDim, double shift, double width, int32_t *out) {
-    const double scale = static_cast<double>(dstDim) / width;
-    if (scale < 1.0)
-        throw std::runtime_error("the blocks are too small for the resize's two taps");
-    const double step = std::min(scale, 1.0);
-    const double support = static_cast<double>(1) / step;
-    const unsigned filterSize = std::max(static_cast<unsigned>(std::ceil(support)) * 2U, 1U);
-    auto filter = [](double x) { return std::max(1.0 - std::abs(x), 0.0); };
-    auto roundHalfup = [](double x) { return x < 0 ? std::floor(x + 0.5) : std::floor(x + 0.49999999999999994); };
-
-    // RowMatrix's rows: an entry is allocated when a value other than the one there is stored
-    struct Row {
-        size_t left = 0;
-        std::vector<double> data;
-        double Get(size_t j) const { return j < left || j >= left + data.size() ? 0.0 : data[j - left]; }
-        void Set(size_t j, double v) {
-            if (Get(j) == v)
-                return;
-            if (data.empty()) {
-                data.assign(1, 0.0);
-                left = j;
-            } else if (j < left) {
-                data.insert(data.begin(), left - j, 0.0);
-                left = j;
-            } else if (j >= left + data.size()) {
-                data.insert(data.end(), j - (left + data.size()) + 1, 0.0);
-            }
-            data[j - left] = v;
-        }
-    };
-    std::vector<Row> m(dstDim);
-    for (unsigned i = 0; i < dstDim; ++i) {
-        const double pos = (i + 0.5) / scale + shift;
-        const double beginPos = roundHalfup(pos - filterSize / 2.0) + 0.5;
-        double total = 0.0;
-        for (unsigned j = 0; j < filterSize; ++j) {
-            const double xpos = beginPos + j;
-            total += filter((xpos - pos) * step);
-        }
-        size_t left = SIZE_MAX;
-        for (unsigned j = 0; j < filterSize; ++j) {
-            const double xpos = beginPos + j;
-            double realPos = xpos < 0.0 ? -xpos : xpos >= srcDim ? 2.0 * srcDim - xpos : xpos;
-            realPos = std::clamp(realPos, 0.0, std::nextafter(static_cast<double>(srcDim), -INFINITY));
-            const size_t idx = static_cast<size_t>(std::floor(realPos));
-            m[i].Set(idx, m[i].Get(idx) + filter((xpos - pos) * step) / total);
-            left = std::min(left, idx);
-        }
-        if (m[i].Get(left) == 0.0) {
-            m[i].Set(left, DBL_EPSILON);
-            m[i].Set(left, 0.0);
-        }
-    }
-
-    size_t taps = 0;
-    for (const Row &r : m)
-        taps = std::max(taps, r.data.size());
-    if (taps > 2)
-        throw std::runtime_error("the resize has more than two taps");
-    for (unsigned i = 0; i < dstDim; ++i) {
-        const size_t left = std::min(m[i].left, static_cast<size_t>(srcDim) - taps);
-        double err = 0;
-        int16_t sum = 0, greatest = 0;
-        size_t greatestIdx = 0;
-        int16_t c[2] = {};
-        for (size_t j = 0; j < taps; ++j) {
-            const double expected = m[i].Get(left + j) * (1 << 14) - err;
-            const int16_t coeff = static_cast<int16_t>(std::lrint(expected));
-            err = static_cast<double>(coeff) - expected;
-            if (std::abs(coeff) > greatest) {
-                greatest = coeff;
-                greatestIdx = j;
-            }
-            sum += coeff;
-            c[j] = coeff;
-        }
-        c[greatestIdx] += (1 << 14) - sum;
-        if (c[0] < 0 || c[0] + (taps > 1 ? c[1] : 0) != (1 << 14))
-            throw std::runtime_error("the resize's taps don't add up");
-        out[i] = static_cast<int32_t>((left << 15) | static_cast<unsigned>(c[0]));
-    }
-}
-
-// mvu's MaskResizer (MaskResize.cpp) for one dimension: the srcDim blocks laid over the samples
-// they cover, the blocks blk apart (their size less the overlap) plus one overlap, resized to dstDim
-// samples in tiles of 64; for each output sample its taps, as TileTaps packs them
-std::vector<int32_t> ResizeTaps(int srcDim, int dstDim, int step, int overlap) {
-    const double srcScale = static_cast<double>(srcDim) / (step * srcDim + overlap);
-    std::vector<int32_t> taps(dstDim);
-    for (int t = 0; t < dstDim; t += 64) {
-        const int n = std::min(64, dstDim - t);
-        // The tile's active region, which zimg's graph builder turns into the resize's shift and width
-        const double left = t * srcScale, width = n * srcScale;
-        const double scaleW = static_cast<double>(n) / width;
-        TileTaps(static_cast<unsigned>(srcDim), static_cast<unsigned>(n), left - 0.0 / scaleW, width * (static_cast<double>(n) / static_cast<double>(n)),
-                 taps.data() + t);
-    }
-    return taps;
-}
-
-// zimg's choice of the order of the passes (resize/resize.cpp's resize_h_first), for every size of
-// tile mvu's MaskResizer makes of a dstW x dstH plane
-bool HorizontalFirst(int srcW, int dstW, int stepX, int overlapX, int srcH, int dstH, int stepY, int overlapY) {
-    const double sx = static_cast<double>(srcW) / (stepX * srcW + overlapX), sy = static_cast<double>(srcH) / (stepY * srcH + overlapY);
-    for (int w : {std::min(64, dstW), (dstW - 1) % 64 + 1}) {
-        for (int h : {std::min(64, dstH), (dstH - 1) % 64 + 1}) {
-            const double xscale = static_cast<double>(w) / (w * sx), yscale = static_cast<double>(h) / (h * sy);
-            const double hFirstCost = std::max(xscale, 1.0) * 2.0 + xscale * std::max(yscale, 1.0);
-            const double vFirstCost = std::max(yscale, 1.0) + yscale * std::max(xscale, 1.0) * 2.0;
-            if (!(hFirstCost < vFirstCost))
-                return false;
-        }
-    }
-    return true;
-}
 
 void SetFpsDuration(VSFrame *frame, int64_t fpsNum, int64_t fpsDen, const VSAPI *vsapi) {
     VSMap *props = vsapi->getFramePropertiesRW(frame);
@@ -332,19 +210,22 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         if (d->fps)
             SetFpsDuration(dst, d->vi.fpsNum, d->vi.fpsDen, vsapi);
 
+        // The clip's planes, one for Gray, which has no chroma frame in its super either
+        const int numPlanes = d->vi.format.numPlanes;
+        const bool chroma = L.format.chroma;
         VSVulkanPlaneInfo clipSrc[3] = {}, clipRef[3] = {}, outPlanes[3] = {}, superPlanes[4] = {}, vecPlanes[4] = {};
-        for (int p = 0; p < 3; ++p)
+        for (int p = 0; p < numPlanes; ++p)
             if (vkapi->getGPUPlane(src, p, &clipSrc[p]) || vkapi->getGPUPlane(ref, p, &clipRef[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the clip's frames aren't GPU resident");
         ptrdiff_t lumaStride = 0, chromaStride = 0, recBytes = 0;
         if (haveFB) {
             const VSFrame *planes[4] = {before.luma, before.chroma, after.luma, after.chroma};
             for (int i = 0; i < 4; ++i)
-                if (vkapi->getGPUPlane(planes[i], 0, &superPlanes[i]))
+                if ((chroma || (i & 1) == 0) && vkapi->getGPUPlane(planes[i], 0, &superPlanes[i]))
                     return fail("the super's planes aren't GPU resident");
             lumaStride = vsapi->getStride(before.luma, 0);
-            chromaStride = vsapi->getStride(before.chroma, 0);
-            if (vsapi->getStride(after.luma, 0) != lumaStride || vsapi->getStride(after.chroma, 0) != chromaStride)
+            chromaStride = chroma ? vsapi->getStride(before.chroma, 0) : 0;
+            if (vsapi->getStride(after.luma, 0) != lumaStride || (chroma && vsapi->getStride(after.chroma, 0) != chromaStride))
                 return fail("the super frames' storage strides differ");
             for (int i = 0; i < 4; ++i) {
                 if (!vec[i] || (i >= 2 && !haveExtra))
@@ -357,7 +238,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 recBytes = stride;
             }
         }
-        for (int p = 0; p < 3; ++p)
+        for (int p = 0; p < numPlanes; ++p)
             if (vsapi->getStride(ref, p) != vsapi->getStride(src, p))
                 return fail("the clip's frames' strides differ");
 
@@ -383,11 +264,12 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             vkapi->gpuExecReadsFrame(ctx, ref);
         if (haveFB) {
             for (const VSFrame *f : {before.luma, before.chroma, after.luma, after.chroma})
-                vkapi->gpuExecReadsFrame(ctx, f);
+                if (f)
+                    vkapi->gpuExecReadsFrame(ctx, f);
             for (int i = 0; i < (haveExtra ? 4 : 2); ++i)
                 vkapi->gpuExecReadsFrame(ctx, vec[i]);
         }
-        for (int p = 0; p < 3; ++p)
+        for (int p = 0; p < numPlanes; ++p)
             vkapi->gpuExecWritesPlane(ctx, dst, p);
 
         const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
@@ -426,9 +308,9 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         rec.Bind(kFlTaps, d->tapsInfo.buffer);
         if (haveFB) {
             rec.Bind(kFlSrcLuma, superPlanes[0].buffer);
-            rec.Bind(kFlSrcChroma, superPlanes[1].buffer);
+            rec.Bind(kFlSrcChroma, chroma ? superPlanes[1].buffer : d->tapsInfo.buffer);
             rec.Bind(kFlRefLuma, superPlanes[2].buffer);
-            rec.Bind(kFlRefChroma, superPlanes[3].buffer);
+            rec.Bind(kFlRefChroma, chroma ? superPlanes[3].buffer : d->tapsInfo.buffer);
             const int vecBindings[4] = {kFlVecF, kFlVecB, kFlVecFF, kFlVecBB};
             for (int i = 0; i < (haveExtra ? 4 : 2); ++i)
                 rec.Bind(vecBindings[i], vecPlanes[i].buffer);
@@ -442,7 +324,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             rec.ComputeBarrier();
         }
         stamp(1);
-        for (int p = 0; p < 3; ++p) {
+        for (int p = 0; p < numPlanes; ++p) {
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
@@ -526,7 +408,8 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         const SuperLayout &L = d->layout;
         if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
             throw std::runtime_error(unsupported);
-        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != L.format.bits ||
+        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != (L.format.chroma ? cfYUV : cfGray) ||
+            d->vi.format.sampleType != (L.format.Kind() == 2 ? stFloat : stInteger) || d->vi.format.bitsPerSample != L.format.bits ||
             (1 << d->vi.format.subSamplingW) != L.format.xr || (1 << d->vi.format.subSamplingH) != L.format.yr || d->vi.width != L.width || d->vi.height != L.height)
             throw std::runtime_error("super clip is not compatible with source clip");
 
@@ -564,16 +447,9 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         d->nby = fw.nby;
 
         // mvu's ScaleThSCD and GetThSCDScaleFactor, for mvfw's block size, chroma and bit depth
-        constexpr int maxSAD = 8 * 8 * 255;
-        if (thscd1 < 0 || thscd1 > maxSAD)
-            throw std::runtime_error("thscd1 must be between 0 and " + std::to_string(maxSAD));
-        if (!std::isfinite(thscd2) || thscd2 < 0.0f || thscd2 > 100.0f)
-            throw std::runtime_error("thscd2 must be a percentage between 0 and 100");
-        const double scale = static_cast<double>(fw.blkX * fw.blkY) / (8.0 * 8.0) * (fw.chroma ? (1.0 + 2.0 / (fw.xRatio * fw.yRatio)) : 1.0) *
-                             (((1 << std::min(16, fw.bits)) - 1) / 255.0);
-        d->thscd1 = static_cast<int>(static_cast<int64_t>(thscd1 * scale + 0.5));
-        const float blocksTh2 = static_cast<float>(static_cast<double>(thscd2) * fw.nbx * fw.nby / 100.0);
-        d->scdLimit = static_cast<int>(std::floor(blocksTh2)); // a count above the float limit is above its floor
+        const SceneChange scd = ScaleSceneChange(fw, thscd1, thscd2);
+        d->thscd1 = scd.thscd1;
+        d->scdLimit = scd.limit;
 
         if (d->fps) {
             if (d->vi.fpsNum == 0 || d->vi.fpsDen == 0)
@@ -598,7 +474,7 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
         d->prep = vc.Pipeline(Kernel::FlowPrep, 0, L.pel, chromaLog);
-        d->pixels = vc.Pipeline(Kernel::FlowInter, 0, L.pel, chromaLog | (L.format.bits > 8 ? 4 : 0));
+        d->pixels = vc.Pipeline(Kernel::FlowInter, 0, L.pel, chromaLog | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0));
         if (static_cast<VkDeviceSize>(2) * d->nbx * d->nby * 4 > vc.limits.maxStorageBufferRange)
             throw std::runtime_error("the frame is too large for the device's storage buffers");
 
@@ -609,13 +485,13 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             const int lx = c ? d->vi.format.subSamplingW : 0, ly = c ? d->vi.format.subSamplingH : 0;
             const int stepX = (d->blk >> lx) - (d->overlap >> lx), stepY = (d->blk >> ly) - (d->overlap >> ly);
             const int w = d->vi.width >> lx, h = d->vi.height >> ly;
-            if (!HorizontalFirst(d->nbx, w, stepX, d->overlap >> lx, d->nby, h, stepY, d->overlap >> ly))
+            if (!TilesHorizontalFirst(d->nbx, w, stepX, d->overlap >> lx, d->nby, h, stepY, d->overlap >> ly))
                 throw std::runtime_error("zimg would resize the masks vertically first, which isn't implemented");
             d->colOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> cols = ResizeTaps(d->nbx, w, stepX, d->overlap >> lx);
+            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, d->overlap >> lx);
             tables.insert(tables.end(), cols.begin(), cols.end());
             d->rowOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> rows = ResizeTaps(d->nby, h, stepY, d->overlap >> ly);
+            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, d->overlap >> ly);
             tables.insert(tables.end(), rows.begin(), rows.end());
         }
         if (L.format.xr == 1 && L.format.yr == 1) {

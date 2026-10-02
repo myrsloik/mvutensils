@@ -2,9 +2,10 @@
 
 MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's Vulkan GPU frames
 (API 4.3): every clip it takes and returns is GPU resident. The goal is a drop-in replacement for
-`mvu`, the same functions with the same arguments; so far there are `Super`, `Analyse`,
-`AnalyseMany`, `Degrain` (with `Degrain1` … `Degrain25`), `FlowInter` and `FlowFPS`. The rest of
-this file documents MVUtensils, which the GPU filters follow.
+`mvu`, the same functions with the same arguments; there are `Super`, `Analyse`, `AnalyseMany`,
+`Recalculate`, `Degrain` (with `Degrain1` … `Degrain25`), `Compensate`, `Flow`, `FlowBlur`,
+`FlowInter`, `FlowFPS`, `SCDetection`, `VectorLengthMask`, `SADMask` and `OcclusionMask` (not the
+`Depan` family). The rest of this file documents MVUtensils, which the GPU filters follow.
 
 ```python
 clip = core.bs.VideoSource('video.mkv', gpu=True)
@@ -20,19 +21,26 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
   (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
   the GPU search's own, reduced with `rfilter`'s filter.
-* `Analyse`, `AnalyseMany`, `Degrain`, `FlowInter` and `FlowFPS` so far take 4:2:0 and 4:4:4
-  supers of 8 to 16-bit samples at `pel=2` or `pel=4` with square blocks of 8×8, 16×16 or 32×32,
-  with the same overlap and padding horizontally and vertically (an even padding at 4:2:0),
-  MVUtensils' extended grids included. Other supers (float ones among them), and the Analyse values
-  not implemented yet (`satd`, `fields`, an Analyse grid other than the super's), are errors. As in
-  mvu, vectors analysed on an 8-bit copy of a clip serve `Degrain`, `FlowInter` and `FlowFPS` on the
-  9 to 16-bit clip, their SAD thresholds scaled to the depth the vectors were analysed at.
+* The other filters so far take Gray, 4:2:0 and 4:4:4 supers of 8 to 16-bit or float samples at
+  any `pel` (1, 2 or 4) with square blocks of 8×8, 16×16 or 32×32, with the same overlap and padding
+  horizontally and vertically (an even padding at 4:2:0), MVUtensils' extended grids included.
+  Other supers, and the values not implemented yet (`satd`, `fields`, an `Analyse` or `Recalculate`
+  grid other than the super's), are errors. As in mvu, vectors analysed on an 8-bit copy of a clip
+  serve the filters that compensate motion on the 9 to 16-bit or float clip, their SAD thresholds
+  scaled to the depth the vectors were analysed at, and a Gray clip's SADs are luma's.
+* `Analyse` searches float supers as the 16-bit samples they stand for: luma's 0 to 1 and
+  chroma's −0.5 to 0.5 scaled to 0 to 65535, rounded and clamped, each sample as it is read, which
+  puts the SADs on the 16-bit scale mvu gives float SADs. `Degrain`, `FlowInter` and `FlowFPS` take
+  mvu's float arithmetic operation for operation. mvu's float `FlowInter` and `FlowFPS` round
+  differently with each CPU's kernels (AVX-512, AVX2, SSE2); mvgpu's are bit for bit those of
+  mvu's AVX-512 kernels.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`; `plevel` scales the coarse levels'
   lambda as mvu scales it per level), a wide search for the blocks still
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
-  half-pel step. At `pel=4` the seeds and the passes stay on the half-pel grid (chained and
-  inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the half-pel one.
+  half-pel step (none at `pel=1`). At `pel=4` the seeds and the passes stay on the half-pel grid
+  (chained and inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the
+  half-pel one.
   With `chroma=False` every SAD is luma's alone, at every level. Above 8 bits `mvlambda`, `lsad` and
   `badsad` are scaled to the depth as mvu scales them, and `lsad` relaxes lambda by the worst
   neighbour's SAD in steps of 2^(bits − 8), as the search tabulates it.
@@ -67,17 +75,41 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   vectors, mvu.Analyse's, or constant fields with scene changes in between). mvu resizes the blocks'
   vectors and occlusion masks to the pixels with zimg's bilinear resize, in 64×64 tiles; the GPU
   does the same arithmetic, the taps computed for each tile as zimg computes them.
-* `test/matrix.py` runs the checks over their case matrices (`super`, `analyse`, `degrain`, `flow`)
-  on a directory of raw test clips.
-* With the environment variable `MVGPU_PROFILE=1`, `Super`, `Analyse`, `Degrain`, `FlowInter` and
-  `FlowFPS` time their stages on the GPU and print the averages to stderr when the filter is freed.
-  They wait for every frame, so they run slower.
+* `Compensate`, `Flow` and `FlowBlur` take all of mvu's arguments but `fields`, and given the same
+  super and vectors their output is mvu's bit for bit (`test/check_flow.py --filter compensate`,
+  `flow`, `blur`), float `FlowBlur` included, which sums in double precision as mvu does (on a device
+  without 64-bit floats in float, which can round apart).
+* `VectorLengthMask`, `SADMask` and `OcclusionMask` take all of mvu's arguments, and given the same
+  vectors their masks are mvu's bit for bit (`test/check_masks.py`), zimg's resize of the whole plane
+  included, but where a `gamma` other than 1 (other than 1 or 2 for `VectorLengthMask`) takes a
+  power: mvgpu computes it correctly rounded, in double precision, while the C library's `powf` mvu
+  calls misrounds about one value in ten thousand by a unit in the last place, which can move a
+  mask's sample a step (on a device without 64-bit floats mvgpu uses the GPU's `pow`, a step off
+  more often). `SCDetection` sets mvu's properties on the clip's frames, GPU resident or not; it
+  counts the badly matched blocks on the GPU and waits for the count, the one filter whose frames
+  wait for their GPU work.
+* `Recalculate` takes all of mvu's arguments but `satd` and `fields`, for the super's own grid (the
+  old vectors can be of any grid, from mvgpu.Analyse or Recalculate of the same bit depth and
+  `pel`), and its vectors are mvu's bit for bit (`test/check_recalculate.py`), every search type
+  replicated candidate for candidate: unlike `Analyse`'s, its blocks don't depend on one another.
+  As in mvu, a frame whose old vectors are missing (their reference frame outside the clip) is
+  recalculated from zero vectors against the reference frame clamped to the clip. Float supers
+  are searched as `Analyse` searches them, as the 16-bit samples they stand for (mvu sums float
+  differences in the order its CPU kernels take), so at `pel=1`, where the samples are the clip's,
+  the vectors are mvu's of the clip so quantized.
+* `test/matrix.py` runs the checks over their case matrices (`super`, `analyse`, `degrain`, `flow`,
+  `masks`, `motion`, `recalculate`) on a directory of raw test clips, and `smoke` a cross section of
+  all of them in a few minutes.
+* With the environment variable `MVGPU_PROFILE=1`, the filters time their stages on the GPU and
+  print the averages to stderr when the filter is freed. They wait for every frame, so they run
+  slower.
 * The search's results are bit-identical to its CPU reference implementation,
   `test/reference/reference.cpp` (built with `meson compile mvgpu_reference`, or on its own with any
   C++20 compiler); `test/check_reference.py --reference` runs it on the same frames with the same
   arguments and compares every block.
 * Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics,
-  and for `Degrain` 158 storage buffers per kernel (2 · 25 references with three buffers each).
+  and for `Degrain` 158 storage buffers per kernel (2 · 25 references with three buffers each);
+  64-bit floats where the device has them (the masks' powers, float `FlowBlur`'s sums).
   Building needs the Vulkan headers (`-Dvulkan_include=` for meson, the Vulkan SDK for
   `msvc/MVGPUtensils.slnx`); nothing is linked, the core hands out every entry point.
 

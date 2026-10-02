@@ -41,6 +41,12 @@ enum class Kernel {
     DegrainPixels,
     FlowPrep,
     FlowInter,
+    FlowFetch,
+    FlowBlur,
+    MaskBlocks,
+    MaskResize,
+    Compensate,
+    Recalculate,
 };
 
 // The bindings, as the kernels declare them (refine_common.glsl, pyr_common.glsl, super.comp,
@@ -122,11 +128,14 @@ struct DegrainParams {
     int32_t thscd1, scdLimit;
     int32_t plane, width, height, outStride;
     int32_t limit, winOff, thOff, uwOff;
-    int32_t nb, pixelMax, reserved1, reserved2;
+    int32_t nb, pixelMax;
+    float limitF;
+    int32_t reserved2;
 };
 static_assert(sizeof(DegrainParams) == 112, "degrain_common.glsl's Params is 28 ints");
 
-// The Flow kernels' push constants, matching flow_common.glsl's Params; they share the Main layout
+// The Flow kernels' push constants, matching flow_common.glsl's Params; they share the Main layout.
+// flow_blur.comp takes blur256 in time256 and prec in time4096FX.
 struct FlowParams {
     int32_t nbx, nby, recStride, flags;
     int32_t pad, padY, padc, padcY;
@@ -138,6 +147,44 @@ struct FlowParams {
     int32_t time4096FX, time4096FY, time4096BX, time4096BY;
 };
 static_assert(sizeof(FlowParams) == 112, "flow_common.glsl's Params is 28 words");
+
+// The mask kernels' push constants (mask_blocks.comp, mask_resize.comp), matching mask_common.glsl's
+// Params; they share the Main layout
+struct MaskParams {
+    int32_t nbx, nby, recStride, kind;
+    int32_t width, height, outStride, flags;
+    int32_t thscd1, scdLimit, pel, maxVal;
+    int32_t time4096X, time4096Y, sadShift, backward;
+    float norm, normY, gamma, scvalF;
+    int32_t scval, colOff, rowOff, countSlot;
+};
+static_assert(sizeof(MaskParams) <= 112, "mask_common.glsl's Params must fit the Main layout's push constants");
+
+// The mask kernels' bindings in the Main layout (mask_common.glsl): the vector records, the blocks'
+// mask values, the scene change count, the output plane, the resize's taps
+enum MaskBinding {
+    kMkVectors, kMkValues, kMkCounts, kMkOut, kMkTaps,
+};
+
+// Recalculate's push constants (recalc.comp's Params); it runs in the Main layout with bindings of its
+// own: the supers' luma and chroma of the frame and of its reference frame (0 .. 3), the old vectors
+// (4) and the new ones (5)
+struct RecalcParams {
+    int32_t nbx, nby, step, recStride;
+    int32_t nbxOld, nbyOld, blkOld, stepOld;
+    int32_t recStrideOld, pad, padY, padc;
+    int32_t padcY, wp, hp, wc;
+    int32_t hc, aw, ah, lambda;
+    int32_t thsad, pnew, search, searchParam;
+    int32_t smoothing;
+};
+static_assert(sizeof(RecalcParams) <= 112, "recalc.comp's Params must fit the Main layout's push constants");
+
+class Recorder;
+// Records mask_blocks.comp (count, a MaskBlocks pipeline) counting the blocks of a vector frame
+// (records recStride apart) whose SAD is above thscd1 into the uint slot of counts, which must start at
+// zero; it binds MaskBinding's kMkVectors and kMkCounts, which the caller rebinds after
+void RecordBadBlockCount(Recorder &rec, VkPipeline count, VkBuffer vectors, int recStride, int nbx, int nby, int thscd1, VkBuffer counts, int slot);
 
 class VulkanContext {
 public:
@@ -171,6 +218,7 @@ public:
     VkPhysicalDeviceLimits limits = {};
     std::string deviceName;
     uint32_t subgroup = 32;      // lanes per subgroup, every pipeline's required subgroup size
+    bool float64 = false;        // the device has 64-bit floats in shaders: kernels see MVGPU_FLOAT64 1
     uint32_t medianLanes = 1024; // median.comp's workgroup, within the device's subgroups per workgroup
 
     static constexpr int kFallbackSubgroups = 4; // subgroups searching each block the fallback flags
@@ -227,6 +275,8 @@ public:
     void Dispatch(VkPipeline pipeline, const Params &pc, uint32_t x, uint32_t y, uint32_t z = 1);
     void Dispatch(VkPipeline pipeline, const SuperParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
     void Dispatch(VkPipeline pipeline, const FlowParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
+    void Dispatch(VkPipeline pipeline, const MaskParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
+    void Dispatch(VkPipeline pipeline, const RecalcParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
     void DispatchIndirect(VkPipeline pipeline, const Params &pc, VkBuffer args, VkDeviceSize offset);
 
     void Fill(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t value);
@@ -239,6 +289,8 @@ public:
     // Compute reads and writes before transfers, and transfer writes before compute
     void ComputeToTransfer();
     void TransferToCompute();
+    // Compute writes before the host reads them, once the submission has completed
+    void ComputeToHost();
 
 private:
     void Barrier(VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);

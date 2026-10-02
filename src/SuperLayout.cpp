@@ -132,10 +132,10 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
 }
 
 std::string SuperLayout::Unsupported([[maybe_unused]] Use use) const {
-    if (format.Kind() == 2 || !format.chroma || format.xr != format.yr)
-        return "only 4:2:0 and 4:4:4 supers of 8 to 16-bit samples are implemented so far";
-    if (pel != 2 && pel != 4)
-        return "only supers with pel=2 or pel=4 are implemented so far";
+    if (format.chroma && format.xr != format.yr)
+        return "only Gray, 4:2:0 and 4:4:4 supers are implemented so far";
+    if (pel != 1 && pel != 2 && pel != 4)
+        return "only supers with pel=1, pel=2 or pel=4 are implemented so far";
     if (blk != blkY || (blk != 8 && blk != 16 && blk != 32))
         return "only supers with 8x8, 16x16 or 32x32 blocks are implemented so far";
     if (overlap != overlapY)

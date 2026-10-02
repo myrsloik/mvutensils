@@ -9,6 +9,11 @@ void superRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void degrainRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void flowRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void flowFetchRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void compensateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void recalculateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void maskRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void scdetectionRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 
 
 VS_EXTERNAL_API(void)
@@ -21,4 +26,9 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     analyseRegister(plugin, vspapi);
     degrainRegister(plugin, vspapi);
     flowRegister(plugin, vspapi);
+    flowFetchRegister(plugin, vspapi);
+    compensateRegister(plugin, vspapi);
+    recalculateRegister(plugin, vspapi);
+    maskRegister(plugin, vspapi);
+    scdetectionRegister(plugin, vspapi);
 }
