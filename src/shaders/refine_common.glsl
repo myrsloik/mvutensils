@@ -39,10 +39,11 @@ uint WorkgroupLane() {
 
 // The super's level-0 planes of the current frame n and the reference frame n + d (the storage
 // frames mvgpu.Super attaches, SuperLayout.h): four planes of hp rows for luma (full, x + 1/2,
-// y + 1/2, both), and four each for U and V (U at planes 0-3, V at 4-7) of hc rows. wp and wc are
-// the storage frames' strides, whole words, so every row starts on a word. LaneSad reads the
-// reference frame's planes as 32-bit words, up to two past a row's last pixel, so the storage
-// frames carry a spare row at the end.
+// y + 1/2, both), and for U and V four each of hc rows at pel 2 (U at planes 0-3, V at 4-7), at pel
+// 4 an image each of the quarter-pel grid, 4 hc rows of 4 wc samples. wp and wc are the storage
+// frames' strides, whole words, so every row starts on a word. LaneSad reads the reference frame's
+// planes as 32-bit words, up to two past a row's last pixel, so the storage frames carry a spare row
+// at the end.
 // super.comp builds them, so it writes them; every other kernel only reads them.
 #ifdef SUPER_BUILD
 #define PLANE_ACCESS
@@ -105,18 +106,41 @@ layout(push_constant) uniform Params {
     int srcStrideY;  // super.comp: the source frame's luma and chroma strides, bytes
     int srcStrideC;
     int recStride;   // fields stored as records (x, y, SAD, 0) per block: records per row
-    int reserved;
+    int coarseBase;  // seed building: where the field's coarse result starts in Coarse, in vectors
 } pc;
 
 // The target grid's block size, 8 or 16 (specialization constant 3): luma kBlk x kBlk, U and V
 // kBlk / 2 square. The pyramid's levels always use 8x8 blocks (pyr_common.glsl).
 layout(constant_id = 3) const int kBlk = 8;
+
+// The vectors' units per pixel, the super's pel, 2 or 4 (specialization constant 5). The super
+// holds luma's four half-pel planes either way, and chroma's four at pel 2 or its quarter-pel image
+// at pel 4, which takes as much as sixteen planes. The seeds, the passes and the half-pel step keep
+// the luma vectors on the half-pel grid (ClampHalf), the fallback on the full-pel grid (ClampFull);
+// only the quarter-pel step (refine_qpel.comp) reads luma between the grid's samples, and computes
+// them there, exactly as mvu.Super's quarter planes hold them.
+layout(constant_id = 5) const int kPel = 2;
+const int kChromaPlanes = kPel == 4 ? 16 : 4; // U's planes (or image), then V's as many plane sizes on
 const int kRowWords = kBlk / 4;                        // words of 4 pixels in a luma row,
 const int kRowWordsC = kBlk / 8;                       // and in a chroma row
 const int kLumaWords = kBlk * kRowWords;
 const int kChromaWords = kBlk / 2 * kRowWordsC;        // per chroma plane
 const int kBlockWords = kLumaWords + 2 * kChromaWords;
 const int kCurStride = 2 * kBlockWords;                // sCur entries per block
+
+// Where V's samples start, past U's
+uint ChromaV() {
+    return uint(kChromaPlanes * pc.wc * pc.hc);
+}
+// U's address of full-pel chroma pixel (x, y) of the padded plane: in the full-pel plane at pel 2,
+// at (4x, 4y) of the image at pel 4
+uint ChromaPixel(int x, int y) {
+    return kPel == 4 ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x);
+}
+// Samples from a chroma pixel to the one below it
+int ChromaRow() {
+    return kPel == 4 ? 16 * pc.wc : pc.wc;
+}
 
 // The current pixels of the workgroup's blocks, kCurStride entries per block (see LoadBlock), or
 // kLevelStride for the pyramid's 8x8 blocks (LoadLevelBlock, in kernels that define LEVEL_BLOCKS).
@@ -158,9 +182,10 @@ void LoadBlock(int group, int sub, int lanesPerBlock, int bx, int by, bool live)
                 if (k < kLumaWords) {
                     b[i] = uint(curY[(gY + pc.pad + k / kRowWords) * pc.wp + gX + pc.pad + (k % kRowWords) * 4 + i]);
                 } else {
-                    int kc = k - kLumaWords, plane = kc < kChromaWords ? 0 : 4;
+                    int kc = k - kLumaWords;
+                    uint plane = kc < kChromaWords ? 0u : ChromaV();
                     kc %= kChromaWords;
-                    b[i] = uint(curC[plane * pc.wc * pc.hc + (gY / 2 + pc.padc + kc / kRowWordsC) * pc.wc + gX / 2 + pc.padc + (kc % kRowWordsC) * 4 + i]);
+                    b[i] = uint(curC[plane + ChromaPixel(gX / 2 + pc.padc + (kc % kRowWordsC) * 4 + i, gY / 2 + pc.padc + kc / kRowWordsC)]);
                 }
                 partial += b[i];
             }
@@ -174,10 +199,20 @@ void LoadBlock(int group, int sub, int lanesPerBlock, int bx, int by, bool live)
 
 // The range ValidateVectors accepts for the block: within the block-aligned frame the grid covers,
 // (nbx - 1) * step + kBlk wide, and its padding. MVUtensils extends the grid by a column or row of
-// blocks when they fall short of the frame, and the super's planes to match.
+// blocks when they fall short of the frame, and the super's planes to match. ClampHalf keeps to the
+// half-pel grid inside that range, ClampFull to the full-pel grid; at pel 2 all three are the same.
+ivec2 ClampTo(ivec2 v, int top) {
+    return ivec2(clamp(v.x, -kPel * (gX + pc.pad), kPel * ((pc.nbx - 1) * pc.step + pc.pad - gX) - top),
+                 clamp(v.y, -kPel * (gY + pc.pad), kPel * ((pc.nby - 1) * pc.step + pc.pad - gY) - top));
+}
 ivec2 ClampVec(ivec2 v) {
-    return ivec2(clamp(v.x, -2 * (gX + pc.pad), 2 * ((pc.nbx - 1) * pc.step + pc.pad - gX) - 1),
-                 clamp(v.y, -2 * (gY + pc.pad), 2 * ((pc.nby - 1) * pc.step + pc.pad - gY) - 1));
+    return ClampTo(v, 1);
+}
+ivec2 ClampHalf(ivec2 v) {
+    return ClampTo(v, kPel == 4 ? 2 : 1);
+}
+ivec2 ClampFull(ivec2 v) {
+    return ClampTo(v, kPel == 4 ? 4 : 1);
 }
 
 // Analyse rounds the chroma vector toward zero
@@ -194,6 +229,56 @@ uint Bytes4(uint lo, uint hi, uint shift) {
 }
 
 #ifndef NO_BLOCK_CACHE
+// Each byte the rounded average of a's and b's, (a + b + 1) >> 1, as mvu.Super averages
+uint Avg(uint a, uint b) {
+    return (a | b) - (((a ^ b) >> 1u) & 0x7F7F7F7Fu);
+}
+
+// The plane address of sample (Xh, Yh) of the half-pel grid: its plane (Xh & 1) | ((Yh & 1) << 1),
+// planeBytes apart, then its row and column
+uint HalfAddr(int Xh, int Yh, uint planeBytes, int stride) {
+    return uint((Xh & 1) | ((Yh & 1) << 1)) * planeBytes + uint((Yh >> 1) * stride + (Xh >> 1));
+}
+
+// U's address of chroma position (Xc, Yc), 1 / pel pixels of the padded plane: in one of the four
+// half-pel planes at pel 2, at that place of the quarter-pel image at pel 4; V's is ChromaV() on
+uint ChromaAddr(int Xc, int Yc) {
+    if (kPel == 4)
+        return uint(Yc * 4 * pc.wc + Xc);
+    return HalfAddr(Xc, Yc, uint(pc.wc * pc.hc), pc.wc);
+}
+
+// At pel 4, 4 chroma pixels of a row of the reference frame's image from byte a on, as a word: they
+// sit 4 samples apart, each in a word of its own at the same byte
+uint Strided4(uint a) {
+    uint w = a >> 2u, s = (a & 3u) << 3u;
+    return ((refC[w] >> s) & 0xFFu) | (((refC[w + 1u] >> s) & 0xFFu) << 8u) | (((refC[w + 2u] >> s) & 0xFFu) << 16u) | ((refC[w + 3u] >> s) << 24u);
+}
+
+// The runs of words a SAD reads: the 4-byte groups of a row starting at byte a, aligned with funnel
+// shifts, kRowWords of them for luma and kRowWordsC for chroma (at pel 4 gathered from the image)
+void RunY(uint a, out uint r[kRowWords]) {
+    uint w = a >> 2u, s = (a & 3u) << 3u, lo = refY[w];
+    [[unroll]] for (int i = 0; i < kRowWords; ++i) {
+        uint hi = refY[w + uint(i) + 1u];
+        r[i] = Bytes4(lo, hi, s);
+        lo = hi;
+    }
+}
+void RunC(uint a, out uint r[kRowWordsC]) {
+    if (kPel == 4) {
+        [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+            r[i] = Strided4(a + uint(16 * i));
+        return;
+    }
+    uint w = a >> 2u, s = (a & 3u) << 3u, lo = refC[w];
+    [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
+        uint hi = refC[w + uint(i) + 1u];
+        r[i] = Bytes4(lo, hi, s);
+        lo = hi;
+    }
+}
+
 // The SAD as sum(a) + sum(c) - 2 * sum(min(a, c)) over the reference pixels a and the current
 // pixels c, exact in integers. One word r of 4 reference pixels against the block's word at
 // sCur[e], sCur[e + 1] (LoadBlock): r's pixel sum into sa with one 4 x 8-bit dot product, and the
@@ -218,12 +303,17 @@ const int kRowChunk = 4;
 const int kLumaChunk = 32 / kBlk, kChromaChunk = 32 / kBlk;
 
 #ifndef NO_BLOCK_CACHE
-// MVUtensils' SAD of the lane's block for half-pel vector v: luma kBlk x kBlk plus U and V at half
-// that. Each reference row comes as whole words, aligned with funnel shifts. The rows start on
-// whole words (the storage frames' strides are), so every row of the block sits at the same offset
-// in its words.
+// MVUtensils' SAD of the lane's block for vector v: luma kBlk x kBlk plus U and V at half that.
+// Each reference row comes as whole words, aligned with funnel shifts. The rows start on whole
+// words (the storage frames' strides are), so every row of the block sits at the same offset in its
+// words. At pel 4 the luma vector is on the half-pel grid (ClampHalf, ClampFull), and the chroma
+// one anywhere, read from chroma's quarter-pel image, its pixels gathered from a word each.
 int LaneSad(ivec2 v) {
-    int X = 2 * (gX + pc.pad) + v.x, Y = 2 * (gY + pc.pad) + v.y;
+    int X = kPel * (gX + pc.pad) + v.x, Y = kPel * (gY + pc.pad) + v.y;
+    if (kPel == 4) {
+        X >>= 1;
+        Y >>= 1;
+    }
     int idx = (X & 1) | ((Y & 1) << 1);
     uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
     uint w = a >> 2u, shift = (a & 3u) << 3u, stride = uint(pc.wp) >> 2u;
@@ -241,12 +331,24 @@ int LaneSad(ivec2 v) {
             }
         }
     }
-    int Xc = 2 * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = 2 * (gY / 2 + pc.padc) + ChromaComponent(v.y);
-    int ic = (Xc & 1) | ((Yc & 1) << 1);
-    uint plane = uint(pc.wc * pc.hc);
-    uint ac = uint(ic) * plane + uint((Yc >> 1) * pc.wc + (Xc >> 1));
-    uint wu = ac >> 2u, wv = (ac + 4u * plane) >> 2u, shiftC = (ac & 3u) << 3u, strideC = uint(pc.wc) >> 2u;
+    int Xc = kPel * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = kPel * (gY / 2 + pc.padc) + ChromaComponent(v.y);
     int curU = cur + 2 * kLumaWords, curV = curU + 2 * kChromaWords;
+    uint ac = ChromaAddr(Xc, Yc);
+    if (kPel == 4) {
+        uint av = ac + ChromaV(), rowC = uint(ChromaRow());
+        for (int j0 = 0; j0 < pc.blockRows / 2; j0 += kChromaChunk) {
+            [[unroll]] for (int jj = 0; jj < kChromaChunk; ++jj) {
+                int j = j0 + jj;
+                uint u = ac + uint(j) * rowC, t = av + uint(j) * rowC;
+                [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
+                    PackedStep(Strided4(u + uint(16 * i)), curU + 2 * (j * kRowWordsC + i), sa, sm);
+                    PackedStep(Strided4(t + uint(16 * i)), curV + 2 * (j * kRowWordsC + i), sa, sm);
+                }
+            }
+        }
+        return int(sa + gSumCur - 2u * sm);
+    }
+    uint wu = ac >> 2u, wv = (ac + ChromaV()) >> 2u, shiftC = (ac & 3u) << 3u, strideC = uint(pc.wc) >> 2u;
     for (int j0 = 0; j0 < pc.blockRows / 2; j0 += kChromaChunk) {
         [[unroll]] for (int jj = 0; jj < kChromaChunk; ++jj) {
             int j = j0 + jj;

@@ -13,26 +13,36 @@
 #include "SuperLayout.h"
 #include "VulkanContext.h"
 
-// mvu.Super on the GPU: the frame padded to the block-aligned size the grid covers, its half-pel
-// planes and the coarse levels the search starts from, built by super.comp and pyr_reduce.comp
-// into the frames SuperLayout.h describes and attached to the output frame, which is the input
-// frame itself. Implemented: 8-bit 4:2:0, pel 2, sharp 2, rfilter 1, square blocks of 8 or 16, the
-// same padding horizontally and vertically.
+// mvu.Super on the GPU: the frame padded to the block-aligned size the grid covers, its sub-pel
+// planes and the coarse levels the search starts from, built by super.comp, super_qpel.comp and
+// pyr_reduce.comp into the frames SuperLayout.h describes and attached to the output frame, which
+// is the input frame itself. All of mvu.Super's arguments: GRAY and YUV 4:2:0, 4:2:2, 4:4:0 and
+// 4:4:4 at 8 to 16 bits or float, pel 1, 2 and 4, sharp, rfilter, onelevel, pelclip, every block
+// size, overlap and padding mvu takes. Level 0 is mvu.Super's bit for bit (test/check_super.py),
+// at pel 4 luma's quarter planes computed where they're read. That leaves no room for a pelclip's
+// own quarter samples, so a pelclip at pel 4 is refused: a divergence from mvu.Super, which saves
+// half of a pel 4 super's memory. The coarse levels are the GPU search's own (SuperLayout.h),
+// reduced with rfilter's filter.
 
 struct SuperData {
     VSNode *node = nullptr;
+    VSNode *pelclip = nullptr; // with usePelClip, the half-pel planes come from it
     VSVideoInfo vi = {};
 
     SuperLayout layout;
     std::string prefix;
+    int sharp = 2, rfilter = 1;
+    bool usePelClip = false;
 
     std::shared_ptr<VulkanContext> vc;
     VSGPUExecPool *pool = nullptr;
-    VkPipeline superPipeline = VK_NULL_HANDLE;
-    VkPipeline reducePipeline = VK_NULL_HANDLE;
-    VSGPUBuffer *constants = nullptr; // the level table
+    VkPipeline planesPipeline = VK_NULL_HANDLE;
+    VkPipeline quarterPipeline = VK_NULL_HANDLE; // pel 4 chroma: its quarter-pel images, whole
+    VkPipeline reducePipeline = VK_NULL_HANDLE;  // with coarse levels
+    VSGPUBuffer *constants = nullptr;            // the level table
     VSVulkanBufferInfo constantsInfo = {};
-    VSVideoFormat gray8 = {};
+    VSVideoFormat storage = {}; // the storage frames' format: Gray of the clip's samples
+    std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
 
@@ -42,10 +52,12 @@ struct SuperData {
         // The pool drains the GPU first, so nothing still uses what follows
         if (pool)
             vc->vkapi->freeGPUExecPool(pool);
+        profile.reset();
         if (constants)
             vc->vkapi->destroyGPUBuffer(constants);
         vc.reset();
         vsapi->freeNode(node);
+        vsapi->freeNode(pelclip);
     }
 };
 
@@ -54,92 +66,154 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
+        if (d->usePelClip)
+            vsapi->requestFrameFilter(n, d->pelclip, frameCtx);
     } else if (activationReason == arAllFramesReady) {
         const VSVULKANAPI *vkapi = d->vc->vkapi;
         const SuperLayout &L = d->layout;
+        const SuperFormat &F = L.format;
+        const int planes = F.chroma ? 3 : 1;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        VSFrame *luma = vkapi->newGPUVideoFrame(&d->gray8, L.wp, L.LumaRows(), nullptr, core);
-        VSFrame *chroma = vkapi->newGPUVideoFrame(&d->gray8, L.wc, L.ChromaRows(), nullptr, core);
-        VSFrame *pyramid = L.topLevel > 0 ? vkapi->newGPUVideoFrame(&d->gray8, L.PyramidWidth(), L.PyramidRows(), nullptr, core) : nullptr;
+        const VSFrame *pel = d->usePelClip ? vsapi->getFrameFilter(n, d->pelclip, frameCtx) : nullptr;
+        VSFrame *luma = vkapi->newGPUVideoFrame(&d->storage, L.wp, L.LumaRows(), nullptr, core);
+        VSFrame *chroma = F.chroma ? vkapi->newGPUVideoFrame(&d->storage, L.wc, L.ChromaRows(), nullptr, core) : nullptr;
+        VSFrame *pyramid = L.topLevel > 0 ? vkapi->newGPUVideoFrame(&d->storage, L.PyramidWidth(), L.PyramidRows(), nullptr, core) : nullptr;
         VSGPUExecContext *ctx = nullptr;
         auto fail = [&](const std::string &message) -> const VSFrame * {
             if (ctx)
                 vkapi->gpuExecAbandon(ctx);
             vsapi->freeFrame(src);
+            vsapi->freeFrame(pel);
             vsapi->freeFrame(luma);
             vsapi->freeFrame(chroma);
             vsapi->freeFrame(pyramid);
             vsapi->setFilterError(("Super: " + message).c_str(), frameCtx);
             return nullptr;
         };
-        if (!luma || !chroma || (L.topLevel > 0 && !pyramid))
+        if (!luma || (F.chroma && !chroma) || (L.topLevel > 0 && !pyramid))
             return fail("failed to allocate the GPU frames");
 
-        VSVulkanPlaneInfo srcPlanes[3], lumaPlane, chromaPlane, pyramidPlane = {};
-        for (int p = 0; p < 3; ++p)
+        VSVulkanPlaneInfo srcPlanes[3] = {}, pelPlanes[3] = {}, lumaPlane = {}, chromaPlane = {}, pyramidPlane = {};
+        for (int p = 0; p < planes; ++p) {
             if (vkapi->getGPUPlane(src, p, &srcPlanes[p]))
                 return fail("the input frame isn't GPU resident");
-        if (vkapi->getGPUPlane(luma, 0, &lumaPlane) || vkapi->getGPUPlane(chroma, 0, &chromaPlane) || (pyramid && vkapi->getGPUPlane(pyramid, 0, &pyramidPlane)))
+            if (pel && vkapi->getGPUPlane(pel, p, &pelPlanes[p]))
+                return fail("the pelclip frame isn't GPU resident");
+        }
+        if (vkapi->getGPUPlane(luma, 0, &lumaPlane) || (chroma && vkapi->getGPUPlane(chroma, 0, &chromaPlane)) ||
+            (pyramid && vkapi->getGPUPlane(pyramid, 0, &pyramidPlane)))
             return fail("the storage frames aren't GPU resident");
-        const ptrdiff_t lumaStride = vsapi->getStride(luma, 0), chromaStride = vsapi->getStride(chroma, 0);
-        if (lumaStride % 4 || chromaStride % 4)
-            return fail("the storage frames' rows don't start on whole words");
+        const ptrdiff_t bytes = F.Bytes();
+        const ptrdiff_t lumaStride = vsapi->getStride(luma, 0), chromaStride = chroma ? vsapi->getStride(chroma, 0) : 0;
+        if (lumaStride % (4 * bytes) || chromaStride % (4 * bytes))
+            return fail("the storage frames' rows don't start on groups of four samples");
 
         char err[1024] = {};
         ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
         if (!ctx)
             return fail(err);
         vkapi->gpuExecReadsFrame(ctx, src);
+        if (pel)
+            vkapi->gpuExecReadsFrame(ctx, pel);
         vkapi->gpuExecWritesPlane(ctx, luma, 0);
-        vkapi->gpuExecWritesPlane(ctx, chroma, 0);
+        if (chroma)
+            vkapi->gpuExecWritesPlane(ctx, chroma, 0);
         if (pyramid)
             vkapi->gpuExecWritesPlane(ctx, pyramid, 0);
 
-        Recorder rec(*d->vc, vkapi->gpuExecCommandBuffer(ctx), d->constantsInfo.buffer);
+        const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
+        Recorder rec(*d->vc, cmd, d->constantsInfo.buffer);
+        const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
+        auto stamp = [&](int stage) {
+            if (d->profile)
+                d->profile->Stamp(*d->vc, cmd, queries, stage);
+        };
         rec.Bind(kCurLuma, lumaPlane.buffer);
-        rec.Bind(kCurChroma, chromaPlane.buffer);
+        if (chroma)
+            rec.Bind(kCurChroma, chromaPlane.buffer);
         if (pyramid)
             rec.Bind(kCurPyramid, pyramidPlane.buffer);
         rec.Bind(kLevels, d->constantsInfo.buffer);
-        rec.Bind(kRawY, srcPlanes[0].buffer);
-        rec.Bind(kRawU, srcPlanes[1].buffer);
-        rec.Bind(kRawV, srcPlanes[2].buffer);
+        const int raw[3] = {kRawY, kRawU, kRawV}, pelBindings[3] = {kPelY, kPelU, kPelV};
+        for (int p = 0; p < planes; ++p) {
+            rec.Bind(raw[p], srcPlanes[p].buffer);
+            if (pel)
+                rec.Bind(pelBindings[p], pelPlanes[p].buffer);
+        }
 
-        Params q = {};
+        SuperParams q = {};
         q.w = L.width;
         q.h = L.height;
-        q.nbx = L.nbx;
-        q.nby = L.nby;
-        q.step = L.step;
-        q.pad = L.pad;
-        q.padc = L.padc;
-        q.wp = static_cast<int32_t>(lumaStride);
+        q.aw = L.aw;
+        q.ah = L.ah;
+        q.padX = L.pad;
+        q.padY = L.padY;
+        q.padcX = L.padc;
+        q.padcY = L.padcY;
+        q.wp = static_cast<int32_t>(lumaStride / bytes);
         q.hp = L.hp;
-        q.wc = static_cast<int32_t>(chromaStride);
+        q.wc = static_cast<int32_t>(chromaStride / bytes);
         q.hc = L.hc;
-        q.blockRows = L.blk;
-        q.srcStrideY = static_cast<int32_t>(vsapi->getStride(src, 0));
-        q.srcStrideC = static_cast<int32_t>(vsapi->getStride(src, 1));
-        // The full-pel planes from the frame, then the x + 1/2 and y + 1/2 planes from them, then
-        // the diagonal plane from the y + 1/2 plane; 256 pixels of a padded row per workgroup
-        const uint32_t padded = static_cast<uint32_t>(L.aw + 2 * L.pad), rows = static_cast<uint32_t>(L.hp);
-        for (int step = 0; step < 3; ++step) {
-            q.level = step;
-            rec.Dispatch(d->superPipeline, q, (padded + 255) / 256, rows, 3);
+        q.lumaPlanes = L.lumaPlanes;
+        q.chromaPlanes = L.ChromaPlanes();
+        q.xr = F.xr;
+        q.yr = F.yr;
+        q.planes = planes;
+        q.sharp = d->sharp;
+        q.pixelMax = F.Float() ? 0 : (1 << F.bits) - 1;
+        q.srcStrideY = static_cast<int32_t>(vsapi->getStride(src, 0) / bytes);
+        q.srcStrideC = F.chroma ? static_cast<int32_t>(vsapi->getStride(src, 1) / bytes) : 0;
+        q.pelStrideY = pel ? static_cast<int32_t>(vsapi->getStride(pel, 0) / bytes) : 0;
+        q.pelStrideC = pel && F.chroma ? static_cast<int32_t>(vsapi->getStride(pel, 1) / bytes) : 0;
+        q.rfilter = d->rfilter;
+        q.pel = L.pel;
+
+        // The full-pel planes from the frame; then the half-pel planes from them (the diagonal one
+        // after the y + 1/2 one it filters), or from the pelclip. At pel 4 those are luma's alone,
+        // and super_qpel.comp makes chroma's quarter-pel images whole from the frame. Four samples
+        // of a padded row per lane.
+        const uint32_t groups = static_cast<uint32_t>((L.aw + 2 * L.pad + 255) / 256), rows = static_cast<uint32_t>(L.hp);
+        const uint32_t stepPlanes = d->quarterPipeline ? 1u : static_cast<uint32_t>(planes);
+        auto planesStep = [&](int step) {
+            q.step = step;
+            rec.Dispatch(d->planesPipeline, q, groups, rows, stepPlanes);
+            rec.ComputeBarrier();
+        };
+        planesStep(0);
+        stamp(1);
+        if (L.pel > 1) {
+            if (d->usePelClip) {
+                planesStep(3);
+            } else {
+                planesStep(1);
+                planesStep(2);
+            }
+        }
+        stamp(2);
+        if (d->quarterPipeline) {
+            rec.Dispatch(d->quarterPipeline, q, static_cast<uint32_t>((L.aw / F.xr + 2 * L.padc + 255) / 256), static_cast<uint32_t>(L.hc), 2);
             rec.ComputeBarrier();
         }
-        // Each coarse level from the one below it, borders included
+        stamp(3);
+        // Each coarse level from the one below it, borders included; chroma's border can be the wider
+        // one, and without subsampling its plane as large as luma's
         for (int level = 1; level <= L.topLevel; ++level) {
             const LevelEntry &e = L.levels[level];
             q.level = level;
-            rec.Dispatch(d->reducePipeline, q, static_cast<uint32_t>((e.w + 2 * e.borderY + 63) / 64), static_cast<uint32_t>(e.h + 2 * e.borderY), 3);
+            const int cols = std::max(e.w + 2 * e.borderY, F.chroma ? e.wc + 2 * e.borderC : 0);
+            const int rows = std::max(e.h + 2 * e.borderY, F.chroma ? e.hc + 2 * e.borderC : 0);
+            rec.Dispatch(d->reducePipeline, q, static_cast<uint32_t>((cols + 63) / 64), static_cast<uint32_t>(rows), static_cast<uint32_t>(planes));
             if (level < L.topLevel)
                 rec.ComputeBarrier();
         }
-        const int submitted = vkapi->gpuExecSubmit(ctx, nullptr, err, sizeof(err));
+        stamp(4);
+        uint64_t signaled = 0;
+        const int submitted = vkapi->gpuExecSubmit(ctx, &signaled, err, sizeof(err));
         ctx = nullptr;
         if (submitted)
             return fail(err);
+        if (d->profile)
+            d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
         VSFrame *dst = vsapi->copyFrame(src, core);
         SuperFrames frames;
@@ -149,6 +223,7 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         ExportSuper(dst, L, frames, d->prefix, vsapi);
         frames.Free(vsapi);
         vsapi->freeFrame(src);
+        vsapi->freeFrame(pel);
         return dst;
     }
 
@@ -172,13 +247,13 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
 
         const bool onelevel = !!vsapi->mapGetIntSaturated(in, "onelevel", 0, &err);
 
-        int sharp = vsapi->mapGetIntSaturated(in, "sharp", 0, &err);
+        d->sharp = vsapi->mapGetIntSaturated(in, "sharp", 0, &err);
         if (err)
-            sharp = 2;
+            d->sharp = 2;
 
-        int rfilter = vsapi->mapGetIntSaturated(in, "rfilter", 0, &err);
+        d->rfilter = vsapi->mapGetIntSaturated(in, "rfilter", 0, &err);
         if (err)
-            rfilter = 1;
+            d->rfilter = 1;
 
         const char *prefix = vsapi->mapGetData(in, "prefix", 0, &err);
         if (prefix)
@@ -189,18 +264,18 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         if ((pel != 1) && (pel != 2) && (pel != 4))
             throw std::runtime_error("pel must be 1, 2, or 4");
 
-        if (sharp < 0 || sharp > 2)
+        if (d->sharp < 0 || d->sharp > 2)
             throw std::runtime_error("sharp must be between 0 and 2");
 
-        if (rfilter < 0 || rfilter > 2)
+        if (d->rfilter < 0 || d->rfilter > 2)
             throw std::runtime_error("rfilter must be between 0 and 2");
 
         d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
         d->vi = *vsapi->getVideoInfo(d->node);
 
-        if (!vsh::isConstantVideoFormat(&d->vi) || (d->vi.format.bitsPerSample > 16 && d->vi.format.sampleType == stInteger) || (d->vi.format.bitsPerSample != 32 && d->vi.format.sampleType == stFloat) ||
-            d->vi.format.subSamplingW > 1 || d->vi.format.subSamplingH > 1 || (d->vi.format.colorFamily != cfYUV && d->vi.format.colorFamily != cfGray))
+        if (!vsh::isConstantVideoFormat(&d->vi))
             throw std::runtime_error("input clip must be GRAY, YUV420, YUV422, YUV440, or YUV444, up to 16 bits integer or 32 bit float, with constant dimensions");
+        const SuperFormat format = SuperFormat::Of(d->vi.format);
 
         int blkX, blkY, overlapX, overlapY;
         GetPairArgument(blkX, blkY, "blksize", 8, 8, in, vsapi);
@@ -208,55 +283,69 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
 
         CheckBlockSize(blkX, blkY, overlapX, overlapY, d->vi.format.subSamplingW, d->vi.format.subSamplingH);
 
-        VSNode *pelclipNode = vsapi->mapGetNode(in, "pelclip", 0, &err);
-        const bool pelclip = pelclipNode != nullptr;
-        vsapi->freeNode(pelclipNode);
+        d->pelclip = vsapi->mapGetNode(in, "pelclip", 0, &err);
+        const VSVideoInfo *pelvi = d->pelclip ? vsapi->getVideoInfo(d->pelclip) : nullptr;
 
-        // What the GPU path implements so far
-        if (d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != 8 || d->vi.format.subSamplingW != 1 ||
-            d->vi.format.subSamplingH != 1)
-            throw std::runtime_error("only 8-bit YUV420 input is implemented so far");
-        if (pel != 2)
-            throw std::runtime_error("only pel=2 is implemented so far");
-        if (sharp != 2)
-            throw std::runtime_error("only sharp=2 is implemented so far");
-        if (rfilter != 1)
-            throw std::runtime_error("only rfilter=1 is implemented so far");
-        if (pelclip)
-            throw std::runtime_error("pelclip isn't implemented yet");
-        if (blkX != blkY || (blkX != 8 && blkX != 16))
-            throw std::runtime_error("only 8x8 and 16x16 blocks are implemented so far");
-        if (overlapX != overlapY)
-            throw std::runtime_error("only the same overlap horizontally and vertically is implemented so far");
-        if (hpad != vpad)
-            throw std::runtime_error("only the same padding horizontally and vertically is implemented so far");
+        if (pelvi && (!vsh::isConstantVideoFormat(pelvi) || !vsh::isSameVideoFormat(&pelvi->format, &d->vi.format)))
+            throw std::runtime_error("pelclip must have the same format as the input clip, and it must have constant dimensions");
 
-        d->layout = SuperLayout::Make(d->vi.width, d->vi.height, blkX, overlapX, hpad, !onelevel);
+        // mvu.Super takes a pelclip at pel 4 too, but this super keeps luma's half-pel planes only
+        // and computes its quarter samples as averages of them, which a pelclip's needn't be
+        if (pelvi && pel == 4)
+            throw std::runtime_error("a pelclip isn't supported at pel=4: mvgpu.Super stores only the half-pel planes and computes the quarter-pel samples "
+                                     "from them, to save memory; use pel=2 with a pelclip, or pel=4 without one");
+
+        if (pelvi && pel >= 2) {
+            // mvu.Super only refuses a pelclip when both dimensions are wrong, then reads as if both
+            // were right; this takes only one with both right
+            if (pelvi->width != d->vi.width * pel || pelvi->height != d->vi.height * pel)
+                throw std::runtime_error("pelclip's dimensions must be a multiple of the input clip's dimensions");
+
+            if (pelvi->numFrames != d->vi.numFrames)
+                throw std::runtime_error("pelclip's length must match the input clip's length");
+
+            d->usePelClip = true;
+        }
+
+        d->layout = SuperLayout::Make(format, d->vi.width, d->vi.height, blkX, blkY, overlapX, overlapY, hpad, vpad, pel, !onelevel);
+        const SuperLayout &L = d->layout;
 
         d->vc = VulkanContext::Get(core, vsapi);
-        d->superPipeline = d->vc->Pipeline(Kernel::Super, blkX);
-        if (d->layout.topLevel > 0)
-            d->reducePipeline = d->vc->Pipeline(Kernel::PyrReduce, blkX);
+        VulkanContext &vc = *d->vc;
+        // The super kernels don't use the grid's block size, so their pipelines don't depend on it
+        d->planesPipeline = vc.Pipeline(Kernel::Super, 0, pel, format.Kind());
+        if (pel == 4 && format.chroma)
+            d->quarterPipeline = vc.Pipeline(Kernel::SuperQuarter, 0, pel, format.Kind());
+        if (L.topLevel > 0)
+            d->reducePipeline = vc.Pipeline(Kernel::PyrReduce, 0, pel, format.Kind());
+        const VkDeviceSize lumaBytes = static_cast<VkDeviceSize>(L.LumaRows()) * L.wp * format.Bytes();
+        const VkDeviceSize chromaBytes = static_cast<VkDeviceSize>(L.ChromaRows()) * L.wc * format.Bytes();
+        if (lumaBytes > vc.limits.maxStorageBufferRange || (format.chroma && chromaBytes > vc.limits.maxStorageBufferRange))
+            throw std::runtime_error("the frame is too large for the device's storage buffers");
 
         char errMsg[1024] = {};
-        d->pool = d->vc->vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
+        d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
         if (!d->pool)
             throw std::runtime_error(errMsg);
-        const std::vector<LevelEntry> &table = d->layout.levels;
-        d->constants = d->vc->Upload(core, d->pool, table.data(), table.size() * sizeof(LevelEntry), d->constantsInfo);
+        const std::vector<LevelEntry> &table = L.levels;
+        d->constants = vc.Upload(core, d->pool, table.data(), table.size() * sizeof(LevelEntry), d->constantsInfo);
 
-        if (!vsapi->queryVideoFormat(&d->gray8, cfGray, stInteger, 8, 0, 0, core))
-            throw std::runtime_error("failed to query the Gray8 format");
+        if (!vsapi->queryVideoFormat(&d->storage, cfGray, d->vi.format.sampleType, d->vi.format.bitsPerSample, 0, 0, core))
+            throw std::runtime_error("failed to query the storage frames' format");
+        if (StageProfiler::Requested())
+            d->profile = std::make_unique<StageProfiler>("Super (pel " + std::to_string(pel) + ")",
+                                                         std::vector<std::string>{"full-pel planes", "sub-pel planes", "pel 4 chroma images", "coarse levels"});
     } catch (const std::exception &e) {
         vsapi->mapSetError(out, ("Super: " + std::string(e.what())).c_str());
         return;
     }
 
-    VSFilterDependency deps[1] = {
-        { d->node, rpStrictSpatial }
+    VSFilterDependency deps[2] = {
+        { d->node, rpStrictSpatial },
+        { d->pelclip, rpStrictSpatial }
     };
 
-    vsapi->createVideoFilterEx(out, "Super", &d->vi, superGetFrame, filterFree<SuperData>, fmParallel, ffGPUOutput, deps, ARRAY_SIZE(deps), d.get(), core);
+    vsapi->createVideoFilterEx(out, "Super", &d->vi, superGetFrame, filterFree<SuperData>, fmParallel, ffGPUOutput, deps, d->usePelClip ? 2 : 1, d.get(), core);
     d.release();
 }
 

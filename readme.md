@@ -2,35 +2,65 @@
 
 MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's Vulkan GPU frames
 (API 4.3): every clip it takes and returns is GPU resident. The goal is a drop-in replacement for
-`mvu`, the same functions with the same arguments; so far there are `Super`, `Analyse` and
-`AnalyseMany`. The rest of this file documents MVUtensils, which the GPU filters follow.
+`mvu`, the same functions with the same arguments; so far there are `Super`, `Analyse`,
+`AnalyseMany` and `Degrain` (with `Degrain1` … `Degrain25`). The rest of this file documents
+MVUtensils, which the GPU filters follow.
 
 ```python
 clip = core.bs.VideoSource('video.mkv', gpu=True)
 sup = core.mvgpu.Super(clip, blksize=16, overlap=8)
-vectors = core.mvgpu.AnalyseMany(sup, radius=2, badsad=1000, badrange=40)
+vectors = core.mvgpu.AnalyseMany(sup, radius=2)
+denoised = core.mvgpu.Degrain(clip, sup, vectors)
 ```
 
 ## Status
 
-* Implemented so far: 8-bit YUV420, `pel=2`, square blocks of 8×8 or 16×16 with any overlap
-  MVUtensils accepts, and its extended grids. Values not implemented yet (`satd`, `fields`,
-  `chroma=False`, other `pel`, `sharp` or `rfilter` values, `pelclip`, an Analyse grid other than
-  the super's) are errors.
+* `Super` takes everything mvu.Super does: GRAY and YUV 4:2:0, 4:2:2, 4:4:0 and 4:4:4 at 8 to 16
+  bits or float, `pel` 1, 2 and 4, every `sharp` and `rfilter`, `pelclip`, `onelevel`, and every
+  block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
+  (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
+  the GPU search's own, reduced with `rfilter`'s filter.
+* `Analyse` and `Degrain` so far take 8-bit 4:2:0 supers at `pel=2` or `pel=4` with square blocks
+  of 8×8 or 16×16, the same overlap and padding horizontally and vertically, and no `pel=4`
+  `pelclip`; MVUtensils' extended grids included. Other supers, and the Analyse values not
+  implemented yet (`satd`, `fields`, `chroma=False`, an Analyse grid other than the super's), are
+  errors.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`), a wide search for the blocks still
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
-  half-pel step. `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`,
-  `globalmv`, `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
-  mvu's default `badsad` of 10000 rarely triggers the wide search; around 1000 suits it better.
+  half-pel step. At `pel=4` the seeds and the passes stay on the half-pel grid (chained and
+  inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the half-pel one.
+  `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`, `globalmv`,
+  `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
+  The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
+  mvu's `badsad=10000` (which it would almost never reach) and `badrange=24`.
 * `AnalyseMany` also seeds each field from the fields refined before it (chained and inverted
   vectors), which separate `Analyse` calls can't.
 * The super and the vectors travel as GPU frames in frame properties, laid out for the GPU, under
   the prefix `MVGPUtensils` by default. A vector frame holds a 32-bit record (x, y, SAD, 0) per
-  block, vectors in half-pels.
-* The results are bit-identical to the CPU reference implementation of the search
+  block, vectors in units of the super's `pel`.
+* A `pel=4` super stores luma's four half-pel planes only, as `pel=2` does: mvu's quarter-pel
+  samples are rounded averages of the half-pel ones around them, whatever `sharp`, which the
+  quarter-pel step computes as it goes. Chroma, which the half-pel passes already read at quarter-pel
+  positions, keeps all sixteen planes' samples, as one image of the quarter-pel grid per plane
+  rather than sixteen planes: neighbouring blocks' vectors mostly differ in sub-pel phase, and in the
+  image their reads stay in one region. That made a `pel=4` chain of `Super`, `AnalyseMany` and
+  `Degrain` 7-19% faster on the GPU on moving content and 1-4% on static (RX 6900 XT, 16×16 blocks,
+  radius 3). The super is twice the size of a `pel=2` one instead of four times.
+* Divergence from MVUtensils: `Super` refuses a `pelclip` at `pel=4`. A pelclip's quarter-pel
+  samples needn't be averages of its half-pel ones, so its luma would need all sixteen planes, twice
+  the memory of a `pel=4` super that computes them. A `pelclip` at `pel=2` works as in mvu.
+* `Degrain` takes all of mvu.Degrain's arguments, on mvgpu's supers and vectors. Given the same
+  vectors its output is mvu.Degrain's bit for bit, at `pel=2` and `pel=4` (`test/check_degrain.py`
+  runs both on mvgpu.AnalyseMany's vectors); its weights, which mvu computes in double precision,
+  are reproduced exactly in integers.
+* With the environment variable `MVGPU_PROFILE=1`, `Super`, `Analyse` and `Degrain` time their
+  stages on the GPU and print the averages to stderr when the filter is freed. They wait for every
+  frame, so they run slower.
+* The search's results are bit-identical to its CPU reference implementation
   (`test/check_reference.py`).
-* Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics.
+* Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics,
+  and for `Degrain` 158 storage buffers per kernel (2 · 25 references with three buffers each).
   Building needs the Vulkan headers (`-Dvulkan_include=` for meson, the Vulkan SDK for
   `msvc/MVGPUtensils.slnx`); nothing is linked, the core hands out every entry point.
 

@@ -5,8 +5,10 @@
 // fields the seeds chain and invert. Everything follows the CPU reference's Pyramid and
 // BuildSeeds (probe/seedrefine.cpp) exactly, so the seeds are the CPU's bit for bit.
 //
-// The kernels take the field from gl_WorkGroupID.z, so that the coarse searches of several fields
-// can share dispatches; Analyse.cpp dispatches one field at a time for now.
+// The coarse searches run in batches: the fields (n, d) of one frame n for several d, in the same
+// dispatches, field z of the batch in gl_WorkGroupID.z (Analyse.cpp's coarse node). These kernels
+// have a pipeline layout of their own (VulkanContext.h), with the reference frames' pyramids an
+// array of bindings.
 
 #include "refine_common.glsl"
 
@@ -16,12 +18,13 @@
 // and the words LevelSadOf reads around it stay inside. offY, offU and offV point at each plane's
 // first pixel inside the border, its rows strideY or strideC apart, whole words. pyr_reduce.comp
 // builds it, border included, writing through binding 16; the other kernels read the current
-// frame's (16) and the reference frame's (17) as words.
+// frame's (16) and each field's reference frame's (17, element z) as words.
+const int kMaxBatch = 16; // fields per batch: VulkanContext.h's kMaxBatch
 #ifdef PYRAMID_BUILD
 layout(std430, set = 0, binding = 16) buffer Pyramid { uint8_t pyr[]; };
 #else
 layout(std430, set = 0, binding = 16) readonly buffer CurPyramid { uint curPyrW[]; };
-layout(std430, set = 0, binding = 17) readonly buffer RefPyramid { uint refPyrW[]; };
+layout(std430, set = 0, binding = 17) readonly buffer RefPyramid { uint w[]; } refPyr[kMaxBatch];
 #endif
 // The coarse fields of the fields being searched, levels finest to top one after another, field
 // z's at z * levels[0].fieldTotal; vectors are full pels of their level
@@ -30,13 +33,13 @@ layout(std430, set = 0, binding = 19) buffer LevelSad { int levelSad[]; };
 
 // Per level: luma and chroma size, plane offsets in a frame's pyramid, blocks, the offset of its
 // coarse field, its padding (pad >> L, at least 1), the offset of its lambda table, the planes'
-// strides and borders. Entry 0 describes the frame itself, the bytes of one frame's pyramid and
+// strides and borders. Entry 0 describes the frame itself, the samples of one frame's pyramid and
 // the blocks of one field's coarse fields. Matches LevelEntry in SuperLayout.h.
 struct Level {
     int w, h, wc, hc;
     int offY, offU, offV, nbx;
     int nby, fieldOff, pad, lambdaOff;
-    int frameBytes, fieldTotal, strideY, strideC;
+    int frameSamples, fieldTotal, strideY, strideC;
     int borderY, borderC, reserved0, reserved1;
 };
 layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
@@ -56,8 +59,8 @@ layout(std430, set = 0, binding = 25) readonly buffer InvRec { ivec4 invRec[]; }
 // Per full-size block, the block of the inverted field that lands nearest to it: SAD << 32 | index,
 // the lowest winning; all ones where none lands (seed_build.comp resets what it reads)
 layout(std430, set = 0, binding = 27) buffer InvKey { uint64_t invKey[]; };
-// The coarse search's result for the field being refined: the global median, then the finest
-// level's vectors (seed_build.comp)
+// The coarse searches' results, a row per field: its global median, then the finest level's
+// vectors; the field being refined starts at pc.coarseBase (seed_build.comp)
 layout(std430, set = 0, binding = 28) readonly buffer Coarse { ivec2 coarse[]; };
 
 // Where block b of the full-size grid has its record in a stored field
@@ -71,11 +74,13 @@ const int kMedianSlots = 32, kGlobalSlot = 31;
 const ivec2 kAround5[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
 int gLX, gLY;       // the lane's block position at the level
-int gFieldBase;     // the lane's field: its coarse fields in levelVec and levelSad,
+int gField;         // the lane's field in the batch, z: its reference frame's pyramid,
+int gFieldBase;     // its coarse fields in levelVec and levelSad,
 int gMedianBase;    // and its medians
 
-// Sets up the lane's field, field z of those searched
+// Sets up the lane's field, field z of the batch (dynamically uniform: a workgroup works on one)
 void SetupField(int z) {
+    gField = z;
     gFieldBase = z * levels[0].fieldTotal;
     gMedianBase = z * kMedianSlots;
 }
@@ -134,7 +139,7 @@ int LevelSadOf(Level lv, ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint wj = w + uint(j) * stride;
-            uint w0 = refPyrW[wj], w1 = refPyrW[wj + 1u], w2 = refPyrW[wj + 2u];
+            uint w0 = refPyr[gField].w[wj], w1 = refPyr[gField].w[wj + 1u], w2 = refPyr[gField].w[wj + 2u];
             PackedStep(Bytes4(w0, w1, shift), cur + 4 * j, sa, sm);
             PackedStep(Bytes4(w1, w2, shift), cur + 4 * j + 2, sa, sm);
         }
@@ -147,8 +152,8 @@ int LevelSadOf(Level lv, ivec2 v) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;
-            PackedStep(Bytes4(refPyrW[u], refPyrW[u + 1u], shiftU), cur + 32 + 2 * j, sa, sm);
-            PackedStep(Bytes4(refPyrW[t], refPyrW[t + 1u], shiftV), cur + 40 + 2 * j, sa, sm);
+            PackedStep(Bytes4(refPyr[gField].w[u], refPyr[gField].w[u + 1u], shiftU), cur + 32 + 2 * j, sa, sm);
+            PackedStep(Bytes4(refPyr[gField].w[t], refPyr[gField].w[t + 1u], shiftV), cur + 40 + 2 * j, sa, sm);
         }
     }
     return int(sa + gSumCur - 2u * sm);

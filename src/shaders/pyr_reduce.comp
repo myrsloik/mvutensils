@@ -1,73 +1,132 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-#define NO_BLOCK_CACHE
-#define PYRAMID_BUILD
-#include "pyr_common.glsl"
+#include "super_common.glsl"
 
 layout(local_size_x = 64) in;
 
-// One level of a frame's pyramid from the level below it, with mvu.Super's default filter
-// (RB2BilinearFiltered, the CPU reference's Reduce): 1/8, 3/8, 3/8, 1/8 vertically, then the same
-// horizontally, a plain average of two at the edges. Level 1 reads the frame's super planes
-// (bindings 0 and 2, their full-pel planes inside the padding), later levels the pyramid itself.
-// The border is part of the output: a border pixel gets the value of the nearest edge pixel,
-// computed again at that position, which is what SmallPlane::At's clamping reads there. One lane
-// per pixel, border included, 64 pixels of a row per workgroup, the plane (Y, U, V) in z;
-// dispatched as ((w + 2 * borderY + 63) / 64, h + 2 * borderY, 3) with w x h the level's luma size.
-// (Four pixels per lane written as one word was slower: the reads dominate, and fewer lanes hide
-// less of their latency.)
+// The level table, matching LevelEntry in SuperLayout.h (and pyr_common.glsl's Level)
+struct Level {
+    int w, h, wc, hc;
+    int offY, offU, offV, nbx;
+    int nby, fieldOff, pad, lambdaOff;
+    int frameSamples, fieldTotal, strideY, strideC;
+    int borderY, borderC, reserved0, reserved1;
+};
+layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
 
-int gPlane, gW, gH, gBase, gStride; // the source plane
+// One level of a frame's pyramid from the level below it, halving it rounding up, by mvu.Super's
+// rfilter (SuperPyramid.cpp's reductions, which the CPU reference's Reduce follows for the default):
+// 0 RB2F, the average of each 2 x 2; 1 RB2BilinearFiltered, 1/8, 3/8, 3/8, 1/8 vertically, then
+// the same horizontally, a plain average of two at the edges; 2 RB2Cubic, 1/32, 5/32, 10/32,
+// 10/32, 5/32, 1/32 the same way. The vertical pass's results are samples, rounded, as there.
+// Level 1 reads the frame's super planes (bindings 0 and 2, their full-pel planes inside the
+// padding; at pel 4 chroma's full-pel samples in its quarter-pel image, every fourth of every fourth
+// row), later levels the pyramid itself, reads clamped to the source plane. The border is part
+// of the output: a border pixel gets the value of the nearest edge pixel, computed again at that
+// position, which is what SmallPlane::At's clamping reads there. One lane per pixel, border
+// included, 64 pixels of a row per workgroup, the plane (Y, U, V) in z; dispatched as
+// ((W + 63) / 64, H, planes) with W x H the larger of the level's planes, border included.
 
-int Src(int x, int y) {
-    int i = gBase + clamp(y, 0, gH - 1) * gStride + clamp(x, 0, gW - 1);
-    if (pc.level > 1)
-        return int(pyr[i]);
-    return int(gPlane == 0 ? curY[i] : curC[i]);
+int gBuf, gW, gH, gStride, gStep; // the source plane: rows gStride samples apart, pixels gStep
+uint gBase;
+
+uint Src(int x, int y) {
+    return gBase + uint(clamp(y, 0, gH - 1) * gStride + clamp(x, 0, gW - 1) * gStep);
 }
 
-// The vertical filter at source column x for destination row y of a plane dh rows high
-int Column(int x, int y, int dh) {
+// The vertical pass of rfilter 1 or 2 at source column x for destination row y of a plane dh rows high
+int ColumnI(int x, int y, int dh) {
+    int r = 2 * y;
     if (y == 0 || y == dh - 1)
-        return (Src(x, 2 * y) + Src(x, 2 * y + 1) + 1) >> 1;
-    return (Src(x, 2 * y - 1) + (Src(x, 2 * y) + Src(x, 2 * y + 1)) * 3 + Src(x, 2 * y + 2) + 4) >> 3;
+        return (GetI(gBuf, Src(x, r)) + GetI(gBuf, Src(x, r + 1)) + 1) >> 1;
+    if (pc.rfilter == 1)
+        return (GetI(gBuf, Src(x, r - 1)) + (GetI(gBuf, Src(x, r)) + GetI(gBuf, Src(x, r + 1))) * 3 + GetI(gBuf, Src(x, r + 2)) + 4) >> 3;
+    int m2 = (GetI(gBuf, Src(x, r)) + GetI(gBuf, Src(x, r + 1))) * 10, m1 = (GetI(gBuf, Src(x, r - 1)) + GetI(gBuf, Src(x, r + 2))) * 5;
+    return (GetI(gBuf, Src(x, r - 2)) + GetI(gBuf, Src(x, r + 3)) + m2 + m1 + 16) >> 5;
+}
+
+float ColumnF(int x, int y, int dh) {
+    int r = 2 * y;
+    if (y == 0 || y == dh - 1) {
+        precise float s = GetF(gBuf, Src(x, r)) + GetF(gBuf, Src(x, r + 1));
+        return s * 0.5;
+    }
+    if (pc.rfilter == 1) {
+        precise float s = (GetF(gBuf, Src(x, r - 1)) + (GetF(gBuf, Src(x, r)) + GetF(gBuf, Src(x, r + 1))) * 3.0) + GetF(gBuf, Src(x, r + 2));
+        return s * 0.125;
+    }
+    precise float m2 = (GetF(gBuf, Src(x, r)) + GetF(gBuf, Src(x, r + 1))) * 10.0;
+    precise float m1 = (GetF(gBuf, Src(x, r - 1)) + GetF(gBuf, Src(x, r + 2))) * 5.0;
+    precise float s = GetF(gBuf, Src(x, r - 2)) + ((GetF(gBuf, Src(x, r + 3)) + m2) + m1);
+    return s * (1.0 / 32.0);
 }
 
 void main() {
-    gPlane = int(gl_WorkGroupID.z);
+    int z = int(gl_WorkGroupID.z);
+    gStep = 1;
     if (pc.level == 1) {
-        if (gPlane == 0) {
+        gBuf = z == 0 ? kLuma : kChroma;
+        if (z == 0) {
             gW = pc.w;
             gH = pc.h;
             gStride = pc.wp;
-            gBase = pc.pad * pc.wp + pc.pad;
+            gBase = uint(pc.padY * pc.wp + pc.padX);
         } else {
-            gW = pc.w / 2;
-            gH = pc.h / 2;
-            gStride = pc.wc;
-            gBase = (gPlane - 1) * 4 * pc.wc * pc.hc + pc.padc * pc.wc + pc.padc;
+            gW = pc.w / pc.xr;
+            gH = pc.h / pc.yr;
+            int image = pc.chromaPlanes == 16 ? 4 : 1; // pel 4: the image's pixels 4 apart, rows 4 * 4 wc
+            gStride = image * image * pc.wc;
+            gStep = image;
+            gBase = uint(z - 1) * uint(pc.chromaPlanes) * uint(pc.wc * pc.hc) + uint(pc.padcY * gStride + pc.padcX * gStep);
         }
     } else {
         Level s = levels[pc.level - 1];
-        gW = gPlane == 0 ? s.w : s.wc;
-        gH = gPlane == 0 ? s.h : s.hc;
-        gStride = gPlane == 0 ? s.strideY : s.strideC;
-        gBase = gPlane == 0 ? s.offY : gPlane == 1 ? s.offU : s.offV;
+        gBuf = kPyramid;
+        gW = z == 0 ? s.w : s.wc;
+        gH = z == 0 ? s.h : s.hc;
+        gStride = z == 0 ? s.strideY : s.strideC;
+        gBase = uint(z == 0 ? s.offY : z == 1 ? s.offU : s.offV);
     }
     Level d = levels[pc.level];
-    int dw = gPlane == 0 ? d.w : d.wc, dh = gPlane == 0 ? d.h : d.hc;
-    int border = gPlane == 0 ? d.borderY : d.borderC, stride = gPlane == 0 ? d.strideY : d.strideC;
+    int dw = z == 0 ? d.w : d.wc, dh = z == 0 ? d.h : d.hc;
+    int border = z == 0 ? d.borderY : d.borderC, stride = z == 0 ? d.strideY : d.strideC;
     int xp = int(gl_GlobalInvocationID.x) - border, yp = int(gl_WorkGroupID.y) - border;
     if (xp >= dw + border || yp >= dh + border)
         return;
     int x = clamp(xp, 0, dw - 1), y = clamp(yp, 0, dh - 1);
-    int v;
-    if (x == 0)
-        v = (Column(0, y, dh) + Column(1, y, dh) + 1) >> 1;
-    else if (x == dw - 1)
-        v = (Column(2 * x, y, dh) + Column(2 * x + 1, y, dh) + 1) >> 1;
-    else
-        v = (Column(2 * x - 1, y, dh) + (Column(2 * x, y, dh) + Column(2 * x + 1, y, dh)) * 3 + Column(2 * x + 2, y, dh) + 4) >> 3;
-    int off = gPlane == 0 ? d.offY : gPlane == 1 ? d.offU : d.offV;
-    pyr[off + yp * stride + xp] = uint8_t(v);
+    uint out0 = uint((z == 0 ? d.offY : z == 1 ? d.offU : d.offV) + yp * stride + xp);
+    int c = 2 * x;
+    if (kFloat) {
+        float v;
+        if (pc.rfilter == 0) {
+            // RB2F sums top left, top right, bottom right, bottom left
+            precise float s = ((GetF(gBuf, Src(c, 2 * y)) + GetF(gBuf, Src(c + 1, 2 * y))) + GetF(gBuf, Src(c + 1, 2 * y + 1))) + GetF(gBuf, Src(c, 2 * y + 1));
+            v = s * 0.25;
+        } else if (x == 0 || x == dw - 1) {
+            precise float s = ColumnF(c, y, dh) + ColumnF(c + 1, y, dh);
+            v = s * 0.5;
+        } else if (pc.rfilter == 1) {
+            precise float s = (ColumnF(c - 1, y, dh) + (ColumnF(c, y, dh) + ColumnF(c + 1, y, dh)) * 3.0) + ColumnF(c + 2, y, dh);
+            v = s * 0.125;
+        } else {
+            precise float m2 = (ColumnF(c, y, dh) + ColumnF(c + 1, y, dh)) * 10.0;
+            precise float m1 = (ColumnF(c - 1, y, dh) + ColumnF(c + 2, y, dh)) * 5.0;
+            precise float s = ColumnF(c - 2, y, dh) + ((ColumnF(c + 3, y, dh) + m2) + m1);
+            v = s * (1.0 / 32.0);
+        }
+        PutF(kPyramid, out0, v);
+    } else {
+        int v;
+        if (pc.rfilter == 0) {
+            v = (GetI(gBuf, Src(c, 2 * y)) + GetI(gBuf, Src(c + 1, 2 * y)) + GetI(gBuf, Src(c + 1, 2 * y + 1)) + GetI(gBuf, Src(c, 2 * y + 1)) + 2) >> 2;
+        } else if (x == 0 || x == dw - 1) {
+            v = (ColumnI(c, y, dh) + ColumnI(c + 1, y, dh) + 1) >> 1;
+        } else if (pc.rfilter == 1) {
+            v = (ColumnI(c - 1, y, dh) + (ColumnI(c, y, dh) + ColumnI(c + 1, y, dh)) * 3 + ColumnI(c + 2, y, dh) + 4) >> 3;
+        } else {
+            int m2 = (ColumnI(c, y, dh) + ColumnI(c + 1, y, dh)) * 10, m1 = (ColumnI(c - 1, y, dh) + ColumnI(c + 2, y, dh)) * 5;
+            v = (ColumnI(c - 2, y, dh) + ColumnI(c + 3, y, dh) + m2 + m1 + 16) >> 5;
+        }
+        PutI(kPyramid, out0, v);
+    }
 }

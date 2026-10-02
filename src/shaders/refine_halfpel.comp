@@ -11,7 +11,8 @@ layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; 
 // The 8 half-pel positions around each block's vector, against its final neighbours: 8 blocks per
 // workgroup in a row, lane i of a block's group measuring position i, the best by one minimum of
 // CandidateKey over the group. Reads field A and writes the output, so every block sees its
-// neighbours as the passes left them. Dispatched as ((nbx + 7) / 8, nby) workgroups.
+// neighbours as the passes left them; at pel 4 it writes field B instead, for the quarter-pel step
+// (refine_qpel.comp). Dispatched as ((nbx + 7) / 8, nby) workgroups.
 void main() {
     uint lane = WorkgroupLane();
     int group = int(lane >> 3u), sub = int(lane & 7u);
@@ -29,7 +30,7 @@ void main() {
     ivec2 best = c0;
     int bestSad = sadA[b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
-    ivec2 v = ClampVec(c0 + Around(sub, 1));
+    ivec2 v = ClampHalf(c0 + Around(sub, kPel / 2));
     int s = live ? LaneSad(v) : 0;
     uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
     int owner = KeyLane(win);
@@ -39,6 +40,12 @@ void main() {
         best = wv;
         bestSad = ws;
     }
-    if (live && sub == 0)
-        outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
+    if (live && sub == 0) {
+        if (kPel == 4) {
+            vecB[b] = best;
+            sadB[b] = bestSad;
+        } else {
+            outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
+        }
+    }
 }

@@ -1,0 +1,148 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "degrain_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// The rounded average mvu.Super's quarter planes take of two samples
+uint Avg(uint a, uint b) {
+    return (a + b + 1u) >> 1u;
+}
+
+// The address of sample (Xh, Yh) of luma's half-pel grid, in the padded planes
+uint HalfAddr(int Xh, int Yh) {
+    return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(pc.wp * pc.hp) + uint((Yh >> 1) * pc.wp + (Xh >> 1));
+}
+
+// U's address of chroma position (Xc, Yc), 1 / pel pixels of the padded plane: in one of the four
+// half-pel planes at pel 2, at that place of the quarter-pel image at pel 4 (SuperLayout.h); V's is
+// kChromaPlanes plane sizes on
+uint ChromaAddr(int Xc, int Yc) {
+    if (kPel == 4)
+        return uint(Yc * 4 * pc.wc + Xc);
+    return uint((Xc & 1) | ((Yc & 1) << 1)) * uint(pc.wc * pc.hc) + uint((Yc >> 1) * pc.wc + (Xc >> 1));
+}
+
+// Samples from a chroma pixel to the one below it: a row of the full-pel plane, four of the image
+int ChromaRow() {
+    return kPel == 4 ? 16 * pc.wc : pc.wc;
+}
+
+// The range ValidateVectors accepts for block (bx, by)'s vector, the block inside the padded planes;
+// vectors from mvgpu.Analyse are always inside it, so this only guards the reads
+ivec2 ClampVec(ivec2 v, int bx, int by) {
+    int gX = bx * pc.step, gY = by * pc.step;
+    return ivec2(clamp(v.x, -kPel * (gX + pc.pad), kPel * ((pc.nbx - 1) * pc.step + pc.pad - gX) - 1),
+                 clamp(v.y, -kPel * (gY + pc.pad), kPel * ((pc.nby - 1) * pc.step + pc.pad - gY) - 1));
+}
+
+// mvu.Degrain for one plane. A lane is one pixel column of a cell row: the rows between two
+// block rows, step of them (half of it for chroma), the last cell row also the rows below it its
+// blocks reach. Every pixel of it lies in the same block columns, one or, inside the overlap, two,
+// and in the same two block rows, the upper one covering only the first overlap rows. Each block
+// gives the pixel mvu's degrained value, (128 + centre * its weight + the sum of each reference's
+// motion compensated pixel * its weight) >> 8, and the pixel adds those up weighted by the blocks'
+// overlap windows (mvu's OverlapWindows, the 9 of them for the frame's edges and corners, values to
+// 2048, each product >> 6), then (sum + 16) >> 5, clamped; without overlap a pixel's one block gives
+// it its value. limit then keeps it within that of the centre's pixel.
+//
+// The motion compensated pixel is read from the reference's super where its vector puts the block,
+// mvu's GetPointer: luma at pel 2 from its half-pel plane; at pel 4 computed from the half-pel planes
+// exactly as mvu.Super's quarter planes hold it (refine_qpel.comp); chroma at half the luma vector,
+// rounded down, from its half-pel planes or quarter-pel image. Dispatched as ((width + 63) / 64,
+// nby) workgroups.
+void main() {
+    bool luma = pc.plane == 0;
+    int B = luma ? kBlk : kBlk / 2;             // the plane's block size,
+    int S = luma ? pc.step : pc.step / 2;       // step
+    int O = luma ? pc.overlap : pc.overlap / 2; // and overlap
+    int x = int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
+    int y0 = cy * S;
+    int rows = min(cy == pc.nby - 1 ? B : S, pc.height - y0);
+    if (x >= pc.width || rows <= 0)
+        return;
+
+    // The centre's pixels, from the centre super's full-pel samples (at pel 4 chroma's every fourth of
+    // every fourth row of its image)
+    uint centre[kBlk], acc[kBlk];
+    uint curC0 = kPel == 4 ? uint(16 * (pc.padc + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padc + y0) * pc.wc + pc.padc + x);
+    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : curC0 + (pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u);
+    uint curStride = uint(luma ? pc.wp : ChromaRow());
+    [[unroll]] for (int j = 0; j < kBlk; ++j) {
+        centre[j] = j < rows ? uint(luma ? curY[cur + uint(j) * curStride] : curC[cur + uint(j) * curStride]) : 0u;
+        acc[j] = 0u;
+    }
+
+    int bxA = min(x / S, pc.nbx - 1);
+    bool hasLeft = bxA >= 1 && x < bxA * S + O;
+    // The (up to) four blocks: k & 1 the column to the left, k & 2 the row above
+    for (int k = 0; k < 4; ++k) {
+        int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? cy - 1 : cy;
+        int jEnd = (k & 2) != 0 ? min(O, rows) : rows;
+        bool valid = ((k & 1) == 0 || hasLeft) && ((k & 2) == 0 || cy >= 1) && jEnd > 0;
+        int b = valid ? by * pc.nbx + bx : 0;
+        uint shift = luma ? 0u : 16u;
+        uint sum[kBlk];
+        uint wc = valid ? (meta[b] >> shift) & 0xFFFFu : 0u;
+        [[unroll]] for (int j = 0; j < kBlk; ++j)
+            sum[j] = 128u + centre[j] * wc;
+        int dx = x - bx * S, dy = y0 - by * S; // the lane's place in the block at its first row
+
+        for (int r = 0; r < pc.refs; ++r) {
+            uint w = valid ? (meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu : 0u;
+            if (w == 0u)
+                continue;
+            ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
+            if (luma && kPel == 4) {
+                int X = 4 * (bx * S + pc.pad + dx) + v.x, Y = 4 * (by * S + pc.pad + dy) + v.y;
+                int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+                uint aa = HalfAddr(Xa, Ya), ab = HalfAddr(Xa, Yb), ba = HalfAddr(Xb, Ya), bb = HalfAddr(Xb, Yb);
+                [[unroll]] for (int j = 0; j < kBlk; ++j) {
+                    if (j < jEnd) {
+                        uint o = uint(j * pc.wp);
+                        uint p = Avg(Avg(uint(refY[r].px[aa + o]), uint(refY[r].px[ab + o])), Avg(uint(refY[r].px[ba + o]), uint(refY[r].px[bb + o])));
+                        sum[j] += p * w;
+                    }
+                }
+            } else if (luma) {
+                int X = 2 * (bx * S + pc.pad + dx) + v.x, Y = 2 * (by * S + pc.pad + dy) + v.y;
+                uint a = HalfAddr(X, Y);
+                [[unroll]] for (int j = 0; j < kBlk; ++j)
+                    if (j < jEnd)
+                        sum[j] += uint(refY[r].px[a + uint(j * pc.wp)]) * w;
+            } else {
+                // Chroma at the luma position halved, rounded down (GetPointer(blx >> 1, bly >> 1))
+                int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> 1);
+                int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> 1);
+                uint a = ChromaAddr(Xc, Yc) + (pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u);
+                [[unroll]] for (int j = 0; j < kBlk; ++j)
+                    if (j < jEnd)
+                        sum[j] += uint(refC[r].px[a + uint(j * ChromaRow())]) * w;
+            }
+        }
+
+        if (valid) {
+            if (O == 0) {
+                [[unroll]] for (int j = 0; j < kBlk; ++j)
+                    acc[j] = sum[j] >> 8u;
+            } else {
+                int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
+                int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
+                int win = pc.winOff + ((wby + wbx) * B + dy) * B + dx;
+                [[unroll]] for (int j = 0; j < kBlk; ++j)
+                    if (j < jEnd)
+                        acc[j] += ((sum[j] >> 8u) * uint(tables[win + j * B])) >> 6u;
+            }
+        }
+    }
+
+    uint out0 = uint(y0 * pc.outStride + x);
+    [[unroll]] for (int j = 0; j < kBlk; ++j) {
+        if (j < rows) {
+            uint p = O == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, 255u);
+            if (pc.limit >= 0)
+                p = uint(clamp(int(p), max(int(centre[j]) - pc.limit, 0), min(int(centre[j]) + pc.limit, 255)));
+            outPlane[pc.plane].px[out0 + uint(j * pc.outStride)] = uint8_t(p);
+        }
+    }
+}

@@ -36,11 +36,17 @@ endif
 
 add_project_arguments('-DPACKAGE_VERSION="@0@"'.format(meson.project_version()), language: ['cpp'])
 add_project_arguments('-DVS_USE_API_43', language: ['cpp'])
+# The MSVC runtime deprecates getenv (the profiler's MVGPU_PROFILE); a no-op elsewhere
+add_project_arguments('-D_CRT_SECURE_NO_WARNINGS', language: ['cpp'])
 
 # The kernels, compiled at runtime by the core, are embedded as raw string literals. Listing them
 # as inputs makes an edited kernel regenerate the header, and the header in the compiler's depfile
 # rebuilds what includes it.
 shader_sources = files(
+    'src/shaders/degrain.comp',
+    'src/shaders/degrain_common.glsl',
+    'src/shaders/degrain_count.comp',
+    'src/shaders/degrain_weights.comp',
     'src/shaders/median.comp',
     'src/shaders/pyr_common.glsl',
     'src/shaders/pyr_pass.comp',
@@ -54,9 +60,12 @@ shader_sources = files(
     'src/shaders/refine_halfpel.comp',
     'src/shaders/refine_init.comp',
     'src/shaders/refine_pass.comp',
+    'src/shaders/refine_qpel.comp',
     'src/shaders/seed_build.comp',
     'src/shaders/seed_scatter.comp',
     'src/shaders/super.comp',
+    'src/shaders/super_common.glsl',
+    'src/shaders/super_qpel.comp',
 )
 shader_header = custom_target('shader_sources_h',
     input: shader_sources,
@@ -73,6 +82,7 @@ endif
 
 main_sources = files(
     'src/Analyse.cpp',
+    'src/Degrain.cpp',
     'src/EntryPoint.cpp',
     'src/Super.cpp',
     'src/SuperLayout.cpp',

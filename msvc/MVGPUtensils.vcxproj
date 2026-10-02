@@ -61,7 +61,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -84,7 +84,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>VS_USE_API_43;PACKAGE_VERSION="1";_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
@@ -109,12 +109,17 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\src\Analyse.cpp" />
+    <ClCompile Include="..\src\Degrain.cpp" />
     <ClCompile Include="..\src\EntryPoint.cpp" />
     <ClCompile Include="..\src\Super.cpp" />
     <ClCompile Include="..\src\SuperLayout.cpp" />
     <ClCompile Include="..\src\VulkanContext.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\src\shaders\degrain.comp" />
+    <None Include="..\src\shaders\degrain_common.glsl" />
+    <None Include="..\src\shaders\degrain_count.comp" />
+    <None Include="..\src\shaders\degrain_weights.comp" />
     <None Include="..\src\shaders\embed_shaders.py" />
     <None Include="..\src\shaders\median.comp" />
     <None Include="..\src\shaders\pyr_common.glsl" />
@@ -129,9 +134,12 @@
     <None Include="..\src\shaders\refine_halfpel.comp" />
     <None Include="..\src\shaders\refine_init.comp" />
     <None Include="..\src\shaders\refine_pass.comp" />
+    <None Include="..\src\shaders\refine_qpel.comp" />
     <None Include="..\src\shaders\seed_build.comp" />
     <None Include="..\src\shaders\seed_scatter.comp" />
     <None Include="..\src\shaders\super.comp" />
+    <None Include="..\src\shaders\super_common.glsl" />
+    <None Include="..\src\shaders\super_qpel.comp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -14,7 +14,7 @@ which corresponds to
                        --blksize 16 --overlap 8 --badsad 1000 --badrange 40 --badstep 2
 
 (seedrefine's --badsad is the threshold for the block itself, mvgpu's per 8x8 block, so it is
-scaled by blksize^2 / 64; seedrefine --no-chain matches --standalone). Every field the reference
+scaled by blksize^2 / 64; seedrefine --no-chain matches --standalone, --pel 4 matches --pel 4). Every field the reference
 holds is compared: x, y and SAD of every block.
 """
 import argparse
@@ -62,6 +62,7 @@ def main():
     ap.add_argument('--frames', type=int, required=True)
     ap.add_argument('--ref', required=True, help='the CPU reference vector file')
     ap.add_argument('--blksize', type=int, default=16)
+    ap.add_argument('--pel', type=int, default=2)
     ap.add_argument('--overlap', type=int, default=8)
     ap.add_argument('--radius', type=int, default=2)
     ap.add_argument('--badsad', type=int, default=1000)
@@ -77,7 +78,7 @@ def main():
     w, h = (int(v) for v in args.size.split('x'))
     ref = load_fields(args.ref)
     clip = core.std.GPUUpload(nv12_clip(core, args.src, w, h, args.frames))
-    sup = core.mvgpu.Super(clip, blksize=args.blksize, overlap=args.overlap)
+    sup = core.mvgpu.Super(clip, blksize=args.blksize, overlap=args.overlap, pel=args.pel)
     kw = dict(badsad=args.badsad, badrange=args.badrange, badstep=args.badstep)
     if args.standalone:
         fields = [core.mvgpu.Analyse(sup, delta=s * r, **kw) for r in range(1, args.radius + 1) for s in (1, -1)]

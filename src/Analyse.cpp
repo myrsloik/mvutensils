@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -15,17 +16,21 @@
 #include "VulkanContext.h"
 
 // mvu.Analyse on the GPU. A field (n, d), the vectors that match the blocks of frame n in frame
-// n + d, comes from one submission:
+// n + d, comes from two nodes:
 //
-// - the coarse search: an exhaustive search at the super's smallest level, then at every finer
-//   level down to the finest seeds from the level above and checkerboard passes
-//   (pyr_top/pyr_seed/pyr_pass/median.comp);
-// - a seed list per block of the full-size grid: zero, the field's median, the finest level's
-//   vectors around the block, and with AnalyseMany the chained and inverted vectors of fields
-//   refined before (seed_scatter/seed_build.comp);
-// - the refinement: the seeds measured, a pair of checkerboard passes under mvu.Analyse's cost,
-//   the wide fallback search for the blocks still above badsad and one more pair, then the 8
-//   half-pel positions around each block's vector (refine_*.comp).
+// - the coarse node, shared by every field Analyse or AnalyseMany makes: frame n holds the coarse
+//   searches of all of frame n's fields, run as one batch, the field in the dispatches' z: an
+//   exhaustive search at the super's smallest level, then at every finer level down to the finest
+//   seeds from the level above and checkerboard passes (pyr_top/pyr_seed/pyr_pass/median.comp);
+// - the field's node: a seed list per block of the full-size grid, from zero, the field's median
+//   and the finest level's vectors around the block, and with AnalyseMany the chained and inverted
+//   vectors of fields refined before (seed_scatter/seed_build.comp); then the refinement: the
+//   seeds measured, a pair of checkerboard passes under mvu.Analyse's cost, the wide fallback
+//   search for the blocks still above badsad and one more pair, then the 8 half-pel positions
+//   around each block's vector (refine_*.comp), and at pel 4 the 8 quarter-pel positions around
+//   that. At pel 4 the chained and inverted seeds are rounded to the half-pel grid, where the passes
+//   and the half-pel step stay, and the fallback stays on the full-pel grid; the quarter samples are
+//   computed from the super's half-pel planes (SuperLayout.h).
 //
 // The result is the CPU reference's (probe/seedrefine.cpp) bit for bit. The output frame is the
 // super frame with mvu.Analyse's properties and a vector frame (SuperLayout.h's ExportAnalysis).
@@ -35,7 +40,9 @@
 // seeds from the coarse search only.
 //
 // Implemented: chroma, mvlambda, lsad, badsad and badrange (the fallback's threshold and radius),
-// delta, prefix, plus badstep, the fallback's step, which mvu doesn't have. search, searchparam,
+// delta, prefix, plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults
+// are the tested ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which
+// this search would almost never reach, and badrange 24). search, searchparam,
 // pelsearch, levels, pnew, pzero, pglobal, globalmv, meander and trymany tune mvu's search, which
 // this one doesn't use; they are checked and otherwise ignored. satd, fields and chroma=False
 // aren't implemented yet, and blksize and overlap must be the super's.
@@ -58,10 +65,274 @@ struct Region {
     VkDeviceSize offset = 0, size = 0;
 };
 
+// Regions of one buffer, each aligned for binding at its offset
+class Regions {
+public:
+    explicit Regions(const VulkanContext &vc) : align(std::max<VkDeviceSize>(vc.limits.minStorageBufferOffsetAlignment, 16)) {}
+    void Place(Region &r, VkDeviceSize size) {
+        r.offset = total;
+        r.size = std::max<VkDeviceSize>(size, 16);
+        total = (total + r.size + align - 1) / align * align;
+    }
+    VkDeviceSize Total() const { return total; }
+
+private:
+    VkDeviceSize align, total = 0;
+};
+
+// mvu.Analyse's scaling for 8-bit and the block size, lambda divided by pel squared at full size,
+// exactly as the CPU reference computes it
+struct Scaled {
+    int64_t lambda0, lsad, lambdaBlock;
+};
+
+// The ints of one row of the coarse node's frames: a field's global median, then its finest level
+int CoarseRowInts(const SuperLayout &L) {
+    const LevelEntry &finest = L.levels[SuperLayout::kFinest];
+    return 2 * (1 + finest.nbx * finest.nby);
+}
+
 } // namespace
+
+// ---- The coarse node
+
+// Frame n holds the coarse search of field (n, deltas[s]) in row s, where n + deltas[s] is a frame:
+// its global median, then the finest coarse level's vectors, full pels of that level; rows the
+// frame's stride apart. The fields of a frame are searched in batches of up to kMaxBatch, in one
+// submission.
+struct CoarseData {
+    VSNode *node = nullptr; // the super clip
+    VSVideoInfo vi = {};    // Gray32, a row per delta
+    int numFrames = 0;
+    SuperLayout layout;
+    std::vector<int> deltas;
+    std::string prefix;
+
+    std::shared_ptr<VulkanContext> vc;
+    VSGPUExecPool *pool = nullptr;
+    VkPipeline pyrTop = VK_NULL_HANDLE, pyrPass = VK_NULL_HANDLE, pyrSeed = VK_NULL_HANDLE, median = VK_NULL_HANDLE;
+
+    // The tables, uploaded once: lambda per coarse level, the level table
+    VSGPUBuffer *constants = nullptr;
+    VSVulkanBufferInfo constantsInfo = {};
+    Region levelLambda, levels;
+
+    // A batch's working buffers, regions of one buffer allocated per frame
+    int batch = 1;
+    Region levelVec, levelSad, medians;
+    VkDeviceSize scratchBytes = 0;
+
+    std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
+
+    const VSAPI *vsapi;
+
+    CoarseData(const VSAPI *vsapi) : vsapi(vsapi) {};
+
+    ~CoarseData() {
+        // The pool drains the GPU first, so nothing still uses what follows
+        if (pool)
+            vc->vkapi->freeGPUExecPool(pool);
+        profile.reset();
+        if (constants)
+            vc->vkapi->destroyGPUBuffer(constants);
+        vc.reset();
+        vsapi->freeNode(node);
+    }
+};
+
+// The coarse searches of a batch's `count` fields, the field in z, as the prototype's vkrefine.cpp
+// records them: the top level's exhaustive search and passes, then each finer level seeded from the
+// one above, down to the finest; then the finest level's median
+class CoarseRecorder {
+public:
+    CoarseRecorder(const CoarseData &d, Recorder &rec, uint32_t count) : d(d), L(d.layout), rec(rec), count(count) {}
+
+    void Search() {
+        const int T = L.topLevel, F = SuperLayout::kFinest;
+        rec.Dispatch(d.pyrTop, LevelParams(T), static_cast<uint32_t>(L.levels[T].nbx), static_cast<uint32_t>(L.levels[T].nby), count);
+        rec.ComputeBarrier();
+        LevelPasses(T);
+        for (int level = T - 1; level >= F; --level) {
+            Median(level + 1, 2, level);
+            rec.Dispatch(d.pyrSeed, LevelParams(level), static_cast<uint32_t>((L.levels[level].nbx + 7) / 8), static_cast<uint32_t>(L.levels[level].nby), count);
+            rec.ComputeBarrier();
+            LevelPasses(level);
+        }
+        Median(F, L.pel << F, kGlobalSlot);
+    }
+
+private:
+    // The coarse kernels' parameters at a level; the levels use 8x8 blocks
+    Params LevelParams(int level, int colour = 0) const {
+        Params q = {};
+        q.colour = colour;
+        q.level = level;
+        q.topRadius = kTopRadius;
+        q.medianScale = 1;
+        q.finest = SuperLayout::kFinest;
+        q.blockRows = 8;
+        return q;
+    }
+
+    // Checkerboard pass pairs at a coarse level
+    void LevelPasses(int level) {
+        const LevelEntry &e = L.levels[level];
+        for (int p = 0; p < 2 * kLevelPairs; ++p) {
+            rec.Dispatch(d.pyrPass, LevelParams(level, p & 1), static_cast<uint32_t>(((e.nbx + 1) / 2 + 7) / 8), static_cast<uint32_t>(e.nby), count);
+            rec.ComputeBarrier();
+        }
+    }
+
+    // The median of a level's coarse field, times scale, into each field's medians at slot
+    void Median(int level, int scale, int slot) {
+        Params q = LevelParams(level);
+        q.medianScale = scale;
+        q.medianSlot = slot;
+        rec.Dispatch(d.median, q, 1, 1, count);
+        rec.ComputeBarrier();
+    }
+
+    const CoarseData &d;
+    const SuperLayout &L;
+    Recorder &rec;
+    uint32_t count;
+};
+
+static const VSFrame *VS_CC coarseGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
+    CoarseData *d = reinterpret_cast<CoarseData *>(instanceData);
+
+    // The rows with a field, and the reference frames, each once
+    std::vector<int> slots, refs;
+    for (int s = 0; s < static_cast<int>(d->deltas.size()); ++s) {
+        const int nref = n + d->deltas[s];
+        if (nref < 0 || nref >= d->numFrames)
+            continue;
+        slots.push_back(s);
+        if (std::find(refs.begin(), refs.end(), nref) == refs.end())
+            refs.push_back(nref);
+    }
+
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+        for (int nref : refs)
+            vsapi->requestFrameFilter(nref, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSVULKANAPI *vkapi = d->vc->vkapi;
+        const SuperLayout &L = d->layout;
+        VSFrame *out = vkapi->newGPUVideoFrame(&d->vi.format, d->vi.width, d->vi.height, nullptr, core);
+        if (!out) {
+            vsapi->setFilterError("Analyse: failed to allocate the coarse search's frame", frameCtx);
+            return nullptr;
+        }
+        if (slots.empty())
+            return out; // no field of this frame has a reference frame, so nothing reads it
+
+        std::vector<SuperFrames> held;
+        VSGPUExecContext *ctx = nullptr;
+        VSGPUBuffer *scratch = nullptr;
+        auto fail = [&](const std::string &message) -> const VSFrame * {
+            if (ctx)
+                vkapi->gpuExecAbandon(ctx);
+            else if (scratch)
+                vkapi->destroyGPUBuffer(scratch);
+            for (SuperFrames &f : held)
+                f.Free(vsapi);
+            vsapi->freeFrame(out);
+            vsapi->setFilterError(("Analyse: " + message).c_str(), frameCtx);
+            return nullptr;
+        };
+
+        // The current frame's pyramid, then the references'
+        std::vector<VSVulkanPlaneInfo> pyramids;
+        for (int f = -1; f < static_cast<int>(refs.size()); ++f) {
+            const VSFrame *frame = vsapi->getFrameFilter(f < 0 ? n : refs[f], d->node, frameCtx);
+            SuperFrames sf;
+            const bool found = GetSuperFrames(frame, L, d->prefix, sf, vsapi);
+            vsapi->freeFrame(frame);
+            if (!found)
+                return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
+            held.push_back(sf);
+            VSVulkanPlaneInfo info;
+            if (vkapi->getGPUPlane(sf.pyramid, 0, &info))
+                return fail("the super clip's pyramid isn't GPU resident");
+            pyramids.push_back(info);
+        }
+        VSVulkanPlaneInfo outPlane;
+        if (vkapi->getGPUPlane(out, 0, &outPlane))
+            return fail("the coarse search's frame isn't GPU resident");
+        const VkDeviceSize rowBytes = static_cast<VkDeviceSize>(vsapi->getStride(out, 0));
+
+        char err[1024] = {};
+        VSVulkanBufferInfo scratchInfo = {};
+        scratch = vkapi->createGPUBuffer(core, d->scratchBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &scratchInfo, err, sizeof(err));
+        if (!scratch)
+            return fail(err);
+        ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
+        if (!ctx)
+            return fail(err);
+        vkapi->gpuExecUsesBuffer(ctx, scratch);
+        for (const SuperFrames &f : held)
+            vkapi->gpuExecReadsFrame(ctx, f.pyramid);
+        vkapi->gpuExecWritesPlane(ctx, out, 0);
+
+        const VkBuffer constants = d->constantsInfo.buffer, work = scratchInfo.buffer;
+        const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
+        Recorder rec(*d->vc, cmd, constants, Layout::Coarse);
+        const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
+        rec.Bind(kCurPyramid, pyramids[0].buffer);
+        rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
+        rec.Bind(kLevelLambda, constants, d->levelLambda.offset, d->levelLambda.size);
+        rec.Bind(kLevelVec, work, d->levelVec.offset, d->levelVec.size);
+        rec.Bind(kLevelSad, work, d->levelSad.offset, d->levelSad.size);
+        rec.Bind(kMedians, work, d->medians.offset, d->medians.size);
+
+        const LevelEntry &finest = L.levels[SuperLayout::kFinest];
+        const VkDeviceSize finestBytes = static_cast<VkDeviceSize>(finest.nbx) * finest.nby * 8;
+        for (size_t start = 0; start < slots.size(); start += d->batch) {
+            const uint32_t count = static_cast<uint32_t>(std::min<size_t>(d->batch, slots.size() - start));
+            for (uint32_t z = 0; z < count; ++z) {
+                const int nref = n + d->deltas[slots[start + z]];
+                const size_t r = std::find(refs.begin(), refs.end(), nref) - refs.begin();
+                rec.Bind(kRefPyramid, pyramids[1 + r].buffer, 0, VK_WHOLE_SIZE, static_cast<int>(z));
+            }
+            // The batch before has copied out what this one overwrites
+            if (start > 0)
+                rec.TransferToCompute();
+            CoarseRecorder(*d, rec, count).Search();
+            // Each field's global median and finest level to its row
+            rec.ComputeToTransfer();
+            for (uint32_t z = 0; z < count; ++z) {
+                const VkDeviceSize row = rowBytes * slots[start + z];
+                rec.Copy(work, d->medians.offset + (static_cast<VkDeviceSize>(z) * kMedianSlots + kGlobalSlot) * 8, outPlane.buffer, row, 8);
+                rec.Copy(work, d->levelVec.offset + (static_cast<VkDeviceSize>(z) * L.fieldTotal + finest.fieldOff) * 8, outPlane.buffer, row + 8, finestBytes);
+            }
+        }
+        if (d->profile)
+            d->profile->Stamp(*d->vc, cmd, queries, 1);
+
+        uint64_t signaled = 0;
+        const int submitted = vkapi->gpuExecSubmit(ctx, &signaled, err, sizeof(err));
+        ctx = nullptr;
+        scratch = nullptr; // the context owned it
+        if (submitted)
+            return fail(err);
+        if (d->profile)
+            d->profile->Finish(*d->vc, d->pool, signaled, queries);
+        for (SuperFrames &f : held)
+            f.Free(vsapi);
+        return out;
+    }
+
+    return nullptr;
+}
+
+// ---- The field's node
 
 struct AnalyseData {
     VSNode *node = nullptr;
+    VSNode *coarseNode = nullptr; // and the row of its frames this field's coarse search is in
+    int coarseRow = 0;
     // The fields this one's seeds chain (stepNode at n, restNode at n + unit) and invert (invNode at n + delta), or null
     VSNode *stepNode = nullptr;
     VSNode *restNode = nullptr;
@@ -80,20 +351,22 @@ struct AnalyseData {
 
     std::shared_ptr<VulkanContext> vc;
     VSGPUExecPool *pool = nullptr;
-    VkPipeline pyrTop = VK_NULL_HANDLE, pyrPass = VK_NULL_HANDLE, pyrSeed = VK_NULL_HANDLE, median = VK_NULL_HANDLE;
     VkPipeline seedScatter = VK_NULL_HANDLE, seedBuild = VK_NULL_HANDLE;
     VkPipeline init = VK_NULL_HANDLE, pass = VK_NULL_HANDLE, flag = VK_NULL_HANDLE, fallback = VK_NULL_HANDLE, apply = VK_NULL_HANDLE, halfpel = VK_NULL_HANDLE;
+    VkPipeline quarter = VK_NULL_HANDLE; // pel 4
 
-    // The tables, uploaded once: lambda for the full-size grid and per coarse level, the level table
+    // The tables, uploaded once: lambda for the full-size grid, the level table
     VSGPUBuffer *constants = nullptr;
     VSVulkanBufferInfo constantsInfo = {};
-    Region lambda, levelLambda, levels;
+    Region lambda, levels;
 
     // A field's working buffers, regions of one buffer allocated per frame
-    Region seeds, seedCount, seedSad, vecA, sadA, vecB, sadB, lastChange, lastEval, counters, flagged, invKey, levelVec, levelSad, medians, coarse;
+    Region seeds, seedCount, seedSad, vecA, sadA, vecB, sadB, lastChange, lastEval, counters, flagged, invKey;
     VkDeviceSize scratchBytes = 0;
 
     VSVideoFormat gray32 = {};
+
+    std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
 
@@ -103,10 +376,12 @@ struct AnalyseData {
         // The pool drains the GPU first, so nothing still uses what follows
         if (pool)
             vc->vkapi->freeGPUExecPool(pool);
+        profile.reset();
         if (constants)
             vc->vkapi->destroyGPUBuffer(constants);
         vc.reset();
         vsapi->freeNode(node);
+        vsapi->freeNode(coarseNode);
         vsapi->freeNode(stepNode);
         vsapi->freeNode(restNode);
         vsapi->freeNode(invNode);
@@ -116,10 +391,15 @@ struct AnalyseData {
 // What a field's submission records, the order and the barriers as the prototype's vkrefine.cpp
 class FieldRecorder {
 public:
-    FieldRecorder(const AnalyseData &d, Recorder &rec, VkBuffer scratch, int lumaStride, int chromaStride, int recStride)
-        : d(d), L(d.layout), rec(rec), scratch(scratch), lumaStride(lumaStride), chromaStride(chromaStride), recStride(recStride) {}
+    // stamp(i), when given, marks the end of stage i (MVGPU_PROFILE): 1 the seeds, 2 init, 3 the
+    // passes before the fallback, 4 the fallback, 5 the passes after it, 6 the half-pel step, 7 the
+    // quarter-pel step
+    FieldRecorder(const AnalyseData &d, Recorder &rec, VkBuffer scratch, int lumaStride, int chromaStride, int recStride, int coarseBase,
+                  std::function<void(int)> stamp)
+        : d(d), L(d.layout), rec(rec), scratch(scratch), lumaStride(lumaStride), chromaStride(chromaStride), recStride(recStride), coarseBase(coarseBase),
+          stamp(std::move(stamp)) {}
 
-    // level, flags, medianScale and medianSlot are the caller's to set where a kernel uses them
+    // flags is the caller's to set where a kernel uses it
     Params MakeParams(int colour, int stamp) const {
         Params q = {};
         q.w = L.width;
@@ -144,38 +424,8 @@ public:
         q.finest = SuperLayout::kFinest;
         q.blockRows = L.blk;
         q.recStride = recStride;
+        q.coarseBase = coarseBase;
         return q;
-    }
-
-    // The coarse kernels' parameters at level `level`; the levels use 8x8 blocks
-    Params CoarseParams(int level, int colour = 0) const {
-        Params q = MakeParams(colour, 0);
-        q.level = level;
-        q.blockRows = 8;
-        return q;
-    }
-
-    // The coarse search: the top level's exhaustive search and passes, then each finer level seeded
-    // from the one above, down to the finest; then the finest level's median, and the field's
-    // global median and finest level copied to where seed_build.comp reads them
-    void Coarse() {
-        const int T = L.topLevel, F = SuperLayout::kFinest;
-        rec.Dispatch(d.pyrTop, CoarseParams(T), static_cast<uint32_t>(L.levels[T].nbx), static_cast<uint32_t>(L.levels[T].nby));
-        rec.ComputeBarrier();
-        LevelPasses(T);
-        for (int level = T - 1; level >= F; --level) {
-            Median(level + 1, 2, level);
-            rec.Dispatch(d.pyrSeed, CoarseParams(level), static_cast<uint32_t>((L.levels[level].nbx + 7) / 8), static_cast<uint32_t>(L.levels[level].nby));
-            rec.ComputeBarrier();
-            LevelPasses(level);
-        }
-        Median(F, 2 << F, kGlobalSlot);
-        const LevelEntry &finest = L.levels[F];
-        rec.ComputeToTransfer();
-        rec.Copy(scratch, d.medians.offset + kGlobalSlot * 8, scratch, d.coarse.offset, 8);
-        rec.Copy(scratch, d.levelVec.offset + static_cast<VkDeviceSize>(finest.fieldOff) * 8, scratch, d.coarse.offset + 8,
-                 static_cast<VkDeviceSize>(finest.nbx) * finest.nby * 8);
-        rec.TransferToCompute();
     }
 
     // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is
@@ -189,10 +439,12 @@ public:
         }
         rec.Dispatch(d.seedBuild, q, groups, 1);
         rec.ComputeBarrier();
+        Stamp(1);
     }
 
     // The seeds measured (init), the checkerboard passes, the fallback and its extra pass pair, then
-    // the half-pel step, which writes the output
+    // the half-pel step, which writes the output; at pel 4 the half-pel step writes field B and the
+    // quarter-pel step, reading it as its field A, writes the output
     void Refinement() {
         const int64_t nb = static_cast<int64_t>(L.nbx) * L.nby;
         const uint32_t gx = static_cast<uint32_t>(L.nbx), gy = static_cast<uint32_t>(L.nby);
@@ -202,8 +454,14 @@ public:
         int step = 0; // init is step 0, every pass and the fallback one more
         rec.Dispatch(d.init, MakeParams(0, step), gx8, gy);
         rec.ComputeBarrier();
+        Stamp(2);
+        if (!withFallback) {
+            Stamp(3);
+            Stamp(4);
+        }
         for (int p = 0; p < 2 * totalPairs; ++p) {
             if (withFallback && p == 2 * kPairs) {
+                Stamp(3);
                 // List the blocks above badSad (init emptied the list); search those, reading A and
                 // writing their results to B by list entry; then copy them to A
                 rec.Dispatch(d.flag, MakeParams(0, step + 1), static_cast<uint32_t>((nb + 63) / 64), 1);
@@ -213,37 +471,37 @@ public:
                 rec.ComputeBarrier();
                 rec.DispatchIndirect(d.apply, MakeParams(0, step), scratch, d.flagged.offset);
                 rec.ComputeBarrier();
+                Stamp(4);
             }
             rec.Dispatch(d.pass, MakeParams(p & 1, ++step), gxHalf8, gy);
             rec.ComputeBarrier();
         }
+        Stamp(5);
         rec.Dispatch(d.halfpel, MakeParams(0, step), gx8, gy);
+        if (L.pel == 4) {
+            rec.ComputeBarrier();
+            Stamp(6);
+            rec.Bind(kVecA, scratch, d.vecB.offset, d.vecB.size);
+            rec.Bind(kSadA, scratch, d.sadB.offset, d.sadB.size);
+            rec.Dispatch(d.quarter, MakeParams(0, step), gx8, gy);
+        } else {
+            Stamp(6);
+        }
+        Stamp(7);
     }
 
 private:
-    // Checkerboard pass pairs at a coarse level
-    void LevelPasses(int level) {
-        const LevelEntry &e = L.levels[level];
-        for (int p = 0; p < 2 * kLevelPairs; ++p) {
-            rec.Dispatch(d.pyrPass, CoarseParams(level, p & 1), static_cast<uint32_t>(((e.nbx + 1) / 2 + 7) / 8), static_cast<uint32_t>(e.nby));
-            rec.ComputeBarrier();
-        }
-    }
-
-    // The median of a level's coarse field, times scale, into the medians at slot
-    void Median(int level, int scale, int slot) {
-        Params q = CoarseParams(level);
-        q.medianScale = scale;
-        q.medianSlot = slot;
-        rec.Dispatch(d.median, q, 1, 1);
-        rec.ComputeBarrier();
+    void Stamp(int stage) {
+        if (stamp)
+            stamp(stage);
     }
 
     const AnalyseData &d;
     const SuperLayout &L;
     Recorder &rec;
     VkBuffer scratch;
-    int lumaStride, chromaStride, recStride;
+    int lumaStride, chromaStride, recStride, coarseBase;
+    std::function<void(int)> stamp;
 };
 
 static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
@@ -256,6 +514,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (hasRef) {
             vsapi->requestFrameFilter(std::min(n, nref), d->node, frameCtx);
             vsapi->requestFrameFilter(std::max(n, nref), d->node, frameCtx);
+            vsapi->requestFrameFilter(n, d->coarseNode, frameCtx);
             if (d->stepNode && d->restNode) {
                 vsapi->requestFrameFilter(n, d->stepNode, frameCtx);
                 vsapi->requestFrameFilter(n + d->unit, d->restNode, frameCtx);
@@ -304,6 +563,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         };
 
         const VSFrame *ref = hold(vsapi->getFrameFilter(nref, d->node, frameCtx));
+        const VSFrame *coarse = hold(vsapi->getFrameFilter(n, d->coarseNode, frameCtx));
         SuperFrames cur, rf;
         if (!GetSuperFrames(src, L, d->prefix, cur, vsapi) || !GetSuperFrames(ref, L, d->prefix, rf, vsapi)) {
             cur.Free(vsapi);
@@ -335,12 +595,15 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = vsapi->getStride(cur.chroma, 0);
         if (lumaStride != vsapi->getStride(rf.luma, 0) || chromaStride != vsapi->getStride(rf.chroma, 0) || lumaStride % 4 || chromaStride % 4)
             return fail("the super frames' storage strides differ");
+        const ptrdiff_t coarseRowBytes = vsapi->getStride(coarse, 0);
+        if (coarseRowBytes % 8)
+            return fail("the coarse search's rows don't start on whole vectors");
 
         // The buffers every binding names
-        VSVulkanPlaneInfo curLuma, curChroma, curPyramid, refLuma, refChroma, refPyramid, outRec, stepRec = {}, restRec = {}, invRec = {};
-        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || vkapi->getGPUPlane(cur.chroma, 0, &curChroma) || vkapi->getGPUPlane(cur.pyramid, 0, &curPyramid) ||
-            vkapi->getGPUPlane(rf.luma, 0, &refLuma) || vkapi->getGPUPlane(rf.chroma, 0, &refChroma) || vkapi->getGPUPlane(rf.pyramid, 0, &refPyramid) ||
-            vkapi->getGPUPlane(vectors, 0, &outRec) || ((flags & 1) && (vkapi->getGPUPlane(stepVec, 0, &stepRec) || vkapi->getGPUPlane(restVec, 0, &restRec))) ||
+        VSVulkanPlaneInfo curLuma, curChroma, refLuma, refChroma, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
+        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || vkapi->getGPUPlane(cur.chroma, 0, &curChroma) || vkapi->getGPUPlane(rf.luma, 0, &refLuma) ||
+            vkapi->getGPUPlane(rf.chroma, 0, &refChroma) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) || vkapi->getGPUPlane(vectors, 0, &outRec) ||
+            ((flags & 1) && (vkapi->getGPUPlane(stepVec, 0, &stepRec) || vkapi->getGPUPlane(restVec, 0, &restRec))) ||
             ((flags & 2) && vkapi->getGPUPlane(invVec, 0, &invRec)))
             return fail("a frame the analysis reads isn't GPU resident");
 
@@ -356,7 +619,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (!ctx)
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
-        for (const VSFrame *f : {cur.luma, cur.chroma, cur.pyramid, rf.luma, rf.chroma, rf.pyramid})
+        for (const VSFrame *f : {cur.luma, cur.chroma, rf.luma, rf.chroma, coarse})
             vkapi->gpuExecReadsFrame(ctx, f);
         if (flags & 1) {
             vkapi->gpuExecReadsFrame(ctx, stepVec);
@@ -367,20 +630,20 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         vkapi->gpuExecWritesPlane(ctx, vectors, 0);
 
         const VkBuffer constants = d->constantsInfo.buffer, work = scratchInfo.buffer;
-        Recorder rec(*d->vc, vkapi->gpuExecCommandBuffer(ctx), constants);
+        const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
+        Recorder rec(*d->vc, cmd, constants);
+        const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
         rec.Bind(kCurLuma, curLuma.buffer);
         rec.Bind(kRefLuma, refLuma.buffer);
         rec.Bind(kCurChroma, curChroma.buffer);
         rec.Bind(kRefChroma, refChroma.buffer);
-        rec.Bind(kCurPyramid, curPyramid.buffer);
-        rec.Bind(kRefPyramid, refPyramid.buffer);
+        rec.Bind(kCoarse, coarsePlane.buffer);
         rec.Bind(kLambda, constants, d->lambda.offset, d->lambda.size);
-        rec.Bind(kLevelLambda, constants, d->levelLambda.offset, d->levelLambda.size);
         rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
         const std::pair<int, const Region *> regions[] = {
             {kSeeds, &d->seeds}, {kSeedCount, &d->seedCount}, {kSeedSad, &d->seedSad}, {kVecA, &d->vecA}, {kSadA, &d->sadA}, {kVecB, &d->vecB},
             {kSadB, &d->sadB}, {kLastChange, &d->lastChange}, {kLastEval, &d->lastEval}, {kCounters, &d->counters}, {kFlagged, &d->flagged},
-            {kInvKey, &d->invKey}, {kLevelVec, &d->levelVec}, {kLevelSad, &d->levelSad}, {kMedians, &d->medians}, {kCoarse, &d->coarse}};
+            {kInvKey, &d->invKey}};
         for (const auto &[binding, region] : regions)
             rec.Bind(binding, work, region->offset, region->size);
         rec.Bind(kOutRec, outRec.buffer);
@@ -395,16 +658,22 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             rec.TransferToCompute();
         }
 
-        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride), static_cast<int>(chromaStride), static_cast<int>(recBytes / 16));
-        field.Coarse();
+        std::function<void(int)> stamp;
+        if (d->profile)
+            stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
+        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride), static_cast<int>(chromaStride), static_cast<int>(recBytes / 16),
+                            static_cast<int>(d->coarseRow * coarseRowBytes / 8), std::move(stamp));
         field.SeedLists(flags);
         field.Refinement();
 
-        const int submitted = vkapi->gpuExecSubmit(ctx, nullptr, err, sizeof(err));
+        uint64_t signaled = 0;
+        const int submitted = vkapi->gpuExecSubmit(ctx, &signaled, err, sizeof(err));
         ctx = nullptr;
         scratch = nullptr; // the context owned it
         if (submitted)
             return fail(err);
+        if (d->profile)
+            d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
         VSFrame *dst = vsapi->copyFrame(src, core);
         ExportAnalysis(dst, L, d->deltaFrame, vectors, d->prefix, vsapi);
@@ -424,8 +693,13 @@ struct AnalyseArgs {
     SuperLayout layout;
     std::string prefix;
     int deltaFrame = 1;
-    int64_t mvlambda = 1000, lsad = 400, badsad = 10000;
-    int badrange = 24, badstep = 2;
+    int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
+    int badrange = 40, badstep = 2;
+
+    Scaled Scale() const {
+        const int64_t area = static_cast<int64_t>(layout.blk) * layout.blk;
+        return {mvlambda * area / 64 / (layout.pel * layout.pel), lsad * area / 64, mvlambda * area / 64};
+    }
 };
 
 AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
@@ -441,8 +715,14 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
     a.node = vsapi->mapGetNode(in, "super", 0, nullptr);
     try {
         a.layout = ImportSuperLayout(a.node, a.prefix, vsapi);
+        if (const std::string unsupported = a.layout.Unsupported(); !unsupported.empty())
+            throw std::runtime_error(unsupported);
         if (a.layout.topLevel < 1)
-            throw std::runtime_error("the super clip has no coarse levels (onelevel=True), which the search starts from");
+            throw std::runtime_error("the super clip has no coarse levels, which the search starts from: it was made with onelevel=True, or the frame is narrower than " +
+                                     std::to_string(2 * SuperLayout::kTopWidth) + " pixels");
+        // median.comp's histogram
+        if (a.layout.maxCoarseVector >= 4064)
+            throw std::runtime_error("the frame is too large for the coarse search");
 
         int blkX, blkY, overlapX, overlapY;
         GetPairArgument(blkX, blkY, "blksize", a.layout.blk, a.layout.blk, in, vsapi);
@@ -504,11 +784,11 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
 
         a.badsad = vsapi->mapGetIntSaturated(in, "badsad", 0, &err);
         if (err)
-            a.badsad = 10000;
+            a.badsad = 1000;
 
         a.badrange = vsapi->mapGetIntSaturated(in, "badrange", 0, &err);
         if (err)
-            a.badrange = 24;
+            a.badrange = 40;
 
         a.badstep = vsapi->mapGetIntSaturated(in, "badstep", 0, &err);
         if (err)
@@ -564,11 +844,79 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
     return a;
 }
 
-// The node of field delta, its seeds chaining stepNode and restNode (with the step unit) and
-// inverting invNode where those aren't null; takes no reference of the caller's
-VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *stepNode, VSNode *restNode, int unit, VSNode *invNode, VSCore *core, const VSAPI *vsapi) {
+// The coarse node of the fields (n, deltas[s]); takes no reference of the caller's
+VSNode *CreateCoarse(const AnalyseArgs &a, const std::vector<int> &deltas, VSCore *core, const VSAPI *vsapi) {
+    std::unique_ptr<CoarseData> d = std::make_unique<CoarseData>(vsapi);
+    d->node = vsapi->addNodeRef(a.node);
+    const VSVideoInfo *superVi = vsapi->getVideoInfo(a.node);
+    d->numFrames = superVi->numFrames;
+    d->layout = a.layout;
+    d->deltas = deltas;
+    d->prefix = a.prefix;
+    const SuperLayout &L = d->layout;
+    const Scaled s = a.Scale();
+
+    d->vc = VulkanContext::Get(core, vsapi);
+    VulkanContext &vc = *d->vc;
+    d->pyrTop = vc.Pipeline(Kernel::PyrTop, L.blk, 2);
+    d->pyrPass = vc.Pipeline(Kernel::PyrPass, L.blk, 2);
+    d->pyrSeed = vc.Pipeline(Kernel::PyrSeed, L.blk, 2);
+    d->median = vc.Pipeline(Kernel::Median, L.blk, 2);
+
+    // lambda for every (worst neighbour SAD) >> 1 per coarse level, mvlambda * 2^level relaxed by
+    // lsad as the CPU reference does in double precision
+    std::vector<int64_t> levelLambda(static_cast<size_t>(L.topLevel + 1) * SuperLayout::kLambdaEntries);
+    for (int level = 0; level <= L.topLevel; ++level)
+        for (int i = 0; i < SuperLayout::kLambdaEntries; ++i) {
+            const double sc = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + i, 1);
+            levelLambda[static_cast<size_t>(level) * SuperLayout::kLambdaEntries + i] = static_cast<int64_t>((s.lambdaBlock << level) * sc * sc);
+        }
+    Regions constants(vc);
+    constants.Place(d->levelLambda, levelLambda.size() * 8);
+    constants.Place(d->levels, L.levels.size() * sizeof(LevelEntry));
+    std::vector<uint8_t> tables(constants.Total());
+    memcpy(tables.data() + d->levelLambda.offset, levelLambda.data(), levelLambda.size() * 8);
+    memcpy(tables.data() + d->levels.offset, L.levels.data(), L.levels.size() * sizeof(LevelEntry));
+
+    d->batch = std::min<int>(VulkanContext::kMaxBatch, static_cast<int>(deltas.size()));
+    Regions scratch(vc);
+    scratch.Place(d->levelVec, static_cast<VkDeviceSize>(d->batch) * L.fieldTotal * 8);
+    scratch.Place(d->levelSad, static_cast<VkDeviceSize>(d->batch) * L.fieldTotal * 4);
+    scratch.Place(d->medians, static_cast<VkDeviceSize>(d->batch) * kMedianSlots * 8);
+    d->scratchBytes = scratch.Total();
+
+    char err[1024] = {};
+    d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, err, sizeof(err));
+    if (!d->pool)
+        throw std::runtime_error(err);
+    d->constants = vc.Upload(core, d->pool, tables.data(), tables.size(), d->constantsInfo);
+
+    d->vi = *superVi;
+    if (!vsapi->queryVideoFormat(&d->vi.format, cfGray, stInteger, 32, 0, 0, core))
+        throw std::runtime_error("failed to query the Gray32 format");
+    d->vi.width = CoarseRowInts(L);
+    d->vi.height = static_cast<int>(deltas.size());
+
+    if (StageProfiler::Requested())
+        d->profile = std::make_unique<StageProfiler>("coarse searches", std::vector<std::string>{"all fields of a frame, batched"});
+
+    VSFilterDependency deps[1] = {{d->node, rpGeneral}};
+    VSNode *out = vsapi->createVideoFilterEx2("AnalyseCoarse", &d->vi, coarseGetFrame, filterFree<CoarseData>, fmParallel, ffGPUOutput, deps, 1, d.get(), core);
+    if (!out)
+        throw std::runtime_error("failed to create the coarse search's filter");
+    d.release();
+    return out;
+}
+
+// The node of field delta, its coarse search in row coarseRow of coarseNode's frames, its seeds
+// chaining stepNode and restNode (with the step unit) and inverting invNode where those aren't
+// null; takes no reference of the caller's
+VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int coarseRow, VSNode *stepNode, VSNode *restNode, int unit, VSNode *invNode,
+                      VSCore *core, const VSAPI *vsapi) {
     std::unique_ptr<AnalyseData> d = std::make_unique<AnalyseData>(vsapi);
     d->node = vsapi->addNodeRef(a.node);
+    d->coarseNode = vsapi->addNodeRef(coarseNode);
+    d->coarseRow = coarseRow;
     d->vi = *vsapi->getVideoInfo(a.node);
     d->layout = a.layout;
     d->prefix = a.prefix;
@@ -583,77 +931,55 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *stepNode, VSNode 
 
     const SuperLayout &L = d->layout;
     const int blk = L.blk, area = blk * blk;
-    // mvu.Analyse's scaling for 8-bit and the block size, lambda divided by pel squared at full
-    // size, exactly as the CPU reference computes it
-    const int64_t lambda0 = a.mvlambda * area / 64 / 4, lsad = a.lsad * area / 64, lambdaBlock = a.mvlambda * area / 64;
+    const Scaled s = a.Scale();
     d->badSad = static_cast<int>(std::min<int64_t>(a.badsad * area / 64, INT32_MAX));
     d->fallbackRadius = std::abs(a.badrange);
     d->fallbackStep = a.badstep;
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    d->pyrTop = vc.Pipeline(Kernel::PyrTop, blk);
-    d->pyrPass = vc.Pipeline(Kernel::PyrPass, blk);
-    d->pyrSeed = vc.Pipeline(Kernel::PyrSeed, blk);
-    d->median = vc.Pipeline(Kernel::Median, blk);
-    d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk);
-    d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk);
-    d->init = vc.Pipeline(Kernel::RefineInit, blk);
-    d->pass = vc.Pipeline(Kernel::RefinePass, blk);
-    d->flag = vc.Pipeline(Kernel::RefineFlag, blk);
-    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk);
-    d->apply = vc.Pipeline(Kernel::RefineApply, blk);
-    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk);
+    const int pel = L.pel;
+    d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel);
+    d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel);
+    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel);
+    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel);
+    d->flag = vc.Pipeline(Kernel::RefineFlag, blk, pel);
+    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel);
+    d->apply = vc.Pipeline(Kernel::RefineApply, blk, pel);
+    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel);
+    if (pel == 4)
+        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel);
 
-    // Regions of one buffer, each aligned for binding at its offset
-    const VkDeviceSize align = std::max<VkDeviceSize>(vc.limits.minStorageBufferOffsetAlignment, 16);
-    auto place = [&](VkDeviceSize &total, Region &r, VkDeviceSize size) {
-        r.offset = total;
-        r.size = std::max<VkDeviceSize>(size, 16);
-        total = (total + r.size + align - 1) / align * align;
-    };
-
-    // lambda for every (worst neighbour SAD) >> 1, for the full-size grid and then per coarse level
-    // (mvlambda * 2^level), relaxed by lsad as the CPU reference does in double precision
-    std::vector<int64_t> lambda(LambdaEntries(blk)), levelLambda(static_cast<size_t>(L.topLevel + 1) * SuperLayout::kLambdaEntries);
+    // lambda for every (worst neighbour SAD) >> 1, relaxed by lsad as the CPU reference does in
+    // double precision
+    std::vector<int64_t> lambda(LambdaEntries(blk));
     for (size_t i = 0; i < lambda.size(); ++i) {
-        const double scale = static_cast<double>(lsad) / std::max<int64_t>(lsad + static_cast<int64_t>(i), 1);
-        lambda[i] = static_cast<int64_t>(lambda0 * scale * scale);
+        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + static_cast<int64_t>(i), 1);
+        lambda[i] = static_cast<int64_t>(s.lambda0 * scale * scale);
     }
-    for (int level = 0; level <= L.topLevel; ++level)
-        for (int i = 0; i < SuperLayout::kLambdaEntries; ++i) {
-            const double sc = static_cast<double>(lsad) / std::max<int64_t>(lsad + i, 1);
-            levelLambda[static_cast<size_t>(level) * SuperLayout::kLambdaEntries + i] = static_cast<int64_t>((lambdaBlock << level) * sc * sc);
-        }
-    VkDeviceSize constantBytes = 0;
-    place(constantBytes, d->lambda, lambda.size() * 8);
-    place(constantBytes, d->levelLambda, levelLambda.size() * 8);
-    place(constantBytes, d->levels, L.levels.size() * sizeof(LevelEntry));
-    std::vector<uint8_t> tables(constantBytes);
+    Regions constants(vc);
+    constants.Place(d->lambda, lambda.size() * 8);
+    constants.Place(d->levels, L.levels.size() * sizeof(LevelEntry));
+    std::vector<uint8_t> tables(constants.Total());
     memcpy(tables.data() + d->lambda.offset, lambda.data(), lambda.size() * 8);
-    memcpy(tables.data() + d->levelLambda.offset, levelLambda.data(), levelLambda.size() * 8);
     memcpy(tables.data() + d->levels.offset, L.levels.data(), L.levels.size() * sizeof(LevelEntry));
 
     const VkDeviceSize nb = static_cast<VkDeviceSize>(L.nbx) * L.nby;
-    const LevelEntry &finest = L.levels[SuperLayout::kFinest];
-    VkDeviceSize &total = d->scratchBytes;
-    place(total, d->seeds, nb * kMaxSeeds * 8);
-    place(total, d->seedCount, nb * 4);
-    place(total, d->seedSad, nb * kMaxSeeds * 4);
-    place(total, d->vecA, nb * 8);
-    place(total, d->sadA, nb * 4);
-    place(total, d->vecB, nb * 8);
-    place(total, d->sadB, nb * 4);
-    place(total, d->lastChange, nb * 4);
-    place(total, d->lastEval, nb * 4);
-    place(total, d->counters, kCounterSlots * 4);
-    place(total, d->flagged, 12 + nb * 4); // the fallback's dispatch size (x, y, z), then its list of blocks
-    place(total, d->invKey, nb * 8);
-    place(total, d->levelVec, static_cast<VkDeviceSize>(L.fieldTotal) * 8);
-    place(total, d->levelSad, static_cast<VkDeviceSize>(L.fieldTotal) * 4);
-    place(total, d->medians, kMedianSlots * 8);
-    place(total, d->coarse, (1 + static_cast<VkDeviceSize>(finest.nbx) * finest.nby) * 8);
-    if (total > vc.limits.maxStorageBufferRange || static_cast<VkDeviceSize>(L.LumaRows()) * L.wp > vc.limits.maxStorageBufferRange)
+    Regions scratch(vc);
+    scratch.Place(d->seeds, nb * kMaxSeeds * 8);
+    scratch.Place(d->seedCount, nb * 4);
+    scratch.Place(d->seedSad, nb * kMaxSeeds * 4);
+    scratch.Place(d->vecA, nb * 8);
+    scratch.Place(d->sadA, nb * 4);
+    scratch.Place(d->vecB, nb * 8);
+    scratch.Place(d->sadB, nb * 4);
+    scratch.Place(d->lastChange, nb * 4);
+    scratch.Place(d->lastEval, nb * 4);
+    scratch.Place(d->counters, kCounterSlots * 4);
+    scratch.Place(d->flagged, 12 + nb * 4); // the fallback's dispatch size (x, y, z), then its list of blocks
+    scratch.Place(d->invKey, nb * 8);
+    d->scratchBytes = scratch.Total();
+    if (d->scratchBytes > vc.limits.maxStorageBufferRange || static_cast<VkDeviceSize>(L.LumaRows()) * L.wp > vc.limits.maxStorageBufferRange)
         throw std::runtime_error("the frame is too large for the device's storage buffers");
 
     char err[1024] = {};
@@ -665,8 +991,13 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *stepNode, VSNode 
     if (!vsapi->queryVideoFormat(&d->gray32, cfGray, stInteger, 32, 0, 0, core))
         throw std::runtime_error("failed to query the Gray32 format");
 
-    VSFilterDependency deps[4] = {{d->node, rpGeneral}};
-    int numDeps = 1;
+    if (StageProfiler::Requested())
+        d->profile = std::make_unique<StageProfiler>("field " + std::to_string(delta) + " (pel " + std::to_string(pel) + ")",
+                                                     std::vector<std::string>{"seeds", "init", "passes before the fallback", "fallback", "passes after it",
+                                                                              "half-pel step", "quarter-pel step"});
+
+    VSFilterDependency deps[5] = {{d->node, rpGeneral}, {d->coarseNode, rpGeneral}};
+    int numDeps = 2;
     for (VSNode *dep : {d->stepNode, d->restNode, d->invNode})
         if (dep)
             deps[numDeps++] = {dep, rpGeneral};
@@ -681,10 +1012,12 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *stepNode, VSNode 
 } // namespace
 
 static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void *userData, VSCore *core, const VSAPI *vsapi) noexcept {
+    VSNode *coarse = nullptr;
     try {
         AnalyseArgs a = ParseAnalyseArgs(in, vsapi);
         try {
-            vsapi->mapConsumeNode(out, "clip", CreateAnalyse(a, a.deltaFrame, nullptr, nullptr, 0, nullptr, core, vsapi), maAppend);
+            coarse = CreateCoarse(a, {a.deltaFrame}, core, vsapi);
+            vsapi->mapConsumeNode(out, "clip", CreateAnalyse(a, a.deltaFrame, coarse, 0, nullptr, nullptr, 0, nullptr, core, vsapi), maAppend);
         } catch (...) {
             vsapi->freeNode(a.node);
             throw;
@@ -693,11 +1026,14 @@ static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
     } catch (const std::exception &e) {
         vsapi->mapSetError(out, ("Analyse: " + std::string(e.what())).c_str());
     }
+    vsapi->freeNode(coarse);
 }
 
 // Every field of radius frames either side, in mvu.AnalyseMany's order (delta, -delta,
 // 2 * delta, -2 * delta, ...). They are created in the order their seeds need each other, -k
 // before +k and k before k + 1, and each node gets the nodes of the fields it chains and inverts.
+// One coarse node searches all of a frame's fields, row 2 (r - 1) for -r * delta and the next for
+// r * delta.
 static void VS_CC analyseManyCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void *userData, VSCore *core, const VSAPI *vsapi) noexcept {
     int err;
 
@@ -719,15 +1055,24 @@ static void VS_CC analyseManyCreate(const VSMap *in, VSMap *out, [[maybe_unused]
     }
 
     std::vector<VSNode *> negative(radius + 1, nullptr), positive(radius + 1, nullptr); // index r: field -r * delta, r * delta
+    VSNode *coarse = nullptr;
     try {
         AnalyseArgs a = ParseAnalyseArgs(in, vsapi);
         try {
+            std::vector<int> deltas;
+            for (int r = 1; r <= radius; ++r) {
+                deltas.push_back(-r * delta);
+                deltas.push_back(r * delta);
+            }
+            coarse = CreateCoarse(a, deltas, core, vsapi);
             for (int r = 1; r <= radius; ++r) {
                 // (n, -r) chains (n, -1) and (n - 1, -(r - 1)); (n, r) chains (n, 1) and (n + 1, r - 1)
                 // and inverts (n + r, -r)
                 const bool chain = r >= 2;
-                negative[r] = CreateAnalyse(a, -r * delta, chain ? negative[1] : nullptr, chain ? negative[r - 1] : nullptr, -delta, nullptr, core, vsapi);
-                positive[r] = CreateAnalyse(a, r * delta, chain ? positive[1] : nullptr, chain ? positive[r - 1] : nullptr, delta, negative[r], core, vsapi);
+                negative[r] = CreateAnalyse(a, -r * delta, coarse, 2 * (r - 1), chain ? negative[1] : nullptr, chain ? negative[r - 1] : nullptr, -delta, nullptr,
+                                            core, vsapi);
+                positive[r] = CreateAnalyse(a, r * delta, coarse, 2 * (r - 1) + 1, chain ? positive[1] : nullptr, chain ? positive[r - 1] : nullptr, delta,
+                                            negative[r], core, vsapi);
             }
         } catch (...) {
             vsapi->freeNode(a.node);
@@ -746,6 +1091,7 @@ static void VS_CC analyseManyCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         }
         vsapi->mapSetError(out, ("AnalyseMany: " + std::string(e.what())).c_str());
     }
+    vsapi->freeNode(coarse);
 }
 
 void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {

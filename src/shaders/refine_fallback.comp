@@ -68,25 +68,33 @@ void Append(int list, bool keep, uint pos, uint cost) {
         sList[list][base + subgroupBallotExclusiveBitCount(ballot)] = uvec2(pos, cost);
 }
 
-// The lane's position: its SAD's word addresses and shifts as LaneSad computes them, its lambda
-// term (saturated to 32 bits: anything that large passes every bound), and the partial sums of the
-// units measured
+// The lane's position: its SAD's word addresses and shifts as LaneSad computes them (at pel 4 its
+// chroma rows' sample addresses in the images), its lambda term (saturated to 32 bits: anything that
+// large passes every bound), and the partial sums of the units measured
 int64_t gLam;
 uint gW, gShift, gWU, gWV, gShiftC, gSa, gSm;
 
 void Setup(ivec2 v, ivec2 p, int64_t lambda) {
-    int X = 2 * (gX + pc.pad) + v.x, Y = 2 * (gY + pc.pad) + v.y;
-    int idx = (X & 1) | ((Y & 1) << 1); // the search's positions are whole pels; a clamped one near it may not be
+    // Half-pel units: at pel 4 the fallback's positions are on the full-pel grid (ClampFull)
+    int X = kPel * (gX + pc.pad) + v.x, Y = kPel * (gY + pc.pad) + v.y;
+    if (kPel == 4) {
+        X >>= 1;
+        Y >>= 1;
+    }
+    int idx = (X & 1) | ((Y & 1) << 1); // the search's positions are whole pels; at pel 2 a clamped one near it may not be
     uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
     gW = a >> 2u;
     gShift = (a & 3u) << 3u;
-    int Xc = 2 * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = 2 * (gY / 2 + pc.padc) + ChromaComponent(v.y);
-    int ic = (Xc & 1) | ((Yc & 1) << 1);
-    uint plane = uint(pc.wc * pc.hc);
-    uint ac = uint(ic) * plane + uint((Yc >> 1) * pc.wc + (Xc >> 1));
-    gWU = ac >> 2u;
-    gWV = (ac + 4u * plane) >> 2u;
-    gShiftC = (ac & 3u) << 3u;
+    int Xc = kPel * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = kPel * (gY / 2 + pc.padc) + ChromaComponent(v.y);
+    uint ac = ChromaAddr(Xc, Yc);
+    if (kPel == 4) {
+        gWU = ac;
+        gWV = ac + ChromaV();
+    } else {
+        gWU = ac >> 2u;
+        gWV = (ac + ChromaV()) >> 2u;
+        gShiftC = (ac & 3u) << 3u;
+    }
     int dx = v.x - p.x, dy = v.y - p.y;
     gLam = (lambda * int64_t(dx * dx + dy * dy)) >> 8;
     gSa = 0u;
@@ -106,9 +114,17 @@ void Unit(int u) {
             lo = hi;
         }
     }
+    int curU = 2 * kLumaWords, curV = curU + 2 * kChromaWords;
+    if (kPel == 4) {
+        uint au = gWU + uint(u * ChromaRow()), av = gWV + uint(u * ChromaRow());
+        [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
+            PackedStep(Strided4(au + uint(16 * i)), curU + 2 * (u * kRowWordsC + i), gSa, gSm);
+            PackedStep(Strided4(av + uint(16 * i)), curV + 2 * (u * kRowWordsC + i), gSa, gSm);
+        }
+        return;
+    }
     uint ru = gWU + uint(u) * strideC, rv = gWV + uint(u) * strideC;
     uint loU = refC[ru], loV = refC[rv];
-    int curU = 2 * kLumaWords, curV = curU + 2 * kChromaWords;
     [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
         uint hiU = refC[ru + uint(i) + 1u], hiV = refC[rv + uint(i) + 1u];
         PackedStep(Bytes4(loU, hiU, gShiftC), curU + 2 * (u * kRowWordsC + i), gSa, gSm);
@@ -145,9 +161,10 @@ void main() {
                 px[i] = uint(curY[(gY + pc.pad + k / kRowWords) * pc.wp + gX + pc.pad + (k % kRowWords) * 4 + i]);
                 unit = k / kRowWords / 2;
             } else {
-                int kc = k - kLumaWords, plane = kc < kChromaWords ? 0 : 4;
+                int kc = k - kLumaWords;
+                uint plane = kc < kChromaWords ? 0u : ChromaV();
                 kc %= kChromaWords;
-                px[i] = uint(curC[plane * pc.wc * pc.hc + (gY / 2 + pc.padc + kc / kRowWordsC) * pc.wc + gX / 2 + pc.padc + (kc % kRowWordsC) * 4 + i]);
+                px[i] = uint(curC[plane + ChromaPixel(gX / 2 + pc.padc + (kc % kRowWordsC) * 4 + i, gY / 2 + pc.padc + kc / kRowWordsC)]);
                 unit = kc / kRowWordsC;
             }
         }
@@ -185,10 +202,12 @@ void main() {
     }
     barrier();
 
-    int R = pc.fallbackRadius, stepH = 2 * pc.fallbackStep;
-    ivec2 c0 = ivec2(p.x & ~1, p.y & ~1);
-    ivec2 lo = ClampVec(c0 - ivec2(2 * R)), hi = ClampVec(c0 + ivec2(2 * R));
-    int x0 = lo.x + (lo.x & 1), y0 = lo.y + (lo.y & 1);
+    // On the full-pel grid: the predictor rounded down to it, the positions every fallbackStep px
+    // from the window's first full-pel position
+    int R = pc.fallbackRadius, stepH = kPel * pc.fallbackStep;
+    ivec2 c0 = ivec2(p.x & ~(kPel - 1), p.y & ~(kPel - 1));
+    ivec2 lo = ClampFull(c0 - ivec2(kPel * R)), hi = ClampFull(c0 + ivec2(kPel * R));
+    int x0 = (lo.x + kPel - 1) & ~(kPel - 1), y0 = (lo.y + kPel - 1) & ~(kPel - 1);
     int nx = hi.x >= x0 ? (hi.x - x0) / stepH + 1 : 0, ny = hi.y >= y0 ? (hi.y - y0) / stepH + 1 : 0;
     int total = nx * ny;
     // cost << 24 | position: fewer than 2^24 positions, costs far below 2^40
@@ -275,13 +294,15 @@ void main() {
         // the best, which the CPU skips, has its cost and can't win either. Cost << 8 | position:
         // fallbackStep stays below 9. 8 lanes measure a position together, a unit each (the last 4
         // idle at 8x8), so that its SAD takes one round of loads instead of all of them.
-        ivec2 cc = best;
+        // At pel 4 around the best rounded down to the full-pel grid: the block's own vector, kept
+        // when nothing in the window beat it, may be on the half-pel grid
+        ivec2 cc = kPel == 4 ? ivec2(best.x & ~3, best.y & ~3) : best;
         int r1 = pc.fallbackStep - 1, side = 2 * r1 + 1, around = side * side;
         int sub = lane & 7, slot = lane >> 3, perRound = lanes >> 3;
         uint64_t near = kNoKey;
         for (int k0 = 0; k0 < around; k0 += perRound) {
             int k = k0 + slot;
-            ivec2 v = ClampVec(cc + 2 * ivec2(k % side - r1, k / side - r1));
+            ivec2 v = ClampFull(cc + kPel * ivec2(k % side - r1, k / side - r1));
             bool live = k < around && v != cc;
             uint part = 0u;
             if (live && sub < kUnits) {
@@ -296,7 +317,7 @@ void main() {
         near = WorkgroupMin(near);
         if (near != kNoKey && int64_t(near >> 8) < bestCost) {
             int k = int(near & 0xFFul);
-            best = ClampVec(cc + 2 * ivec2(k % side - r1, k / side - r1));
+            best = ClampFull(cc + kPel * ivec2(k % side - r1, k / side - r1));
             bestSad = int(int64_t(near >> 8) - Cost(0, best, p, lambda));
         }
     }

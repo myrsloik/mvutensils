@@ -29,6 +29,9 @@
     <ClCompile Include="..\src\Analyse.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\Degrain.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\EntryPoint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -43,6 +46,18 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\src\shaders\degrain.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\degrain_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\degrain_count.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\degrain_weights.comp">
+      <Filter>Shader Files</Filter>
+    </None>
     <None Include="..\src\shaders\embed_shaders.py">
       <Filter>Shader Files</Filter>
     </None>
@@ -85,6 +100,9 @@
     <None Include="..\src\shaders\refine_pass.comp">
       <Filter>Shader Files</Filter>
     </None>
+    <None Include="..\src\shaders\refine_qpel.comp">
+      <Filter>Shader Files</Filter>
+    </None>
     <None Include="..\src\shaders\seed_build.comp">
       <Filter>Shader Files</Filter>
     </None>
@@ -92,6 +110,12 @@
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\super.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\super_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\super_qpel.comp">
       <Filter>Shader Files</Filter>
     </None>
   </ItemGroup>

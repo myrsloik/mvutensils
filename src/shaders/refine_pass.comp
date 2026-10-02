@@ -57,7 +57,7 @@ void main() {
     }
     int nbs[4] = int[4](bx > 0 ? b - 1 : -1, bx + 1 < pc.nbx ? b + 1 : -1, by > 0 ? b - pc.nbx : -1, by + 1 < pc.nby ? b + pc.nbx : -1);
     if (live && sub < 4 && nbs[sub] >= 0) {
-        ivec2 v = ClampVec(vecA[nbs[sub]]);
+        ivec2 v = ClampHalf(vecA[nbs[sub]]);
         int s = LaneSad(v);
         uint64_t key = CandidateKey(Cost(s, v, p, lambda), count + sub);
         if (key < mine) {
@@ -76,9 +76,9 @@ void main() {
         bestSad = ws;
     }
 
-    // The 8 positions one pixel around the winner
+    // The 8 positions one pixel around the winner, on the half-pel grid
     ivec2 c0 = best;
-    ivec2 v = ClampVec(c0 + Around(sub, 2));
+    ivec2 v = ClampHalf(c0 + Around(sub, kPel));
     int s = live ? LaneSad(v) : 0;
     win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
     owner = KeyLane(win);

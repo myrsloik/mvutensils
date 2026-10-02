@@ -1,0 +1,106 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "degrain_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// mvu.Degrain's DegrainWeight, 256 (1 - r^2) / (1 + r^2) truncated with r = sad / th in double
+// precision: exactly floor(256 (th^2 - sad^2) / (th^2 + sad^2)). The double's error is far below
+// the distance of that fraction from an integer, which is one only at sad 0, so both truncate alike
+// (for every th below 2^20 provably, and by an exhaustive check up to 6000 and 2 * 10^8 samples to
+// 2^31). The 8 quotient bits come by long division: the numerator stays below 2^64.
+uint Weight(int th, int sad) {
+    if (sad >= th)
+        return 0u;
+    if (sad == 0)
+        return 256u;
+    uint64_t t2 = uint64_t(th) * uint64_t(th), s2 = uint64_t(sad) * uint64_t(sad);
+    uint64_t num = t2 - s2, den = t2 + s2;
+    uint q = 0u;
+    for (int i = 0; i < 8; ++i) {
+        num <<= 1;
+        q <<= 1u;
+        if (num >= den) {
+            num -= den;
+            q |= 1u;
+        }
+    }
+    return q;
+}
+
+// normaliseWeights' share of a weighted reference weight a of the total s, int(a * (256.0 / s))
+// in double precision, for 0 <= a < s, exactly. Where 256 a / s isn't an integer, the double's
+// error can't reach the next integer, so it truncates to the quotient. Where it is one, q, the
+// result is q or q - 1, depending on how 256 / s and the product round: c = 256 / s rounded to
+// 53 bits is m * 2^-K, computed by long division, and a * c falls short of q by D * 2^-K. The product
+// rounds to q unless it lies more than half the gap below q away (q's own mantissa is even, so a
+// tie goes to q).
+uint Normalised(uint a, uint s) {
+    if (a == 0u)
+        return 0u;
+    uint q;
+    bool divides;
+    if (a < (1u << 24u)) {
+        uint num = a << 8u;
+        q = num / s;
+        divides = num % s == 0u;
+    } else {
+        uint64_t num = uint64_t(a) << 8u;
+        q = uint(num / uint64_t(s));
+        divides = num % uint64_t(s) == 0ul;
+    }
+    if (!divides || (s & (s - 1u)) == 0u)
+        return q; // inexact, or 256 / s itself exact
+    int L = findMSB(s) + 1, K = 44 + L;
+    uint64_t A = 1ul << uint(20 + L);
+    uint64_t qa = A / uint64_t(s), ra = A % uint64_t(s);
+    uint64_t hi = ra << 32u;
+    uint64_t m = (qa << 32u) + hi / uint64_t(s), rem = hi % uint64_t(s);
+    if (2ul * rem > uint64_t(s) || (2ul * rem == uint64_t(s) && (m & 1ul) != 0ul))
+        ++m;
+    if (m == (1ul << 53u)) {
+        m = 1ul << 52u;
+        --K;
+    }
+    uint64_t qK = K >= 64 ? 0ul : (uint64_t(q) << uint(K));
+    int64_t D = int64_t(qK - uint64_t(a) * m); // |D| <= a / 2, exact despite the wrap
+    if (D <= 0l)
+        return q;
+    int texp = K + findMSB(q) - 53 - ((q & (q - 1u)) == 0u ? 1 : 0);
+    if (texp < 0)
+        return q - 1u;
+    return D > (1l << uint(texp)) ? q - 1u : q;
+}
+
+// Every block's weights, mvu.Degrain's useBlock and normaliseWeights for luma and for chroma: each
+// reference's weight from its SAD and thsad, zero for a reference without vectors, out of the clip
+// or at a scene change; scaled by the user weights and normalised so that with the centre's they
+// add up to 256. Writes meta (degrain_common.glsl). Lane per block, dispatched as (nb + 63) / 64
+// workgroups.
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= pc.nb)
+        return;
+    int bx = b % pc.nbx, by = b / pc.nbx;
+    int totalL = 256 * tables[pc.uwOff] + 1, totalC = totalL;
+    for (int r = 0; r < pc.refs; ++r) {
+        if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
+            int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
+            totalL += int(Weight(tables[pc.thOff + r], sad)) * uw;
+            totalC += int(Weight(tables[pc.thOff + pc.refs + r], sad)) * uw;
+        }
+    }
+    int centreL = 256, centreC = 256;
+    for (int r = 0; r < pc.refs; ++r) {
+        uint wl = 0u, wc = 0u;
+        if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
+            int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
+            wl = Normalised(Weight(tables[pc.thOff + r], sad) * uint(uw), uint(totalL));
+            wc = Normalised(Weight(tables[pc.thOff + pc.refs + r], sad) * uint(uw), uint(totalC));
+        }
+        centreL -= int(wl);
+        centreC -= int(wc);
+        meta[(1 + r) * pc.nb + b] = wl | (wc << 16u);
+    }
+    meta[b] = uint(max(centreL, 0)) | (uint(max(centreC, 0)) << 16u);
+}

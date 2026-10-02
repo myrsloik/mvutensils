@@ -1,0 +1,164 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "super_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// pel 4: a chroma plane's quarter-pel image (SuperLayout.h), whole, from the frame, holding exactly
+// mvu.Super's sixteen planes (SuperPyramid.cpp's CopyAndPadPlane, GeneratePelPlanes and
+// GeneratePelQuarters, whatever sharp): the padded full-pel samples, the half-pel ones by the sharp
+// filter as super.comp makes luma's (the diagonal from the y + 1/2 samples, or bilinear from the
+// full-pel ones), and every quarter sample the rounded average of two neighbours on the half-pel
+// grid, the diagonal ones of two vertical averages. Written at binding 2, U's image then V's, its
+// rows 4 pc.wc samples apart, 4 pc.hc rows each. Chroma is materialized at pel 4 while luma isn't:
+// with the luma vectors on the half-pel grid until the quarter-pel step, chroma, at half the
+// resolution, lands between that grid's samples wherever a luma vector has a half pel, and
+// computing those in every pass cost more than storing them. The last column's x + 3/4 samples and
+// the last row's y + 3/4 samples, which mvu leaves unset, get what the clamped reads give; no
+// vector reaches them.
+//
+// A workgroup makes a row y of 256 pixels: it reads the padded full-pel rows y - 2 .. y + 3 around
+// them from the frame into shared memory, makes row y's y + 1/2 samples there, and each lane makes
+// the sixteen samples of 4 pixels 64 apart, writing the image's 4 rows of them whole, a group of four
+// per pixel and row, so that the lanes read neighbouring shared samples and write neighbouring
+// groups. It reads only the frame, so nothing it writes is read meanwhile. The plane (U, V) in z;
+// dispatched as ((W + 255) / 256, H, 2) with W x H the padded chroma size.
+
+const int kCols = 264;       // the shared columns: x0 - 4 .. x0 + 259, the row's 256 pixels and the filters' reach
+shared uint sFull[6][kCols]; // the padded full-pel rows y - 2 .. y + 3, clamped to the plane, as sample bits
+shared uint sV[kCols];       // row y's y + 1/2 samples
+
+int gW, gH; // the padded plane
+uint gBase; // its image
+
+// Shared row r, sFull's 0 .. 5 (y - 2 .. y + 3) or sV as 6, at shared column i
+int SI(int r, int i) {
+    return int(r == 6 ? sV[i] : sFull[r][i]);
+}
+float SF(int r, int i) {
+    return uintBitsToFloat(r == 6 ? sV[i] : sFull[r][i]);
+}
+
+// The horizontal filter of shared row r at shared column i, plane column c
+int HorizontalI(int r, int i, int c) {
+    int mode = Mode(c, gW);
+    if (mode == 0)
+        return SI(r, i);
+    if (mode == 1)
+        return AvgI(SI(r, i), SI(r, i + 1));
+    if (pc.sharp == 1)
+        return BicubicI(SI(r, i - 1), SI(r, i), SI(r, i + 1), SI(r, i + 2));
+    return WienerI(SI(r, i - 2), SI(r, i - 1), SI(r, i), SI(r, i + 1), SI(r, i + 2), SI(r, i + 3));
+}
+float HorizontalF(int r, int i, int c) {
+    int mode = Mode(c, gW);
+    if (mode == 0)
+        return SF(r, i);
+    if (mode == 1)
+        return AvgF(SF(r, i), SF(r, i + 1));
+    if (pc.sharp == 1)
+        return BicubicF(SF(r, i - 1), SF(r, i), SF(r, i + 1), SF(r, i + 2));
+    return WienerF(SF(r, i - 2), SF(r, i - 1), SF(r, i), SF(r, i + 1), SF(r, i + 2), SF(r, i + 3));
+}
+
+// The vertical one at shared column i for row y
+int VerticalI(int i, int y) {
+    int mode = Mode(y, gH);
+    if (mode == 0)
+        return SI(2, i);
+    if (mode == 1)
+        return AvgI(SI(2, i), SI(3, i));
+    if (pc.sharp == 1)
+        return BicubicI(SI(1, i), SI(2, i), SI(3, i), SI(4, i));
+    return WienerI(SI(0, i), SI(1, i), SI(2, i), SI(3, i), SI(4, i), SI(5, i));
+}
+float VerticalF(int i, int y) {
+    int mode = Mode(y, gH);
+    if (mode == 0)
+        return SF(2, i);
+    if (mode == 1)
+        return AvgF(SF(2, i), SF(3, i));
+    if (pc.sharp == 1)
+        return BicubicF(SF(1, i), SF(2, i), SF(3, i), SF(4, i));
+    return WienerF(SF(0, i), SF(1, i), SF(2, i), SF(3, i), SF(4, i), SF(5, i));
+}
+
+// DiagonalBilinear (sharp 0) at shared column i, plane column c, of row y: the average of four, of
+// two along the last column and the last row, the last sample copied
+int DiagonalI(int i, int c, int y) {
+    bool right = c >= gW - 1, bottom = y == gH - 1;
+    int s = SI(2, i), sx = SI(2, i + 1), t = SI(3, i), tx = SI(3, i + 1);
+    if (right && bottom)
+        return s;
+    if (bottom)
+        return AvgI(s, sx);
+    if (right)
+        return AvgI(s, t);
+    return Avg4I(s, sx, t, tx);
+}
+float DiagonalF(int i, int c, int y) {
+    bool right = c >= gW - 1, bottom = y == gH - 1;
+    float s = SF(2, i), sx = SF(2, i + 1), t = SF(3, i), tx = SF(3, i + 1);
+    if (right && bottom)
+        return s;
+    if (bottom)
+        return AvgF(s, sx);
+    if (right)
+        return AvgF(s, t);
+    return Avg4F(s, sx, t, tx);
+}
+
+// The group of quarter samples (0 .. 3, fy) of pixel x of row y
+uint Row(int fy, int x, int y) {
+    return (gBase + uint((4 * y + fy) * 4 * pc.wc + 4 * x)) >> 2u;
+}
+
+void main() {
+    int z = int(gl_WorkGroupID.z), lane = int(gl_LocalInvocationID.x);
+    gW = pc.aw / pc.xr + 2 * pc.padcX;
+    gH = pc.ah / pc.yr + 2 * pc.padcY;
+    gBase = uint(z) * 16u * uint(pc.wc * pc.hc);
+    int x0 = int(gl_WorkGroupID.x) * 256, y = int(gl_WorkGroupID.y);
+    // The padded full-pel rows, as super.comp's step 0 makes them: the frame's samples these
+    // positions repeat (columns past the plane's get its last, and the filters never use them)
+    int raw = z == 0 ? kRawU : kRawV, realW = pc.w / pc.xr, realH = pc.h / pc.yr;
+    for (int t = lane; t < 6 * kCols; t += 64) {
+        int r = t / kCols, i = t % kCols;
+        int sy = clamp(clamp(y - 2 + r, 0, gH - 1) - pc.padcY, 0, realH - 1), sx = clamp(x0 - 4 + i - pc.padcX, 0, realW - 1);
+        uint at = uint(sy * pc.srcStrideC + sx);
+        sFull[r][i] = kFloat ? floatBitsToUint(GetF(raw, at)) : uint(GetI(raw, at));
+    }
+    barrier();
+    for (int i = lane; i < kCols; i += 64)
+        sV[i] = kFloat ? floatBitsToUint(VerticalF(i, y)) : uint(VerticalI(i, y));
+    barrier();
+    if (y >= gH)
+        return;
+    // Each pixel's half-pel samples: p0 full-pel, p2 x + 1/2, p8 y + 1/2, p10 both, the next row's
+    // (n, its row clamped) and the next pixel's (x), then its sixteen samples, rows fy = 0 .. 3 of
+    // phases fx = 0 .. 3
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        int c = x0 + lane + 64 * k, i = 4 + lane + 64 * k;
+        if (c >= gW)
+            continue;
+        if (kFloat) {
+            float p0 = SF(2, i), p2 = HorizontalF(2, i, c), p8 = SF(6, i), p10 = pc.sharp == 0 ? DiagonalF(i, c, y) : HorizontalF(6, i, c);
+            float p0n = SF(3, i), p2n = HorizontalF(3, i, c), p0x = SF(2, i + 1), p8x = SF(6, i + 1), p0nx = SF(3, i + 1);
+            float d4 = AvgF(p0, p8), d6 = AvgF(p2, p10), d4x = AvgF(p0x, p8x);
+            float d12 = AvgF(p0n, p8), d14 = AvgF(p2n, p10), d12x = AvgF(p0nx, p8x);
+            Put4F(kChroma, Row(0, c, y), vec4(p0, AvgF(p0, p2), p2, AvgF(p0x, p2)));
+            Put4F(kChroma, Row(1, c, y), vec4(d4, AvgF(d4, d6), d6, AvgF(d4x, d6)));
+            Put4F(kChroma, Row(2, c, y), vec4(p8, AvgF(p8, p10), p10, AvgF(p8x, p10)));
+            Put4F(kChroma, Row(3, c, y), vec4(d12, AvgF(d12, d14), d14, AvgF(d12x, d14)));
+        } else {
+            int p0 = SI(2, i), p2 = HorizontalI(2, i, c), p8 = SI(6, i), p10 = pc.sharp == 0 ? DiagonalI(i, c, y) : HorizontalI(6, i, c);
+            int p0n = SI(3, i), p2n = HorizontalI(3, i, c), p0x = SI(2, i + 1), p8x = SI(6, i + 1), p0nx = SI(3, i + 1);
+            int d4 = AvgI(p0, p8), d6 = AvgI(p2, p10), d4x = AvgI(p0x, p8x);
+            int d12 = AvgI(p0n, p8), d14 = AvgI(p2n, p10), d12x = AvgI(p0nx, p8x);
+            Put4I(kChroma, Row(0, c, y), ivec4(p0, AvgI(p0, p2), p2, AvgI(p0x, p2)));
+            Put4I(kChroma, Row(1, c, y), ivec4(d4, AvgI(d4, d6), d6, AvgI(d4x, d6)));
+            Put4I(kChroma, Row(2, c, y), ivec4(p8, AvgI(p8, p10), p10, AvgI(p8x, p10)));
+            Put4I(kChroma, Row(3, c, y), ivec4(d12, AvgI(d12, d14), d14, AvgI(d12x, d14)));
+        }
+    }
+}

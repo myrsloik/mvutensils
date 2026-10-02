@@ -1,0 +1,21 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "degrain_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// The scene change test's count: for every reference with vectors, its blocks whose SAD is above
+// thscd1 (MotionBlockLevel::IsSceneChange), added up into counts[r], which starts at zero. Lane per
+// block, the reference in y. Dispatched as ((nb + 63) / 64, refs) workgroups.
+void main() {
+    int r = int(gl_WorkGroupID.y);
+    if (!Usable(r))
+        return;
+    int b = int(gl_GlobalInvocationID.x);
+    uint changed = 0u;
+    if (b < pc.nb)
+        changed = Record(r, b % pc.nbx, b / pc.nbx).z > pc.thscd1 ? 1u : 0u;
+    uint sum = subgroupAdd(changed);
+    if (subgroupElect() && sum != 0u)
+        atomicAdd(counts[r], sum);
+}

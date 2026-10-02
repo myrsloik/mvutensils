@@ -1,6 +1,8 @@
 #include "VulkanContext.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -13,6 +15,7 @@ namespace {
 const char *KernelFile(Kernel kernel) {
     switch (kernel) {
     case Kernel::Super: return "super.comp";
+    case Kernel::SuperQuarter: return "super_qpel.comp";
     case Kernel::PyrReduce: return "pyr_reduce.comp";
     case Kernel::PyrTop: return "pyr_top.comp";
     case Kernel::PyrPass: return "pyr_pass.comp";
@@ -26,8 +29,29 @@ const char *KernelFile(Kernel kernel) {
     case Kernel::RefineFallback: return "refine_fallback.comp";
     case Kernel::RefineApply: return "refine_apply.comp";
     case Kernel::RefineHalfpel: return "refine_halfpel.comp";
+    case Kernel::RefineQuarter: return "refine_qpel.comp";
+    case Kernel::DegrainCount: return "degrain_count.comp";
+    case Kernel::DegrainWeights: return "degrain_weights.comp";
+    case Kernel::DegrainPixels: return "degrain.comp";
     }
     return "";
+}
+
+// The coarse search's kernels and Degrain's have their own layouts
+Layout KernelLayout(Kernel kernel) {
+    switch (kernel) {
+    case Kernel::PyrTop:
+    case Kernel::PyrPass:
+    case Kernel::PyrSeed:
+    case Kernel::Median:
+        return Layout::Coarse;
+    case Kernel::DegrainCount:
+    case Kernel::DegrainWeights:
+    case Kernel::DegrainPixels:
+        return Layout::Degrain;
+    default:
+        return Layout::Main;
+    }
 }
 
 const char *FindSource(const std::string &name) {
@@ -115,8 +139,27 @@ VulkanContext::VulkanContext(VSCore *core, const VSAPI *vsapi) : core(core) {
     medianLanes -= medianLanes % subgroup;
     if (medianLanes < subgroup * kFallbackSubgroups)
         throw std::runtime_error(deviceName + " can't run workgroups of " + std::to_string(subgroup * kFallbackSubgroups) + " lanes");
-    if (p14.maxPushDescriptors < kBindings)
-        throw std::runtime_error(deviceName + " pushes fewer than " + std::to_string(kBindings) + " descriptors");
+    // Main: every binding once; coarse: bindings 16 .. 22, the reference pyramids (17) kMaxBatch times
+    for (uint32_t i = 0; i < kBindings; ++i)
+        bindings[static_cast<int>(Layout::Main)].push_back({i, 1});
+    for (uint32_t i = kCurPyramid; i <= kMedians; ++i)
+        bindings[static_cast<int>(Layout::Coarse)].push_back({i, i == kRefPyramid ? kMaxBatch : 1u});
+    for (Layout pushed : {Layout::Main, Layout::Coarse}) {
+        uint32_t count = 0;
+        for (const auto &[binding, n] : bindings[static_cast<int>(pushed)])
+            count += n;
+        if (p14.maxPushDescriptors < count)
+            throw std::runtime_error(deviceName + " pushes fewer than " + std::to_string(count) + " descriptors");
+    }
+    // Degrain: the output planes 3 times, each reference's buffers kMaxDegrainRefs times
+    for (uint32_t i = 0; i < kDgBindings; ++i)
+        bindings[static_cast<int>(Layout::Degrain)].push_back({i, i == kDgOut ? 3u : i >= kDgRefLuma ? static_cast<uint32_t>(kMaxDegrainRefs) : 1u});
+    uint32_t degrainCount = 0;
+    for (const auto &[binding, n] : bindings[static_cast<int>(Layout::Degrain)])
+        degrainCount += n;
+    if (limits.maxPerStageDescriptorStorageBuffers < degrainCount || limits.maxDescriptorSetStorageBuffers < degrainCount ||
+        limits.maxPerStageResources < degrainCount)
+        degrainError = deviceName + " binds fewer than " + std::to_string(degrainCount) + " storage buffers to a kernel, which Degrain needs";
 
     // The core enables these where the device has them; the kernels need them
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -127,37 +170,62 @@ VulkanContext::VulkanContext(VSCore *core, const VSAPI *vsapi) : core(core) {
     if (!f12.shaderBufferInt64Atomics)
         throw std::runtime_error(deviceName + " lacks 64-bit buffer atomics");
 
-    VkDescriptorSetLayoutBinding bindings[kBindings];
-    for (uint32_t i = 0; i < kBindings; ++i)
-        bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
-    dslci.bindingCount = kBindings;
-    dslci.pBindings = bindings;
-    if (vk->vkCreateDescriptorSetLayout(device, &dslci, nullptr, &setLayout) != VK_SUCCESS)
-        throw std::runtime_error("vkCreateDescriptorSetLayout failed");
-    const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params)};
-    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &setLayout;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges = &range;
-    if (vk->vkCreatePipelineLayout(device, &plci, nullptr, &layout) != VK_SUCCESS) {
-        vk->vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
-        throw std::runtime_error("vkCreatePipelineLayout failed");
+    for (int l = 0; l < kLayouts; ++l) {
+        const bool degrain = l == static_cast<int>(Layout::Degrain);
+        if (degrain && !degrainError.empty())
+            continue;
+        std::vector<VkDescriptorSetLayoutBinding> list;
+        for (const auto &[binding, count] : bindings[l])
+            list.push_back({binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+        VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslci.flags = degrain ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+        dslci.bindingCount = static_cast<uint32_t>(list.size());
+        dslci.pBindings = list.data();
+        if (vk->vkCreateDescriptorSetLayout(device, &dslci, nullptr, &setLayouts[l]) != VK_SUCCESS) {
+            Destroy();
+            throw std::runtime_error("vkCreateDescriptorSetLayout failed");
+        }
+        const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, degrain ? static_cast<uint32_t>(sizeof(DegrainParams)) : static_cast<uint32_t>(sizeof(Params))};
+        VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &setLayouts[l];
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &range;
+        if (vk->vkCreatePipelineLayout(device, &plci, nullptr, &layouts[l]) != VK_SUCCESS) {
+            Destroy();
+            throw std::runtime_error("vkCreatePipelineLayout failed");
+        }
+    }
+}
+
+void VulkanContext::Destroy() {
+    for (const auto &[key, pipeline] : pipelines)
+        vk->vkDestroyPipeline(device, pipeline, nullptr);
+    pipelines.clear();
+    for (int l = 0; l < kLayouts; ++l) {
+        if (layouts[l])
+            vk->vkDestroyPipelineLayout(device, layouts[l], nullptr);
+        if (setLayouts[l])
+            vk->vkDestroyDescriptorSetLayout(device, setLayouts[l], nullptr);
+        layouts[l] = VK_NULL_HANDLE;
+        setLayouts[l] = VK_NULL_HANDLE;
     }
 }
 
 VulkanContext::~VulkanContext() {
-    for (const auto &[key, pipeline] : pipelines)
-        vk->vkDestroyPipeline(device, pipeline, nullptr);
-    vk->vkDestroyPipelineLayout(device, layout, nullptr);
-    vk->vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+    Destroy();
 }
 
-VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk) {
+void VulkanContext::RequireDegrain() const {
+    if (!degrainError.empty())
+        throw std::runtime_error(degrainError);
+}
+
+VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant) {
+    if (KernelLayout(kernel) == Layout::Degrain)
+        RequireDegrain();
     std::lock_guard<std::mutex> guard(lock);
-    const std::pair<int, int> key(static_cast<int>(kernel), blk);
+    const std::tuple<int, int, int, int> key(static_cast<int>(kernel), blk, pel, variant);
     if (auto it = pipelines.find(key); it != pipelines.end())
         return it->second;
 
@@ -178,11 +246,12 @@ VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk) {
         throw std::runtime_error(std::string("vkCreateShaderModule failed for ") + KernelFile(kernel));
 
     // refine_common.glsl's kSubgroup (0), the workgroup size of the kernels that spread a block over
-    // one subgroup (1), median.comp's workgroup size (2), the target grid's block size (3) and the
-    // fallback's workgroup size (4)
-    const uint32_t constants[5] = {subgroup, subgroup, medianLanes, static_cast<uint32_t>(blk), subgroup * kFallbackSubgroups};
-    const VkSpecializationMapEntry entries[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
-    const VkSpecializationInfo spec = {5, entries, sizeof(constants), constants};
+    // one subgroup (1), median.comp's workgroup size (2), the target grid's block size (3), the
+    // fallback's workgroup size (4), the vectors' units per pixel (5) and the variant (6)
+    const uint32_t constants[7] = {subgroup, subgroup, medianLanes, static_cast<uint32_t>(blk), subgroup * kFallbackSubgroups, static_cast<uint32_t>(pel),
+                                   static_cast<uint32_t>(variant)};
+    const VkSpecializationMapEntry entries[7] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}};
+    const VkSpecializationInfo spec = {7, entries, sizeof(constants), constants};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     size.requiredSubgroupSize = subgroup;
     VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -193,7 +262,7 @@ VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk) {
     cpci.stage.module = module;
     cpci.stage.pName = "main";
     cpci.stage.pSpecializationInfo = &spec;
-    cpci.layout = layout;
+    cpci.layout = PipelineLayout(KernelLayout(kernel));
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult created = vk->vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline);
     vk->vkDestroyShaderModule(device, module, nullptr);
@@ -246,49 +315,63 @@ VSGPUBuffer *VulkanContext::Upload(VSCore *core, VSGPUExecPool *pool, const void
     return buffer;
 }
 
-Recorder::Recorder(const VulkanContext &vc, VkCommandBuffer cmd, VkBuffer dummy) : vc(vc), cmd(cmd) {
-    for (VkDescriptorBufferInfo &info : infos)
-        info = {dummy, 0, VK_WHOLE_SIZE};
+Recorder::Recorder(const VulkanContext &vc, VkCommandBuffer cmd, VkBuffer dummy, Layout layout)
+    : vc(vc), cmd(cmd), layout(vc.PipelineLayout(layout)), bindings(vc.LayoutBindings(layout)) {
+    std::fill(std::begin(first), std::end(first), -1);
+    for (const auto &[binding, count] : bindings) {
+        first[binding] = static_cast<int>(infos.size());
+        infos.insert(infos.end(), count, VkDescriptorBufferInfo{dummy, 0, VK_WHOLE_SIZE});
+    }
 }
 
-void Recorder::Bind(int binding, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
-    infos[binding] = {buffer, offset, range};
+void Recorder::Bind(int binding, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range, int element) {
+    if (first[binding] < 0)
+        throw std::logic_error("binding " + std::to_string(binding) + " isn't in the recorder's layout");
+    infos[first[binding] + element] = {buffer, offset, range};
     dirty = true;
 }
 
-void Recorder::Prepare(VkPipeline pipeline, const Params &pc) {
+void Recorder::Prepare(VkPipeline pipeline, const void *pc, uint32_t size) {
     vc.vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    // Every pipeline shares the layout, so pushed descriptors stay bound across pipelines
+    // Every pipeline the recorder binds has its layout, so pushed descriptors stay bound across them
     if (dirty) {
-        VkWriteDescriptorSet writes[kBindings];
-        for (uint32_t i = 0; i < kBindings; ++i) {
-            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &infos[i];
+        std::vector<VkWriteDescriptorSet> writes;
+        for (const auto &[binding, count] : bindings) {
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstBinding = binding;
+            w.descriptorCount = count;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &infos[first[binding]];
+            writes.push_back(w);
         }
-        vc.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vc.layout, 0, kBindings, writes);
+        vc.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, static_cast<uint32_t>(writes.size()), writes.data());
         dirty = false;
     }
     VkPushConstantsInfo push = {VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO};
-    push.layout = vc.layout;
+    push.layout = layout;
     push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push.offset = 0;
-    push.size = sizeof(Params);
-    push.pValues = &pc;
+    push.size = size;
+    push.pValues = pc;
     vc.vk->vkCmdPushConstants2(cmd, &push);
 }
 
 void Recorder::Dispatch(VkPipeline pipeline, const Params &pc, uint32_t x, uint32_t y, uint32_t z) {
     if (!x || !y || !z)
         return;
-    Prepare(pipeline, pc);
+    Prepare(pipeline, &pc, sizeof(pc));
+    vc.vk->vkCmdDispatch(cmd, x, y, z);
+}
+
+void Recorder::Dispatch(VkPipeline pipeline, const SuperParams &pc, uint32_t x, uint32_t y, uint32_t z) {
+    if (!x || !y || !z)
+        return;
+    Prepare(pipeline, &pc, sizeof(pc));
     vc.vk->vkCmdDispatch(cmd, x, y, z);
 }
 
 void Recorder::DispatchIndirect(VkPipeline pipeline, const Params &pc, VkBuffer args, VkDeviceSize offset) {
-    Prepare(pipeline, pc);
+    Prepare(pipeline, &pc, sizeof(pc));
     vc.vk->vkCmdDispatchIndirect(cmd, args, offset);
 }
 
@@ -340,4 +423,55 @@ void Recorder::ComputeToTransfer() {
 void Recorder::TransferToCompute() {
     Barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}
+
+StageProfiler::StageProfiler(std::string name, std::vector<std::string> stages) : name(std::move(name)), stages(std::move(stages)), sums(this->stages.size(), 0.0) {}
+
+StageProfiler::~StageProfiler() {
+    if (!runs)
+        return;
+    double total = 0;
+    for (double s : sums)
+        total += s;
+    fprintf(stderr, "mvgpu profile, %s: %lld submissions, %.3f ms each on the GPU\n", name.c_str(), static_cast<long long>(runs), total / runs);
+    for (size_t i = 0; i < stages.size(); ++i)
+        fprintf(stderr, "  %-34s %.3f ms\n", stages[i].c_str(), sums[i] / runs);
+}
+
+bool StageProfiler::Requested() {
+    const char *v = getenv("MVGPU_PROFILE");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+VkQueryPool StageProfiler::Begin(const VulkanContext &vc, VkCommandBuffer cmd) const {
+    VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = static_cast<uint32_t>(stages.size() + 1);
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vc.vk->vkCreateQueryPool(vc.device, &qpci, nullptr, &pool) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    vc.vk->vkCmdResetQueryPool(cmd, pool, 0, qpci.queryCount);
+    vc.vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, 0);
+    return pool;
+}
+
+void StageProfiler::Stamp(const VulkanContext &vc, VkCommandBuffer cmd, VkQueryPool pool, int stage) const {
+    if (pool)
+        vc.vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, static_cast<uint32_t>(stage));
+}
+
+void StageProfiler::Finish(const VulkanContext &vc, VSGPUExecPool *execPool, uint64_t signaled, VkQueryPool pool) {
+    if (!pool)
+        return;
+    char err[256] = {};
+    if (vc.vkapi->gpuExecWaitValue(execPool, signaled, err, sizeof(err)) == gdDrained) {
+        std::vector<uint64_t> ts(stages.size() + 1);
+        if (vc.vk->vkGetQueryPoolResults(vc.device, pool, 0, static_cast<uint32_t>(ts.size()), ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            std::lock_guard<std::mutex> guard(lock);
+            for (size_t i = 0; i < stages.size(); ++i)
+                sums[i] += (ts[i + 1] - ts[i]) * vc.limits.timestampPeriod * 1e-6;
+            ++runs;
+        }
+    }
+    vc.vk->vkDestroyQueryPool(vc.device, pool, nullptr);
 }

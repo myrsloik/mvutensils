@@ -1,143 +1,242 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-#define NO_BLOCK_CACHE
-#define SUPER_BUILD
-#include "refine_common.glsl"
+#include "super_common.glsl"
 
 layout(local_size_x = 64) in;
 
-// The frame as it arrives, 8-bit 4:2:0: its Y, U and V planes, rows pc.srcStrideY and
-// pc.srcStrideC bytes apart
-layout(std430, set = 0, binding = 29) readonly buffer RawY { uint8_t rawY[]; };
-layout(std430, set = 0, binding = 30) readonly buffer RawU { uint8_t rawU[]; };
-layout(std430, set = 0, binding = 31) readonly buffer RawV { uint8_t rawV[]; };
+// A frame's level-0 super planes built on the GPU exactly as mvu.Super builds them
+// (SuperPyramid.cpp's CopyAndPadPlane, GeneratePelPlanes and SetExternalPelPlanes), in the layout
+// SuperLayout.h gives: per plane (Y at binding 0, U then V at binding 2) its sub-pel planes, rows
+// pc.wp or pc.wc samples apart, pc.hp or pc.hc rows each. Step pc.step:
+//
+// 0: the full-pel planes from the frame: extended to the block-aligned size the grid covers, then
+//    padded, edges repeated, the rows below the frame copies of its last row;
+// 1: the x + 1/2 and y + 1/2 planes from them by the sharp filter (bilinear, bicubic or Wiener)
+//    over the padded plane, averages and copies near its edges;
+// 2: the diagonal plane: the bilinear one from the full-pel plane, the others with the horizontal
+//    filter across the y + 1/2 plane;
+// 3: with a pelclip (pel 2 only, Super.cpp), the three half-pel planes from it instead, its
+//    frame's area extended and padded the same way (SetExtPel2, PadPlaneData).
+//
+// At pel 4 luma keeps its four planes, its quarter samples computed where they're read, and
+// super_qpel.comp makes chroma's quarter-pel image whole, from the frame, so Super.cpp dispatches
+// luma alone. Each lane makes 4 samples of a row, read and written as groups of four
+// (super_common.glsl; rows start on groups, the last group of a row may run into the row's
+// alignment, which nothing reads, and the frames' spare row takes the reads past the last one), 256
+// samples of a row per workgroup, the plane (Y, U, V) in z; dispatched as ((W + 255) / 256, H,
+// planes) with W x H the padded luma size.
 
-// A frame's level-0 super planes built on the GPU, exactly as mvu.Super builds them at pel 2 with
-// sharp=2 (SuperPyramid.cpp's CopyAndPadPlane and GeneratePelPlanes, the CPU reference's MakePlane):
-// the frame extended to the block-aligned size the grid covers and padded by pad on every side,
-// edges repeated, then the x + 1/2, y + 1/2 and diagonal planes by the Wiener filter over the
-// padded plane, averages near its edges. Written in the layout the kernels read: per plane (Y at
-// binding 0, U then V at binding 2) the full-pel plane and the three half-pel planes, rows pc.wp
-// or pc.wc bytes apart, pc.hp or pc.hc rows. Step pc.level: 0 the full-pel planes from the raw
-// frame; 1 the x + 1/2 and y + 1/2 planes from them; 2 the diagonal plane from the y + 1/2 plane.
-// Each lane makes 4 pixels of a row, read and written as whole words (rows start on whole words;
-// the last word of a row may run into the row's padding, which nothing reads), 256 pixels of a row
-// per workgroup, the plane (Y, U, V) in z; dispatched as ((W + 255) / 256, H, 3) with W x H the
-// padded luma size.
+int gBuf;           // the plane's storage: kLuma or kChroma
+int gW, gH;         // the padded plane
+int gStride;        // rows apart, samples
+uint gPlaneSize;    // sub-pel planes apart
+uint gBase;         // where its first sub-pel plane starts
+int gPadX, gPadY;   // its padding
+int gRealW, gRealH; // the frame's plane
+int gRaw, gPelBuf;  // the frame's and the pelclip's plane, as buffers
+int gRawStride, gPelStride;
 
-int gW, gH;               // the plane's padded size
-int gStride, gPlaneBytes; // its rows apart, and its sub-planes apart, in bytes
-int gBase;                // where its full-pel plane starts in its buffer
-
-uint Word(int i, int x, int y) { // the word holding pixels x .. x + 3 of row y of sub-plane i, x a multiple of 4
-    int at = (gBase + i * gPlaneBytes + y * gStride + x) >> 2;
-    return gl_WorkGroupID.z == 0u ? curYW[at] : curCW[at];
+// The group of samples x .. x + 3 of row y of sub-pel plane slot (0 full-pel, 1 x + 1/2,
+// 2 y + 1/2, 3 both), x a multiple of 4
+uint Group(int slot, int x, int y) {
+    return (gBase + uint(slot) * gPlaneSize + uint(y * gStride + x)) >> 2u;
 }
 
-void PutWord(int i, int x, int y, uint v) {
-    int at = (gBase + i * gPlaneBytes + y * gStride + x) >> 2;
-    if (gl_WorkGroupID.z == 0u)
-        curYW[at] = v;
-    else
-        curCW[at] = v;
+// Sample j of the 12 a, b, c hold, x - 4 .. x + 7 (j a constant once unrolled)
+int WI(ivec4 a, ivec4 b, ivec4 c, int j) {
+    return j < 4 ? a[j] : j < 8 ? b[j - 4] : c[j - 8];
+}
+float WF(vec4 a, vec4 b, vec4 c, int j) {
+    return j < 4 ? a[j] : j < 8 ? b[j - 4] : c[j - 8];
 }
 
-uint Byte(uint w, int k) {
-    return bitfieldExtract(w, 8 * k, 8);
-}
-
-uint Avg(uint a, uint b) {
-    return (a + b + 1u) >> 1u;
-}
-
-uint Wiener(uint m0, uint m1, uint m2, uint m3, uint m4, uint m5) {
-    int m = ((int(m2 + m3) * 4 - int(m1 + m4)) * 5 + int(m0 + m5) + 16) >> 5;
-    return uint(clamp(m, 0, 255));
-}
-
-// SuperPyramid.cpp's HorizontalWiener of sub-plane i at pixels x .. x + 3 of row y, packed. s[j]
-// holds pixel x - 4 + j of the row; the words past either end of a row are read but not used.
-uint HorizontalWiener4(int i, int x, int y) {
-    uint w0 = x >= 4 ? Word(i, x - 4, y) : 0u, w1 = Word(i, x, y), w2 = Word(i, x + 4, y);
-    uint s[12];
-    [[unroll]] for (int k = 0; k < 4; ++k) {
-        s[k] = Byte(w0, k);
-        s[4 + k] = Byte(w1, k);
-        s[8 + k] = Byte(w2, k);
+// The horizontal filter of sub-pel plane src's row y at samples x .. x + 3, into plane dst
+void Horizontal(int src, int dst, int x, int y) {
+    if (kFloat) {
+        vec4 a = x >= 4 ? Get4F(gBuf, Group(src, x - 4, y)) : vec4(0.0), b = Get4F(gBuf, Group(src, x, y)), c = Get4F(gBuf, Group(src, x + 4, y));
+        vec4 r;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            int j = 4 + k, mode = Mode(x + k, gW);
+            if (mode == 0)
+                r[k] = WF(a, b, c, j);
+            else if (mode == 1)
+                r[k] = AvgF(WF(a, b, c, j), WF(a, b, c, j + 1));
+            else if (pc.sharp == 1)
+                r[k] = BicubicF(WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2));
+            else
+                r[k] = WienerF(WF(a, b, c, j - 2), WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2), WF(a, b, c, j + 3));
+        }
+        Put4F(gBuf, Group(dst, x, y), r);
+    } else {
+        ivec4 a = x >= 4 ? Get4I(gBuf, Group(src, x - 4, y)) : ivec4(0), b = Get4I(gBuf, Group(src, x, y)), c = Get4I(gBuf, Group(src, x + 4, y));
+        ivec4 r;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            int j = 4 + k, mode = Mode(x + k, gW);
+            if (mode == 0)
+                r[k] = WI(a, b, c, j);
+            else if (mode == 1)
+                r[k] = AvgI(WI(a, b, c, j), WI(a, b, c, j + 1));
+            else if (pc.sharp == 1)
+                r[k] = BicubicI(WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2));
+            else
+                r[k] = WienerI(WI(a, b, c, j - 2), WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2), WI(a, b, c, j + 3));
+        }
+        Put4I(gBuf, Group(dst, x, y), r);
     }
-    uint word = 0u;
-    [[unroll]] for (int k = 0; k < 4; ++k) {
-        int xo = x + k, j = 4 + k;
-        uint v;
-        if (xo < 2 || (xo >= gW - 4 && xo < gW - 1))
-            v = Avg(s[j], s[j + 1]);
-        else if (xo == gW - 1)
-            v = s[j];
-        else
-            v = Wiener(s[j - 2], s[j - 1], s[j], s[j + 1], s[j + 2], s[j + 3]);
-        word |= v << (8 * k);
-    }
-    return word;
 }
 
-// And its VerticalWiener, from the words of rows y - 2 .. y + 3 holding the same 4 columns
-uint VerticalWiener4(int i, int x, int y) {
-    uint r[6];
-    [[unroll]] for (int k = 0; k < 6; ++k)
-        r[k] = Word(i, x, clamp(y - 2 + k, 0, gH - 1));
-    uint word = 0u;
-    [[unroll]] for (int k = 0; k < 4; ++k) {
-        uint v;
-        if (y < 2 || (y >= gH - 4 && y < gH - 1))
-            v = Avg(Byte(r[2], k), Byte(r[3], k));
-        else if (y == gH - 1)
-            v = Byte(r[2], k);
-        else
-            v = Wiener(Byte(r[0], k), Byte(r[1], k), Byte(r[2], k), Byte(r[3], k), Byte(r[4], k), Byte(r[5], k));
-        word |= v << (8 * k);
+// And the vertical one, from the groups of rows y - 2 .. y + 3 holding the same 4 columns
+void Vertical(int src, int dst, int x, int y) {
+    int mode = Mode(y, gH);
+    if (kFloat) {
+        vec4 r[6];
+        [[unroll]] for (int i = 0; i < 6; ++i)
+            r[i] = Get4F(gBuf, Group(src, x, clamp(y - 2 + i, 0, gH - 1)));
+        vec4 o;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            if (mode == 0)
+                o[k] = r[2][k];
+            else if (mode == 1)
+                o[k] = AvgF(r[2][k], r[3][k]);
+            else if (pc.sharp == 1)
+                o[k] = BicubicF(r[1][k], r[2][k], r[3][k], r[4][k]);
+            else
+                o[k] = WienerF(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
+        }
+        Put4F(gBuf, Group(dst, x, y), o);
+    } else {
+        ivec4 r[6];
+        [[unroll]] for (int i = 0; i < 6; ++i)
+            r[i] = Get4I(gBuf, Group(src, x, clamp(y - 2 + i, 0, gH - 1)));
+        ivec4 o;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            if (mode == 0)
+                o[k] = r[2][k];
+            else if (mode == 1)
+                o[k] = AvgI(r[2][k], r[3][k]);
+            else if (pc.sharp == 1)
+                o[k] = BicubicI(r[1][k], r[2][k], r[3][k], r[4][k]);
+            else
+                o[k] = WienerI(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
+        }
+        Put4I(gBuf, Group(dst, x, y), o);
     }
-    return word;
+}
+
+// DiagonalBilinear at samples x .. x + 3: the average of four, of two along the last column and
+// the last row, the last sample copied
+void Diagonal(int dst, int x, int y) {
+    int yn = min(y + 1, gH - 1);
+    bool bottom = y == gH - 1;
+    if (kFloat) {
+        vec4 a0 = Get4F(gBuf, Group(0, x, y)), a1 = Get4F(gBuf, Group(0, x + 4, y)), b0 = Get4F(gBuf, Group(0, x, yn)), b1 = Get4F(gBuf, Group(0, x + 4, yn));
+        vec4 o;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            float s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
+            bool right = x + k >= gW - 1;
+            if (right && bottom)
+                o[k] = s;
+            else if (bottom)
+                o[k] = AvgF(s, sx);
+            else if (right)
+                o[k] = AvgF(s, t);
+            else
+                o[k] = Avg4F(s, sx, t, tx);
+        }
+        Put4F(gBuf, Group(dst, x, y), o);
+    } else {
+        ivec4 a0 = Get4I(gBuf, Group(0, x, y)), a1 = Get4I(gBuf, Group(0, x + 4, y)), b0 = Get4I(gBuf, Group(0, x, yn)), b1 = Get4I(gBuf, Group(0, x + 4, yn));
+        ivec4 o;
+        [[unroll]] for (int k = 0; k < 4; ++k) {
+            int s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
+            bool right = x + k >= gW - 1;
+            if (right && bottom)
+                o[k] = s;
+            else if (bottom)
+                o[k] = AvgI(s, sx);
+            else if (right)
+                o[k] = AvgI(s, t);
+            else
+                o[k] = Avg4I(s, sx, t, tx);
+        }
+        Put4I(gBuf, Group(dst, x, y), o);
+    }
 }
 
 void main() {
     int z = int(gl_WorkGroupID.z);
-    int aw = (pc.nbx - 1) * pc.step + kBlk, ah = (pc.nby - 1) * pc.step + kBlk;
-    int pad, w, h;
     if (z == 0) {
-        gW = aw + 2 * pc.pad;
-        gH = ah + 2 * pc.pad;
+        gBuf = kLuma;
+        gW = pc.aw + 2 * pc.padX;
+        gH = pc.ah + 2 * pc.padY;
         gStride = pc.wp;
-        gPlaneBytes = pc.wp * pc.hp;
-        gBase = 0;
-        pad = pc.pad;
-        w = pc.w;
-        h = pc.h;
+        gPlaneSize = uint(pc.wp * pc.hp);
+        gBase = 0u;
+        gPadX = pc.padX;
+        gPadY = pc.padY;
+        gRealW = pc.w;
+        gRealH = pc.h;
+        gRaw = kRawY;
+        gPelBuf = kPelY;
+        gRawStride = pc.srcStrideY;
+        gPelStride = pc.pelStrideY;
     } else {
-        gW = aw / 2 + 2 * pc.padc;
-        gH = ah / 2 + 2 * pc.padc;
+        gBuf = kChroma;
+        gW = pc.aw / pc.xr + 2 * pc.padcX;
+        gH = pc.ah / pc.yr + 2 * pc.padcY;
         gStride = pc.wc;
-        gPlaneBytes = pc.wc * pc.hc;
-        gBase = (z - 1) * 4 * gPlaneBytes;
-        pad = pc.padc;
-        w = pc.w / 2;
-        h = pc.h / 2;
+        gPlaneSize = uint(pc.wc * pc.hc);
+        gBase = uint(z - 1) * uint(pc.chromaPlanes) * gPlaneSize;
+        gPadX = pc.padcX;
+        gPadY = pc.padcY;
+        gRealW = pc.w / pc.xr;
+        gRealH = pc.h / pc.yr;
+        gRaw = z == 1 ? kRawU : kRawV;
+        gPelBuf = z == 1 ? kPelU : kPelV;
+        gRawStride = pc.srcStrideC;
+        gPelStride = pc.pelStrideC;
     }
     int x = 4 * int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= gW || y >= gH)
         return;
-    if (pc.level == 0) {
-        int sy = clamp(y - pad, 0, h - 1);
-        uint word = 0u;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            int sx = clamp(x + k - pad, 0, w - 1);
-            uint v = z == 0 ? uint(rawY[sy * pc.srcStrideY + sx]) : z == 1 ? uint(rawU[sy * pc.srcStrideC + sx]) : uint(rawV[sy * pc.srcStrideC + sx]);
-            word |= v << (8 * k);
+    // The frame's row and samples these padded positions repeat
+    int sy = clamp(y - gPadY, 0, gRealH - 1);
+    ivec4 sx = clamp(ivec4(x) + ivec4(0, 1, 2, 3) - gPadX, 0, gRealW - 1);
+    if (pc.step == 0) {
+        if (kFloat) {
+            vec4 v;
+            [[unroll]] for (int k = 0; k < 4; ++k)
+                v[k] = GetF(gRaw, uint(sy * gRawStride + sx[k]));
+            Put4F(gBuf, Group(0, x, y), v);
+        } else {
+            ivec4 v;
+            [[unroll]] for (int k = 0; k < 4; ++k)
+                v[k] = GetI(gRaw, uint(sy * gRawStride + sx[k]));
+            Put4I(gBuf, Group(0, x, y), v);
         }
-        PutWord(0, x, y, word);
-    } else if (pc.level == 1) {
-        PutWord(1, x, y, HorizontalWiener4(0, x, y));
-        PutWord(2, x, y, VerticalWiener4(0, x, y));
+    } else if (pc.step == 1) {
+        Horizontal(0, 1, x, y);
+        Vertical(0, 2, x, y);
+    } else if (pc.step == 2) {
+        if (pc.sharp == 0)
+            Diagonal(3, x, y);
+        else
+            Horizontal(2, 3, x, y);
     } else {
-        PutWord(3, x, y, HorizontalWiener4(2, x, y));
+        // Half-pel plane fx | (fy << 1) is pelclip sample (2 sx + fx, 2 sy + fy)
+        for (int i = 1; i < 4; ++i) {
+            int row = (2 * sy + (i >> 1)) * gPelStride + (i & 1);
+            if (kFloat) {
+                vec4 v;
+                [[unroll]] for (int k = 0; k < 4; ++k)
+                    v[k] = GetF(gPelBuf, uint(row + 2 * sx[k]));
+                Put4F(gBuf, Group(i, x, y), v);
+            } else {
+                ivec4 v;
+                [[unroll]] for (int k = 0; k < 4; ++k)
+                    v[k] = GetI(gPelBuf, uint(row + 2 * sx[k]));
+                Put4I(gBuf, Group(i, x, y), v);
+            }
+        }
     }
 }
