@@ -4,14 +4,14 @@
 
 layout(local_size_x = 64) in;
 
-// pel 4: a chroma plane's quarter-pel image (SuperLayout.h), whole, from the frame, holding exactly
-// mvu.Super's sixteen planes (SuperPyramid.cpp's CopyAndPadPlane, GeneratePelPlanes and
-// GeneratePelQuarters, whatever sharp): the padded full-pel samples, the half-pel ones by the sharp
-// filter as super.comp makes luma's (the diagonal from the y + 1/2 samples, or bilinear from the
-// full-pel ones), and every quarter sample the rounded average of two neighbours on the half-pel
+// pel 4, subsampled chroma: a plane's quarter-pel image (SuperLayout.h), whole, from the frame,
+// holding exactly mvu.Super's sixteen planes (SuperPyramid.cpp's CopyAndPadPlane, GeneratePelPlanes
+// and GeneratePelQuarters, whatever sharp): the padded full-pel samples, the half-pel ones by the
+// sharp filter as super.comp makes luma's (the diagonal from the y + 1/2 samples, or bilinear from
+// the full-pel ones), and every quarter sample the rounded average of two neighbours on the half-pel
 // grid, the diagonal ones of two vertical averages. Written at binding 2, U's image then V's, its
-// rows 4 pc.wc samples apart, 4 pc.hc rows each. Chroma is materialized at pel 4 while luma isn't:
-// with the luma vectors on the half-pel grid until the quarter-pel step, chroma, at half the
+// rows 4 pc.wc samples apart, 4 pc.hc rows each. This chroma is materialized at pel 4 while luma
+// isn't: with the luma vectors on the half-pel grid until the quarter-pel step, chroma, at half the
 // resolution, lands between that grid's samples wherever a luma vector has a half pel, and
 // computing those in every pass cost more than storing them. The last column's x + 3/4 samples and
 // the last row's y + 3/4 samples, which mvu leaves unset, get what the clamped reads give; no

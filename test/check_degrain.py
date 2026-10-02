@@ -1,67 +1,30 @@
 #!/usr/bin/env python3
 """mvgpu.Degrain against mvu.Degrain, byte for byte.
 
-Both denoise the same 8-bit clip with the same vectors, mvgpu.AnalyseMany's: mvu.Degrain gets them
-on a carrier clip that holds mvgpu's analysis description under mvu's property names, so mvu never
-searches. Each side builds its super with the same settings (mvgpu.Super's planes are mvu.Super's).
-Every pixel of every frame and plane is compared.
+Both denoise the same 8-bit clip with the same vectors. By default they are mvgpu.AnalyseMany's:
+mvu.Degrain gets them on a carrier clip that holds mvgpu's analysis description under mvu's property
+names, so mvu never searches. With --vectors mvu they are mvu.Analyse's, and mvgpu.Degrain gets them
+on the frames of its super, as mvgpu.Analyse would attach them: for grids and formats mvgpu.Analyse
+doesn't search yet. Each side builds its super with the same settings (mvgpu.Super's planes are
+mvu.Super's). Every pixel of every frame and plane is compared.
 
     check_degrain.py --src noisy.nv12 --size 1920x1080 --frames 52 --pel 4 --blksize 16 --overlap 8
-                     [--radius 2] [--thsad 400 300] [--thsad2 150] [--planes 0 2] [--limit 3 2]
-                     [--thscd1 400] [--thscd2 51] [--weights 1 2 3 2 1] [--centersuper] [--crop 1914x1074]
+                     [--format YUV444P8] [--vectors mvu] [--radius 2] [--thsad 400 300] [--thsad2 150]
+                     [--planes 0 2] [--limit 3 2] [--thscd1 400] [--thscd2 51] [--weights 1 2 3 2 1]
+                     [--centersuper] [--crop 1914x1074]
 
---centersuper gives both a separate centre super, of the clip blurred, as scripts that denoise with
-the super of another clip do.
+--format converts the 8-bit 4:2:0 source first (resize.Bicubic). --centersuper gives both a separate
+centre super, of the clip blurred, as scripts that denoise with the super of another clip do.
 """
 import argparse
+import os
 import sys
 
 import numpy as np
 import vapoursynth as vs
 
-
-def nv12_clip(core, path, w, h, frames):
-    """Raw NV12 frames as a YUV420P8 clip"""
-    size = w * h * 3 // 2
-    raw = np.memmap(path, np.uint8, 'r', shape=(frames, size))
-    blank = core.std.BlankClip(width=w, height=h, format=vs.YUV420P8, length=frames)
-
-    def fill(n, f):
-        out = f.copy()
-        np.asarray(out[0])[:, :] = raw[n, :w * h].reshape(h, w)
-        uv = raw[n, w * h:].reshape(h // 2, w // 2, 2)
-        np.asarray(out[1])[:, :] = uv[:, :, 0]
-        np.asarray(out[2])[:, :] = uv[:, :, 1]
-        return out
-
-    return core.std.ModifyFrame(blank, blank, fill)
-
-
-def mvu_vectors(core, analysis, carrier, frames):
-    """mvgpu's vectors of one field clip on a CPU carrier clip, as mvu.Analyse would attach them"""
-    props = analysis.get_frame(0).props
-    desc = {k.replace('MVGPUtensils', 'MVUtensils', 1): int(props[k]) for k in props.keys()
-            if k.startswith('MVGPUtensilsAnalysis') and k != 'MVGPUtensilsAnalysisVectors'}
-    delta, nbx, nby = desc['MVUtensilsAnalysisDeltaFrame'], desc['MVUtensilsAnalysisNBlkX'], desc['MVUtensilsAnalysisNBlkY']
-    # Frames whose reference frame is outside the clip carry no vectors, and PropToClip takes its
-    # format from its first frame
-    start, end = max(0, -delta), min(frames, frames - delta)
-    records = core.std.GPUDownload(core.std.PropToClip(analysis[start:end], prop='MVGPUtensilsAnalysisVectors'))
-    vectors = {}
-    for n in range(start, end):
-        rec = np.asarray(records.get_frame(n - start)[0]).view(np.int32)[:, :4 * nbx].reshape(nby * nbx, 4)
-        packed = (rec[:, 0].astype(np.int64) & 0xFFFFFFFF) | (rec[:, 1].astype(np.int64) << 32)
-        vectors[n] = (packed.tolist(), rec[:, 2].astype(np.int64).tolist())
-    carrier = core.std.SetFrameProps(carrier, **desc)
-
-    def attach(n, f):
-        g = f.copy()
-        if n in vectors:
-            g.props['MVUtensilsAnalysisVectors'] = vectors[n][0]
-            g.props['MVUtensilsAnalysisSAD'] = vectors[n][1]
-        return g
-
-    return core.std.ModifyFrame(carrier, carrier, attach)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
+from mvtest import gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
 
 
 def main():
@@ -69,6 +32,8 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
+    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8 or YUV444P8')
+    ap.add_argument('--vectors', choices=['mvgpu', 'mvu'], default='mvgpu', help="whose vectors both sides use")
     ap.add_argument('--blksize', type=int, default=16)
     ap.add_argument('--overlap', type=int, default=8)
     ap.add_argument('--pel', type=int, default=2)
@@ -95,6 +60,8 @@ def main():
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
     clip = nv12_clip(core, args.src, w, h, args.frames)
+    if args.format != 'YUV420P8':
+        clip = core.resize.Bicubic(clip, format=getattr(vs, args.format))
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -104,9 +71,14 @@ def main():
     dk = {k: getattr(args, k) for k in ('thsad', 'thsad2', 'planes', 'limit', 'thscd1', 'thscd2', 'weights') if getattr(args, k) is not None}
 
     gsup = core.mvgpu.Super(gclip, **sk)
-    fields = core.mvgpu.AnalyseMany(gsup, radius=args.radius)
     csup = core.mvu.Super(clip, **sk)
-    cvec = [mvu_vectors(core, an, clip, args.frames) for an in fields]
+    if args.vectors == 'mvgpu':
+        fields = core.mvgpu.AnalyseMany(gsup, radius=args.radius)
+        cvec = [mvu_vectors(core, an, clip, args.frames) for an in fields]
+    else:
+        deltas = [d for r in range(1, args.radius + 1) for d in (r, -r)]
+        cvec = [core.mvu.Analyse(csup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
+        fields = [gpu_vectors(core, an, gsup) for an in cvec]
     # Degrain's supers: the analysis one, or one with the render block size and overlap
     rk = dict(sk, blksize=args.render[0], overlap=args.render[1]) if args.render else sk
     if args.render:
@@ -137,8 +109,9 @@ def main():
                     ys, xs = np.nonzero(pa != pb)
                     first = (n, p, int(xs[0]), int(ys[0]), int(pa[ys[0], xs[0]]), int(pb[ys[0], xs[0]]))
     total = args.frames * w * h
-    print(f'{args.frames} frames, {100 * changed / (total * 3 // 2):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}, '
-          f'U {differ[1]}, V {differ[2]} of {total // 4} each'
+    total_c = args.frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h)
+    print(f'{args.format} {args.frames} frames, {100 * changed / (total + 2 * total_c):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}, '
+          f'U {differ[1]}, V {differ[2]} of {total_c} each'
           + (f'; largest difference {worst}; first at frame {first[0]} plane {first[1]} ({first[2]}, {first[3]}): '
              f'mvgpu {first[4]}, mvu {first[5]}' if first else ''))
     sys.exit(0 if sum(differ) == 0 else 1)

@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "flow_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// Per block, for flow_inter.comp: the scene change test's counts of the blocks with a SAD above
+// thscd1 in each vector frame (MotionBlockLevel::IsSceneChange), and the occlusion masks of F (its
+// time pc.time256, forward) and B (256 - pc.time256, backward), mvu's MakeVectorOcclusionMask with
+// gamma 1 and the 8-bit range: where a block's right or lower neighbour moves less, the blocks the
+// difference sweeps over at that time get min(255 * difference * occnorm, 255), each block the
+// largest it gets, through atomicMax into masks zeroed before. Dispatched as ((nbx * nby + 63) / 64)
+// workgroups, only when F and B have vectors.
+
+uint OccValue(int occlusion, float occnorm) {
+    precise float t = 255.0 * float(occlusion);
+    t = t * occnorm;
+    return uint(min(t, 255.0));
+}
+
+// One vector frame's mask entries from block (bx, by) with vector v, its right neighbour's x and its
+// lower neighbour's y, at mask offset base
+void Occlusion(uint base, bool backward, ivec2 v, int vxRight, int vyBelow, int bx, int by, int t4096X, int t4096Y) {
+    if (bx < pc.nbx - 1 && vxRight < v.x) {
+        int occlusion = v.x - vxRight;
+        int reach = occlusion * t4096X / 4096;
+        int minb = backward ? max(0, bx + 1 - reach) : bx;
+        int maxb = backward ? bx + 1 : min(bx + 1 - reach, pc.nbx - 1);
+        uint value = OccValue(occlusion, pc.occnormX);
+        for (int bxi = minb; bxi <= maxb; ++bxi)
+            atomicMax(masks[base + uint(by * pc.nbx + bxi)], value);
+    }
+    if (by < pc.nby - 1 && vyBelow < v.y) {
+        int occlusion = v.y - vyBelow;
+        int reach = occlusion * t4096Y / 4096;
+        int minb = backward ? max(0, by + 1 - reach) : by;
+        int maxb = backward ? by + 1 : min(by + 1 - reach, pc.nby - 1);
+        uint value = OccValue(occlusion, pc.occnormY);
+        for (int byi = minb; byi <= maxb; ++byi)
+            atomicMax(masks[base + uint(byi * pc.nbx + bx)], value);
+    }
+}
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= pc.nbx * pc.nby)
+        return;
+    int bx = b % pc.nbx, by = b / pc.nbx;
+    int at = by * pc.recStride + bx;
+    ivec4 f = vecF[at], bw = vecB[at];
+    if (f.z > pc.thscd1)
+        atomicAdd(counts[0], 1u);
+    if (bw.z > pc.thscd1)
+        atomicAdd(counts[1], 1u);
+    if ((pc.flags & kHaveExtra) != 0) {
+        if (vecFF[at].z > pc.thscd1)
+            atomicAdd(counts[2], 1u);
+        if (vecBB[at].z > pc.thscd1)
+            atomicAdd(counts[3], 1u);
+    }
+    int right = bx < pc.nbx - 1 ? at + 1 : at, below = by < pc.nby - 1 ? at + pc.recStride : at;
+    Occlusion(0u, false, f.xy, vecF[right].x, vecF[below].y, bx, by, pc.time4096FX, pc.time4096FY);
+    Occlusion(uint(pc.nbx * pc.nby), true, bw.xy, vecB[right].x, vecB[below].y, bx, by, pc.time4096BX, pc.time4096BY);
+}

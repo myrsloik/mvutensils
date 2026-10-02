@@ -18,13 +18,13 @@ layout(local_size_x = 64) in;
 // 3: with a pelclip (pel 2 only, Super.cpp), the three half-pel planes from it instead, its
 //    frame's area extended and padded the same way (SetExtPel2, PadPlaneData).
 //
-// At pel 4 luma keeps its four planes, its quarter samples computed where they're read, and
-// super_qpel.comp makes chroma's quarter-pel image whole, from the frame, so Super.cpp dispatches
-// luma alone. Each lane makes 4 samples of a row, read and written as groups of four
-// (super_common.glsl; rows start on groups, the last group of a row may run into the row's
-// alignment, which nothing reads, and the frames' spare row takes the reads past the last one), 256
-// samples of a row per workgroup, the plane (Y, U, V) in z; dispatched as ((W + 255) / 256, H,
-// planes) with W x H the padded luma size.
+// At pel 4 luma keeps its four planes, its quarter samples computed where they're read, and so does
+// 4:4:4 chroma; subsampled chroma's quarter-pel image super_qpel.comp makes whole, from the frame,
+// and Super.cpp dispatches luma alone here. Each lane makes 4 samples of a row, read and written as
+// groups of four (super_common.glsl; rows start on groups, the last group of a row may run into the
+// row's alignment, which nothing reads, and the frames' spare row takes the reads past the last
+// one), 256 samples of a row per workgroup, the plane (Y, U, V) in z; dispatched as
+// ((W + 255) / 256, H, planes) with W x H the padded luma size.
 
 int gBuf;           // the plane's storage: kLuma or kChroma
 int gW, gH;         // the padded plane

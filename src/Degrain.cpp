@@ -30,8 +30,9 @@
 // submission completes: 2 * radius references, each with its super's two planes and its vectors,
 // don't fit a push descriptor set.
 //
-// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's 8-bit 4:2:0 supers at pel 2 and 4
-// and the vectors mvgpu.Analyse makes from them.
+// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's 8-bit 4:2:0 and 4:4:4 supers at
+// pel 2 and 4 with square blocks of 8, 16 or 32, and vectors made from them as mvgpu.Analyse makes
+// them.
 
 namespace {
 
@@ -94,57 +95,6 @@ int64_t InterpolateThSAD(int64_t thsad, int64_t thsad2, int d, int tr) {
     const double x = (d - 1) * kPi / (tr - 1);
     const double lerp = (1.0 - std::cos(x)) * 0.5;
     return static_cast<int64_t>(std::floor(thsad + lerp * static_cast<double>(thsad2 - thsad) + 0.5));
-}
-
-// A vector clip's description, as mvu.Degrain reads it from the first frame
-struct VectorInfo {
-    int width = 0, height = 0, realWidth = 0, realHeight = 0, hpad = 0, vpad = 0, pel = 0;
-    int blkX = 0, blkY = 0, overlapX = 0, overlapY = 0, nbx = 0, nby = 0;
-    int delta = 0, bits = 0, chroma = 0, xRatio = 0, yRatio = 0;
-};
-
-VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *vsapi) {
-    char err[1024] = {};
-    const VSFrame *frame = vsapi->getFrame(0, node, err, sizeof(err));
-    if (!frame)
-        throw std::runtime_error(std::string("failed to get a vector clip's first frame: ") + err);
-    const VSMap *props = vsapi->getFramePropertiesRO(frame);
-    auto get = [&](const char *name) {
-        int e = 0;
-        const int v = vsapi->mapGetIntSaturated(props, (prefix + name).c_str(), 0, &e);
-        if (e) {
-            vsapi->freeFrame(frame);
-            throw std::runtime_error(std::string("a vector clip lacks the property ") + prefix + name + "; it must come from mvgpu.Analyse with the same prefix");
-        }
-        return v;
-    };
-    VectorInfo v;
-    v.width = get("AnalysisWidth");
-    v.height = get("AnalysisHeight");
-    v.realWidth = get("AnalysisRealWidth");
-    v.realHeight = get("AnalysisRealHeight");
-    v.hpad = get("AnalysisHPad");
-    v.vpad = get("AnalysisVPad");
-    v.pel = get("AnalysisPel");
-    v.blkX = get("AnalysisBlkSizeX");
-    v.blkY = get("AnalysisBlkSizeY");
-    v.overlapX = get("AnalysisOverlapX");
-    v.overlapY = get("AnalysisOverlapY");
-    v.nbx = get("AnalysisNBlkX");
-    v.nby = get("AnalysisNBlkY");
-    v.delta = get("AnalysisDeltaFrame");
-    v.bits = get("AnalysisBitsPerSample");
-    v.chroma = get("AnalysisChroma");
-    v.xRatio = get("AnalysisXRatioUV");
-    v.yRatio = get("AnalysisYRatioUV");
-    vsapi->freeFrame(frame);
-    return v;
-}
-
-// The same level-0 storage, whatever the levels above it and the grid: the planes the kernels read
-bool SameStorage(const SuperLayout &a, const SuperLayout &b) {
-    return a.width == b.width && a.height == b.height && a.format == b.format && a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY &&
-           a.pel == b.pel;
 }
 
 // mvu's FramePyramid::IsCompatible: the same storage, padded for the same block size
@@ -634,7 +584,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
 
         d->layout = ImportSuperLayout(d->super, d->prefix, vsapi);
         const SuperLayout &L = d->layout;
-        if (const std::string unsupported = L.Unsupported(); !unsupported.empty())
+        if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
             throw std::runtime_error(unsupported);
 
         // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one (mvu's
@@ -670,7 +620,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         d->nby = first.nby;
 
         if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != 8 ||
-            d->vi.format.subSamplingW != 1 || d->vi.format.subSamplingH != 1 || d->vi.width != L.width || d->vi.height != L.height)
+            (1 << d->vi.format.subSamplingW) != L.format.xr || (1 << d->vi.format.subSamplingH) != L.format.yr || d->vi.width != L.width || d->vi.height != L.height)
             throw std::runtime_error("super clip is not compatible with the source clip");
 
         d->centreLayout = d->centerSuper ? ImportSuperLayout(d->centerSuper, d->prefix, vsapi) : L;
@@ -720,8 +670,9 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         // luma's then chroma's, and the user weights
         std::vector<int32_t> tables;
         if (d->overlap > 0) {
+            const int xr = L.format.xr, yr = L.format.yr;
             const std::vector<int32_t> lumaWin = MakeOverlapWindows(d->blk, d->blk, d->overlap, d->overlap);
-            const std::vector<int32_t> chromaWin = MakeOverlapWindows(d->blk / 2, d->blk / 2, d->overlap / 2, d->overlap / 2);
+            const std::vector<int32_t> chromaWin = MakeOverlapWindows(d->blk / xr, d->blk / yr, d->overlap / xr, d->overlap / yr);
             d->winOff[0] = static_cast<int>(tables.size());
             tables.insert(tables.end(), lumaWin.begin(), lumaWin.end());
             d->winOff[1] = static_cast<int>(tables.size());
@@ -737,9 +688,11 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
         vc.RequireDegrain();
-        d->count = vc.Pipeline(Kernel::DegrainCount, d->blk, L.pel);
-        d->weights = vc.Pipeline(Kernel::DegrainWeights, d->blk, L.pel);
-        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel);
+        // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical
+        const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
+        d->count = vc.Pipeline(Kernel::DegrainCount, d->blk, L.pel, chromaLog);
+        d->weights = vc.Pipeline(Kernel::DegrainWeights, d->blk, L.pel, chromaLog);
+        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel, chromaLog);
         const VkDeviceSize metaBytes = static_cast<VkDeviceSize>(refs + 1) * d->nbx * d->nby * 4;
         if (metaBytes > vc.limits.maxStorageBufferRange)
             throw std::runtime_error("the frame is too large for the device's storage buffers");

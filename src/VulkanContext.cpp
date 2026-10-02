@@ -33,6 +33,8 @@ const char *KernelFile(Kernel kernel) {
     case Kernel::DegrainCount: return "degrain_count.comp";
     case Kernel::DegrainWeights: return "degrain_weights.comp";
     case Kernel::DegrainPixels: return "degrain.comp";
+    case Kernel::FlowPrep: return "flow_prep.comp";
+    case Kernel::FlowInter: return "flow_inter.comp";
     }
     return "";
 }
@@ -364,6 +366,13 @@ void Recorder::Dispatch(VkPipeline pipeline, const Params &pc, uint32_t x, uint3
 }
 
 void Recorder::Dispatch(VkPipeline pipeline, const SuperParams &pc, uint32_t x, uint32_t y, uint32_t z) {
+    if (!x || !y || !z)
+        return;
+    Prepare(pipeline, &pc, sizeof(pc));
+    vc.vk->vkCmdDispatch(cmd, x, y, z);
+}
+
+void Recorder::Dispatch(VkPipeline pipeline, const FlowParams &pc, uint32_t x, uint32_t y, uint32_t z) {
     if (!x || !y || !z)
         return;
     Prepare(pipeline, &pc, sizeof(pc));

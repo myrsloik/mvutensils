@@ -62,11 +62,15 @@ layout(push_constant) uniform Params {
     int reserved0, reserved1, reserved2;
 } pc;
 
-// The grid's luma block size, 8 or 16 (specialization constant 3), and the vectors' units per
-// pixel, 2 or 4 (specialization constant 5), as the other kernels have them
+// The grid's luma block size, 8, 16 or 32 (specialization constant 3), the vectors' units per pixel,
+// 2 or 4 (specialization constant 5), as the other kernels have them, and chroma's subsampling
+// (specialization constant 6): bit 0 horizontal, bit 1 vertical, so 3 for 4:2:0 and 0 for 4:4:4
 layout(constant_id = 3) const int kBlk = 8;
 layout(constant_id = 5) const int kPel = 2;
-const int kChromaPlanes = kPel == 4 ? 16 : 4; // U's planes (at pel 4 its image), then V's as many plane sizes on
+layout(constant_id = 6) const int kChromaLog = 3;
+const int kLogX = kChromaLog & 1, kLogY = kChromaLog >> 1;
+const bool kImage = kPel == 4 && kChromaLog != 0; // subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h)
+const int kChromaPlanes = kImage ? 16 : 4;        // U's half-pel planes (or image), then V's as many plane sizes on
 
 bool Usable(int r) {
     return (((r < 32 ? pc.usable0 >> uint(r) : pc.usable1 >> uint(r - 32)) & 1u) != 0u);

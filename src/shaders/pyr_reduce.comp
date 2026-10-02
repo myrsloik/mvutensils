@@ -74,7 +74,7 @@ void main() {
         } else {
             gW = pc.w / pc.xr;
             gH = pc.h / pc.yr;
-            int image = pc.chromaPlanes == 16 ? 4 : 1; // pel 4: the image's pixels 4 apart, rows 4 * 4 wc
+            int image = pc.chromaPlanes == 16 ? 4 : 1; // subsampled at pel 4: the image's pixels 4 apart, rows 4 * 4 wc
             gStride = image * image * pc.wc;
             gStep = image;
             gBase = uint(z - 1) * uint(pc.chromaPlanes) * uint(pc.wc * pc.hc) + uint(pc.padcY * gStride + pc.padcX * gStep);

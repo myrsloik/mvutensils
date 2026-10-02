@@ -3,8 +3,8 @@
 MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's Vulkan GPU frames
 (API 4.3): every clip it takes and returns is GPU resident. The goal is a drop-in replacement for
 `mvu`, the same functions with the same arguments; so far there are `Super`, `Analyse`,
-`AnalyseMany` and `Degrain` (with `Degrain1` … `Degrain25`). The rest of this file documents
-MVUtensils, which the GPU filters follow.
+`AnalyseMany`, `Degrain` (with `Degrain1` … `Degrain25`), `FlowInter` and `FlowFPS`. The rest of
+this file documents MVUtensils, which the GPU filters follow.
 
 ```python
 clip = core.bs.VideoSource('video.mkv', gpu=True)
@@ -20,11 +20,11 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
   (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
   the GPU search's own, reduced with `rfilter`'s filter.
-* `Analyse` and `Degrain` so far take 8-bit 4:2:0 supers at `pel=2` or `pel=4` with square blocks
-  of 8×8 or 16×16, the same overlap and padding horizontally and vertically, and no `pel=4`
-  `pelclip`; MVUtensils' extended grids included. Other supers, and the Analyse values not
-  implemented yet (`satd`, `fields`, `chroma=False`, an Analyse grid other than the super's), are
-  errors.
+* `Analyse` so far takes 8-bit 4:2:0 supers at `pel=2` or `pel=4` with square blocks of 8×8 or
+  16×16, and `Degrain`, `FlowInter` and `FlowFPS` 8-bit 4:2:0 and 4:4:4 supers at `pel=2` or
+  `pel=4` with square blocks of 8×8, 16×16 or 32×32; all with the same overlap and padding
+  horizontally and vertically, MVUtensils' extended grids included. Other supers, and the Analyse values not implemented yet (`satd`,
+  `fields`, `chroma=False`, an Analyse grid other than the super's), are errors.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`), a wide search for the blocks still
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
@@ -41,22 +41,31 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   block, vectors in units of the super's `pel`.
 * A `pel=4` super stores luma's four half-pel planes only, as `pel=2` does: mvu's quarter-pel
   samples are rounded averages of the half-pel ones around them, whatever `sharp`, which the
-  quarter-pel step computes as it goes. Chroma, which the half-pel passes already read at quarter-pel
-  positions, keeps all sixteen planes' samples, as one image of the quarter-pel grid per plane
-  rather than sixteen planes: neighbouring blocks' vectors mostly differ in sub-pel phase, and in the
-  image their reads stay in one region. That made a `pel=4` chain of `Super`, `AnalyseMany` and
-  `Degrain` 7-19% faster on the GPU on moving content and 1-4% on static (RX 6900 XT, 16×16 blocks,
-  radius 3). The super is twice the size of a `pel=2` one instead of four times.
+  quarter-pel step computes as it goes; so does 4:4:4 chroma, which takes the luma vector itself.
+  Subsampled chroma, which the half-pel passes already read at quarter-pel positions, keeps all
+  sixteen planes' samples, as one image of the quarter-pel grid per plane rather than sixteen
+  planes: neighbouring blocks' vectors mostly differ in sub-pel phase, and in the image their reads
+  stay in one region. That made a `pel=4` chain of `Super`, `AnalyseMany` and `Degrain` 7-19%
+  faster on the GPU on moving content and 1-4% on static (RX 6900 XT, 16×16 blocks, radius 3). A
+  4:2:0 super is twice the size of a `pel=2` one instead of four times, a 4:4:4 one the same size.
 * Divergence from MVUtensils: `Super` refuses a `pelclip` at `pel=4`. A pelclip's quarter-pel
   samples needn't be averages of its half-pel ones, so its luma would need all sixteen planes, twice
   the memory of a `pel=4` super that computes them. A `pelclip` at `pel=2` works as in mvu.
 * `Degrain` takes all of mvu.Degrain's arguments, on mvgpu's supers and vectors. Given the same
   vectors its output is mvu.Degrain's bit for bit, at `pel=2` and `pel=4` (`test/check_degrain.py`
-  runs both on mvgpu.AnalyseMany's vectors); its weights, which mvu computes in double precision,
-  are reproduced exactly in integers.
-* With the environment variable `MVGPU_PROFILE=1`, `Super`, `Analyse` and `Degrain` time their
-  stages on the GPU and print the averages to stderr when the filter is freed. They wait for every
-  frame, so they run slower.
+  runs both on mvgpu.AnalyseMany's vectors, or on mvu.Analyse's for grids and formats mvgpu.Analyse
+  doesn't search yet); its weights, which mvu computes in double precision, are reproduced exactly
+  in integers.
+* `FlowInter` and `FlowFPS` take all of mvu's arguments, on mvgpu's supers and vectors, and given
+  the same vectors their output is mvu's bit for bit (`test/check_flow.py`, on mvgpu.Analyse's
+  vectors, mvu.Analyse's, or constant fields with scene changes in between). mvu resizes the blocks'
+  vectors and occlusion masks to the pixels with zimg's bilinear resize, in 64×64 tiles; the GPU
+  does the same arithmetic, the taps computed for each tile as zimg computes them.
+* `test/matrix.py` runs the checks over their case matrices (`super`, `degrain`, `flow`) on a
+  directory of raw test clips.
+* With the environment variable `MVGPU_PROFILE=1`, `Super`, `Analyse`, `Degrain`, `FlowInter` and
+  `FlowFPS` time their stages on the GPU and print the averages to stderr when the filter is freed.
+  They wait for every frame, so they run slower.
 * The search's results are bit-identical to its CPU reference implementation
   (`test/check_reference.py`).
 * Needs a Vulkan device with 32- or 64-lane subgroups, 64-bit integers and 64-bit buffer atomics,

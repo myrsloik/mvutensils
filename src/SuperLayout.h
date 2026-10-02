@@ -11,9 +11,10 @@
 //   wide, its rows whole words apart: the full-pel plane alone at pel 1; at pel 2 and 4 it and the
 //   three half-pel planes (x + 1/2, y + 1/2, both).
 // - chroma (not for Gray): U's samples, then V's, then a spare row, wc wide: the full-pel plane of
-//   hc rows at pel 1, and the three half-pel planes after it at pel 2; at pel 4 one image of the
-//   plane's quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at (4x + fx, 4y + fy),
-//   4 hc rows of 4 wc samples, each four of the frame's rows (as much as sixteen planes would take).
+//   hc rows at pel 1, and the three half-pel planes after it at pel 2, and at pel 4 when chroma
+//   isn't subsampled (4:4:4, kept as luma is); at pel 4 when it is, one image of the plane's
+//   quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at (4x + fx, 4y + fy), 4 hc
+//   rows of 4 wc samples, each four of the frame's rows (as much as sixteen planes would take).
 // - pyramid (not with onelevel): the coarse levels 1 .. topLevel the search starts from, every
 //   plane of every level inside a border of repeated edge pixels, at the offsets the level table
 //   gives; one flat buffer.
@@ -23,9 +24,11 @@
 // SADs read whole words past a plane's last pixel. At pel 4 luma keeps its four half-pel planes:
 // mvu.Super makes every quarter sample the rounded average of half-pel ones, whatever sharp, so the
 // kernels compute them where they read luma between the half-pel samples, which measured as fast
-// as reading materialized planes (probe/qpel_bench.cpp). Chroma, at half the resolution, lands
-// between its half-pel samples wherever a luma vector has a half pel, so its quarter samples are
-// materialized: the super is twice pel 2's size instead of four times. They form one image rather
+// as reading materialized planes (probe/qpel_bench.cpp). Unsubsampled chroma takes the luma vector
+// itself, so it lands where luma does and is kept the same way. Subsampled chroma, at half the
+// resolution, lands between its half-pel samples wherever a luma vector has a half pel, so its
+// quarter samples are materialized: a 4:2:0 super is twice pel 2's size instead of four times, a
+// 4:4:4 one the same size as pel 2's. The quarter samples form one image rather
 // than sixteen planes: neighbouring blocks' vectors mostly differ in sub-pel phase, and in planes a
 // block's candidates and its neighbours' read up to nine of the sixteen, where in the image they read
 // one region. Measured on the test clips (RX 6900 XT, 16x16/8, radius 3), the pel 4 chain's GPU
@@ -97,17 +100,23 @@ struct SuperLayout {
     static SuperLayout Make(const SuperFormat &format, int width, int height, int blkX, int blkY, int overlapX, int overlapY, int padX, int padY, int pel,
                             bool pyramid);
 
-    int ChromaPlanes() const { return pel * pel; } // plane sizes each chroma plane takes (at pel 4 its image)
+    // Chroma kept as its quarter-pel image: subsampled chroma at pel 4
+    bool ChromaImage() const { return pel == 4 && format.chroma && (format.xr > 1 || format.yr > 1); }
+    // Plane sizes each chroma plane takes: its full-pel plane, its four half-pel planes, or its image
+    int ChromaPlanes() const { return ChromaImage() ? 16 : pel == 1 ? 1 : 4; }
     // The storage frames' sizes
     int LumaRows() const { return lumaPlanes * hp + 1; }
     int ChromaRows() const { return 2 * ChromaPlanes() * hc + 1; }
     int PyramidWidth() const { return wp; }
     int PyramidRows() const { return (pyramidSamples + wp - 1) / wp + 1; }
 
-    // The layout the search and Degrain implement so far: 8-bit 4:2:0 at pel 2 or 4, square blocks
-    // of 8 or 16 with the same overlap and padding either way. Empty when it is one, else what it
-    // lacks.
-    std::string Unsupported() const;
+    // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
+    // compensate motion with its vectors (Degrain)
+    enum class Use { Search, Compensation };
+    // What they implement so far: 8-bit at pel 2 or 4, square blocks with the same overlap and
+    // padding either way; the search 4:2:0 with blocks of 8 or 16, the others 4:2:0 or 4:4:4 with
+    // blocks of 8, 16 or 32. Empty when the layout is one of those, else what it lacks.
+    std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;
 };
@@ -130,6 +139,19 @@ SuperLayout ImportSuperLayout(VSNode *node, const std::string &prefix, const VSA
 
 // The frames attached to a frame of such a clip, new references; false when they're missing
 bool GetSuperFrames(const VSFrame *frame, const SuperLayout &layout, const std::string &prefix, SuperFrames &out, const VSAPI *vsapi);
+
+// The same level-0 storage, whatever the levels above it and the grid: the planes the kernels read
+bool SameStorage(const SuperLayout &a, const SuperLayout &b);
+
+// A vector clip's analysis description, as mvu's filters read it from its first frame
+struct VectorInfo {
+    int width = 0, height = 0, realWidth = 0, realHeight = 0, hpad = 0, vpad = 0, pel = 0;
+    int blkX = 0, blkY = 0, overlapX = 0, overlapY = 0, nbx = 0, nby = 0;
+    int delta = 0, bits = 0, chroma = 0, xRatio = 0, yRatio = 0;
+};
+
+// Read from the clip's first frame; throws when a property is missing
+VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *vsapi);
 
 // The analysis description mvu.Analyse attaches, under the same names, plus the vector frame when
 // there is one: a 32-bit record (x, y, SAD, 0) per block, vectors in 1 / pel pixels, a row of records

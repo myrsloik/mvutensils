@@ -4,9 +4,10 @@
 Both make the super of the same clip with the same arguments. Every sub-pel plane of level 0, padding
 included, is compared sample for sample (float ones bit for bit): mvu.Super's level-0 frames
 (MVUtensilsSuperLevel0, the sub-pel planes stacked) against mvgpu.Super's storage frames (SuperLayout.h).
-At pel 4, where mvgpu keeps only luma's half-pel planes, its quarter planes are computed from them the
-way the kernels read them and compared with mvu's, and chroma's sixteen are read out of its quarter-pel
-image (every fourth sample of every fourth row from the phase on); the quarter samples mvu leaves unset
+At pel 4, where mvgpu keeps only luma's half-pel planes (and 4:4:4 chroma's), its quarter planes are
+computed from them the way the kernels read them and compared with mvu's, and subsampled chroma's
+sixteen are read out of its quarter-pel image (every fourth sample of every fourth row from the phase
+on); the quarter samples mvu leaves unset
 (the last column of x + 3/4, the last row of y + 3/4) are skipped. mvgpu's coarse levels, which mvu
 doesn't have, are compared with a numpy model of their reduction (rfilter's filter on clamped reads,
 SuperLayout.h's level table).
@@ -254,6 +255,8 @@ def main():
     pel, n_sub = args.pel, args.pel * args.pel
     gp = gsup.get_frame(0).props
     luma_planes = 1 if pel == 1 else 4  # at pel 4 the half-pel planes, the quarter ones computed
+    image = pel == 4 and chroma and (xr > 1 or yr > 1)  # subsampled chroma at pel 4: its quarter-pel image
+    chroma_planes = n_sub if image else luma_planes     # plane sizes per chroma plane: else kept as luma is
     top = gp['MVGPUtensilsSuperLevels'] - 1
 
     planes = 3 if chroma else 1
@@ -272,9 +275,9 @@ def main():
             H = (ah if p == 0 else ah // yr) + 2 * (pady if p == 0 else pady // yr)
             mvu = np.asarray(cl0[p].get_frame(n)[0])
             g = np.asarray(gframes[0 if p == 0 else 1][0])
-            stored = luma_planes if p == 0 else n_sub
-            base = 0 if p == 0 else (p - 1) * n_sub
-            if p > 0 and pel == 4:
+            stored = luma_planes if p == 0 else chroma_planes
+            base = 0 if p == 0 else (p - 1) * chroma_planes
+            if p > 0 and image:
                 # The plane's quarter-pel image: 4 H rows of 4 strides, phase (fx, fy) of pixel (x, y)
                 # at (4 x + fx, 4 y + fy); U's, then V's
                 buf, stride = flat(gframes[1], dtype)

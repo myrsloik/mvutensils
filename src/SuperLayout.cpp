@@ -6,8 +6,9 @@
 namespace {
 
 // SuperGPULayout: what the kernels expect of the frames. 2: any format, pel 1, separate
-// horizontal and vertical geometry. 3: chroma at pel 4 as one image of its quarter-pel grid.
-constexpr int kLayoutVersion = 3;
+// horizontal and vertical geometry. 3: chroma at pel 4 as one image of its quarter-pel grid. 4: only
+// subsampled chroma; 4:4:4 keeps four half-pel planes, as luma does.
+constexpr int kLayoutVersion = 4;
 
 int AlignUp(int v, int a) {
     return (v + a - 1) / a * a;
@@ -129,13 +130,18 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
     return s;
 }
 
-std::string SuperLayout::Unsupported() const {
-    if (format.bits != 8 || !format.chroma || format.xr != 2 || format.yr != 2)
+std::string SuperLayout::Unsupported(Use use) const {
+    const bool search = use == Use::Search;
+    if (search && (format.bits != 8 || !format.chroma || format.xr != 2 || format.yr != 2))
         return "only 8-bit 4:2:0 supers are implemented so far";
+    if (format.bits != 8 || !format.chroma || format.xr != format.yr)
+        return "only 8-bit 4:2:0 and 4:4:4 supers are implemented so far";
     if (pel != 2 && pel != 4)
         return "only supers with pel=2 or pel=4 are implemented so far";
-    if (blk != blkY || (blk != 8 && blk != 16))
+    if (search && (blk != blkY || (blk != 8 && blk != 16)))
         return "only supers with 8x8 or 16x16 blocks are implemented so far";
+    if (blk != blkY || (blk != 8 && blk != 16 && blk != 32))
+        return "only supers with 8x8, 16x16 or 32x32 blocks are implemented so far";
     if (overlap != overlapY)
         return "only supers with the same overlap horizontally and vertically are implemented so far";
     if (pad != padY)
@@ -236,6 +242,49 @@ bool GetSuperFrames(const VSFrame *frame, const SuperLayout &layout, const std::
         return false;
     }
     return true;
+}
+
+VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *vsapi) {
+    char err[1024] = {};
+    const VSFrame *frame = vsapi->getFrame(0, node, err, sizeof(err));
+    if (!frame)
+        throw std::runtime_error(std::string("failed to get a vector clip's first frame: ") + err);
+    const VSMap *props = vsapi->getFramePropertiesRO(frame);
+    auto get = [&](const char *name) {
+        int e = 0;
+        const int v = vsapi->mapGetIntSaturated(props, (prefix + name).c_str(), 0, &e);
+        if (e) {
+            vsapi->freeFrame(frame);
+            throw std::runtime_error(std::string("a vector clip lacks the property ") + prefix + name + "; it must come from mvgpu.Analyse with the same prefix");
+        }
+        return v;
+    };
+    VectorInfo v;
+    v.width = get("AnalysisWidth");
+    v.height = get("AnalysisHeight");
+    v.realWidth = get("AnalysisRealWidth");
+    v.realHeight = get("AnalysisRealHeight");
+    v.hpad = get("AnalysisHPad");
+    v.vpad = get("AnalysisVPad");
+    v.pel = get("AnalysisPel");
+    v.blkX = get("AnalysisBlkSizeX");
+    v.blkY = get("AnalysisBlkSizeY");
+    v.overlapX = get("AnalysisOverlapX");
+    v.overlapY = get("AnalysisOverlapY");
+    v.nbx = get("AnalysisNBlkX");
+    v.nby = get("AnalysisNBlkY");
+    v.delta = get("AnalysisDeltaFrame");
+    v.bits = get("AnalysisBitsPerSample");
+    v.chroma = get("AnalysisChroma");
+    v.xRatio = get("AnalysisXRatioUV");
+    v.yRatio = get("AnalysisYRatioUV");
+    vsapi->freeFrame(frame);
+    return v;
+}
+
+bool SameStorage(const SuperLayout &a, const SuperLayout &b) {
+    return a.width == b.width && a.height == b.height && a.format == b.format && a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY &&
+           a.pel == b.pel;
 }
 
 void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi) {

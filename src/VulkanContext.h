@@ -39,6 +39,8 @@ enum class Kernel {
     DegrainCount,
     DegrainWeights,
     DegrainPixels,
+    FlowPrep,
+    FlowInter,
 };
 
 // The bindings, as the kernels declare them (refine_common.glsl, pyr_common.glsl, super.comp,
@@ -77,6 +79,15 @@ enum DegrainBinding {
 };
 constexpr int kMaxDegrainRefs = 50; // 2 * the largest radius, degrain_common.glsl's kMaxRefs
 
+// The Flow kernels' bindings in the Main layout (flow_common.glsl): the two supers' planes (the frame
+// before and the one after), the vector frames (F and B, and FF and BB for the extra masks), the
+// blocks' occlusion masks and scene change counts, the clip's planes for the blend, the output
+// plane, the resize's taps
+enum FlowBinding {
+    kFlSrcLuma, kFlSrcChroma, kFlRefLuma, kFlRefChroma, kFlVecF, kFlVecB, kFlVecFF, kFlVecBB,
+    kFlMasks, kFlCounts, kFlClipSrc, kFlClipRef, kFlOut, kFlTaps,
+};
+
 // Push constants, matching refine_common.glsl's Params
 struct Params {
     int32_t w, h, nbx, nby;
@@ -114,6 +125,19 @@ struct DegrainParams {
     int32_t nb, reserved0, reserved1, reserved2;
 };
 static_assert(sizeof(DegrainParams) == 112, "degrain_common.glsl's Params is 28 ints");
+
+// The Flow kernels' push constants, matching flow_common.glsl's Params; they share the Main layout
+struct FlowParams {
+    int32_t nbx, nby, recStride, flags;
+    int32_t pad, padY, padc, padcY;
+    int32_t wp, hp, wc, hc;
+    int32_t plane, width, height, outStride;
+    int32_t clipStride, time256, thscd1, scdLimit;
+    int32_t colOff, rowOff;
+    float occnormX, occnormY;
+    int32_t time4096FX, time4096FY, time4096BX, time4096BY;
+};
+static_assert(sizeof(FlowParams) == 112, "flow_common.glsl's Params is 28 words");
 
 class VulkanContext {
 public:
@@ -202,6 +226,7 @@ public:
     void Bind(int binding, VkBuffer buffer, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE, int element = 0);
     void Dispatch(VkPipeline pipeline, const Params &pc, uint32_t x, uint32_t y, uint32_t z = 1);
     void Dispatch(VkPipeline pipeline, const SuperParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
+    void Dispatch(VkPipeline pipeline, const FlowParams &pc, uint32_t x, uint32_t y, uint32_t z = 1);
     void DispatchIndirect(VkPipeline pipeline, const Params &pc, VkBuffer args, VkDeviceSize offset);
 
     void Fill(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t value);

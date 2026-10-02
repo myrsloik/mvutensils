@@ -111,6 +111,7 @@
     <ClCompile Include="..\src\Analyse.cpp" />
     <ClCompile Include="..\src\Degrain.cpp" />
     <ClCompile Include="..\src\EntryPoint.cpp" />
+    <ClCompile Include="..\src\FlowInterpolate.cpp" />
     <ClCompile Include="..\src\Super.cpp" />
     <ClCompile Include="..\src\SuperLayout.cpp" />
     <ClCompile Include="..\src\VulkanContext.cpp" />
@@ -121,6 +122,9 @@
     <None Include="..\src\shaders\degrain_count.comp" />
     <None Include="..\src\shaders\degrain_weights.comp" />
     <None Include="..\src\shaders\embed_shaders.py" />
+    <None Include="..\src\shaders\flow_common.glsl" />
+    <None Include="..\src\shaders\flow_inter.comp" />
+    <None Include="..\src\shaders\flow_prep.comp" />
     <None Include="..\src\shaders\median.comp" />
     <None Include="..\src\shaders\pyr_common.glsl" />
     <None Include="..\src\shaders\pyr_pass.comp" />

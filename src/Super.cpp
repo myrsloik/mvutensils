@@ -169,8 +169,9 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         q.pel = L.pel;
 
         // The full-pel planes from the frame; then the half-pel planes from them (the diagonal one
-        // after the y + 1/2 one it filters), or from the pelclip. At pel 4 those are luma's alone,
-        // and super_qpel.comp makes chroma's quarter-pel images whole from the frame. Four samples
+        // after the y + 1/2 one it filters), or from the pelclip. At pel 4 with subsampled chroma
+        // those are luma's alone, and super_qpel.comp makes chroma's quarter-pel images whole from the
+        // frame; 4:4:4 chroma gets the same planes as luma. Four samples
         // of a padded row per lane.
         const uint32_t groups = static_cast<uint32_t>((L.aw + 2 * L.pad + 255) / 256), rows = static_cast<uint32_t>(L.hp);
         const uint32_t stepPlanes = d->quarterPipeline ? 1u : static_cast<uint32_t>(planes);
@@ -314,7 +315,7 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         VulkanContext &vc = *d->vc;
         // The super kernels don't use the grid's block size, so their pipelines don't depend on it
         d->planesPipeline = vc.Pipeline(Kernel::Super, 0, pel, format.Kind());
-        if (pel == 4 && format.chroma)
+        if (L.ChromaImage())
             d->quarterPipeline = vc.Pipeline(Kernel::SuperQuarter, 0, pel, format.Kind());
         if (L.topLevel > 0)
             d->reducePipeline = vc.Pipeline(Kernel::PyrReduce, 0, pel, format.Kind());

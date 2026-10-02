@@ -35,6 +35,9 @@
     <ClCompile Include="..\src\EntryPoint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\FlowInterpolate.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\Super.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -59,6 +62,15 @@
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\embed_shaders.py">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\flow_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\flow_inter.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include="..\src\shaders\flow_prep.comp">
       <Filter>Shader Files</Filter>
     </None>
     <None Include="..\src\shaders\median.comp">

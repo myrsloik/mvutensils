@@ -8,6 +8,7 @@
 void superRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void degrainRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void flowRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 
 
 VS_EXTERNAL_API(void)
@@ -19,4 +20,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     superRegister(plugin, vspapi);
     analyseRegister(plugin, vspapi);
     degrainRegister(plugin, vspapi);
+    flowRegister(plugin, vspapi);
 }

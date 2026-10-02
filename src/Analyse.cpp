@@ -715,7 +715,7 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
     a.node = vsapi->mapGetNode(in, "super", 0, nullptr);
     try {
         a.layout = ImportSuperLayout(a.node, a.prefix, vsapi);
-        if (const std::string unsupported = a.layout.Unsupported(); !unsupported.empty())
+        if (const std::string unsupported = a.layout.Unsupported(SuperLayout::Use::Search); !unsupported.empty())
             throw std::runtime_error(unsupported);
         if (a.layout.topLevel < 1)
             throw std::runtime_error("the super clip has no coarse levels, which the search starts from: it was made with onelevel=True, or the frame is narrower than " +

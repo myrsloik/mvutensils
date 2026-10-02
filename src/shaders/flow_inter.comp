@@ -1,0 +1,154 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "flow_common.glsl"
+
+layout(local_size_x = 64) in;
+
+// A sample of the plane pc.plane of the frame before (src) or the frame after (ref)
+uint Px(bool ref, uint i) {
+    if (pc.plane == 0)
+        return ref ? uint(refY[i]) : uint(srcY[i]);
+    return ref ? uint(refC[i]) : uint(srcC[i]);
+}
+
+// The rounded average mvu.Super's quarter planes take of two samples
+uint Avg(uint a, uint b) {
+    return (a + b + 1u) >> 1u;
+}
+
+// The address of sample (Xh, Yh) of the half-pel grid of a plane with rows stride samples apart,
+// its four half-pel planes rows rows each
+uint HalfAddr(int Xh, int Yh, int stride, int rows) {
+    return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
+}
+
+// mvu's PlaneGather: the sample at (X, Y), 1 / pel pixels from the plane's top left pixel, of the
+// super of the frame before or the frame after; between the half-pel samples (luma, and 4:4:4
+// chroma, at pel 4) the rounded average of their neighbours, as mvu.Super's quarter planes hold it;
+// subsampled chroma at pel 4 from its quarter-pel image. The position is clamped to the storage,
+// where mvu reads outside the padding.
+uint Sample(bool ref, int X, int Y) {
+    bool luma = pc.plane == 0;
+    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
+    X += kPel * (luma ? pc.pad : pc.padc);
+    Y += kPel * (luma ? pc.padY : pc.padcY);
+    uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
+    if (!luma && kImage) {
+        X = clamp(X, 0, 4 * stride - 1);
+        Y = clamp(Y, 0, 4 * rows - 1);
+        return Px(ref, base + uint(Y * 4 * stride + X));
+    }
+    if (kPel == 2) {
+        X = clamp(X, 0, 2 * stride - 1);
+        Y = clamp(Y, 0, 2 * rows - 1);
+        return Px(ref, base + HalfAddr(X, Y, stride, rows));
+    }
+    X = clamp(X, 0, 4 * stride - 2);
+    Y = clamp(Y, 0, 4 * rows - 2);
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    return Avg(Avg(Px(ref, base + HalfAddr(Xa, Ya, stride, rows)), Px(ref, base + HalfAddr(Xa, Yb, stride, rows))),
+               Avg(Px(ref, base + HalfAddr(Xb, Ya, stride, rows)), Px(ref, base + HalfAddr(Xb, Yb, stride, rows))));
+}
+
+// The resize's blocks and weights at the plane's pixel (x, y): blocks gIa and gIb = gIa + 1 of the
+// rows gJa and gJb = gJa + 1, weighted gCa and 16384 - gCa across, gDa and 16384 - gDa down
+int gIa, gIb, gCa, gJa, gJb, gDa;
+
+void Weights(int x, int y) {
+    int cx = taps[pc.colOff + x], ry = taps[pc.rowOff + y];
+    gIa = cx >> 15;
+    gCa = cx & 0x7FFF;
+    gIb = min(gIa + 1, pc.nbx - 1);
+    gJa = ry >> 15;
+    gDa = ry & 0x7FFF;
+    gJb = min(gJa + 1, pc.nby - 1);
+}
+
+// zimg's 16-bit bilinear step, the weights adding up to 1 << 14: its result rounded and offset
+// back (unpack_pixel_u16, pack_pixel_u16), which comes to this
+int Lerp(int a, int b, int c) {
+    return (c * a + (16384 - c) * b + 8192) >> 14;
+}
+
+// The resize of the four blocks' values at the pixel: across each row, then down, each pass rounded
+// to 16 bits, as zimg resizes horizontally first when it scales both ways up (resize_h_first)
+int Interpolate(int aa, int ab, int ba, int bb) {
+    return Lerp(Lerp(aa, ab, gCa), Lerp(ba, bb, gCa), gDa);
+}
+
+// A block's vector as mvu's MakeSmallVectorMasks and AdjustSmallVectorMaskSubSampling keep it:
+// biased into 16 bits, saturated, chroma's then shifted by the subsampling
+ivec2 Biased(ivec4 rec) {
+    ivec2 v = clamp(rec.xy + 32768, 0, 65535);
+    if (pc.plane != 0)
+        v = ((v - 32768) >> ivec2(kLogX, kLogY)) + 32768;
+    return v;
+}
+
+// A vector frame's vector at the pixel, unbiased, in 1 / pel pixels of the plane
+ivec2 VectorAt(int which) {
+    ivec4 raa, rab, rba, rbb;
+    int aa = gJa * pc.recStride + gIa, ab = gJa * pc.recStride + gIb, ba = gJb * pc.recStride + gIa, bb = gJb * pc.recStride + gIb;
+    if (which == 0) {
+        raa = vecF[aa]; rab = vecF[ab]; rba = vecF[ba]; rbb = vecF[bb];
+    } else if (which == 1) {
+        raa = vecB[aa]; rab = vecB[ab]; rba = vecB[ba]; rbb = vecB[bb];
+    } else if (which == 2) {
+        raa = vecFF[aa]; rab = vecFF[ab]; rba = vecFF[ba]; rbb = vecFF[bb];
+    } else {
+        raa = vecBB[aa]; rab = vecBB[ab]; rba = vecBB[ba]; rbb = vecBB[bb];
+    }
+    ivec2 baa = Biased(raa), bab = Biased(rab), bba = Biased(rba), bbb = Biased(rbb);
+    return ivec2(Interpolate(baa.x, bab.x, bba.x, bbb.x), Interpolate(baa.y, bab.y, bba.y, bbb.y)) - 32768;
+}
+
+// An occlusion mask at the pixel, 0 .. 255: F's (base 0) or B's
+int MaskAt(int base) {
+    return Interpolate(int(masks[base + gJa * pc.nbx + gIa]), int(masks[base + gJa * pc.nbx + gIb]),
+                       int(masks[base + gJb * pc.nbx + gIa]), int(masks[base + gJb * pc.nbx + gIb]));
+}
+
+// mvu.FlowInter's and mvu.FlowFPS's pixel of the plane at pc.time256 between the frames: where F
+// and B have vectors and neither is at a scene change, FlowInter (the two compensations blended
+// through the occlusion masks), or FlowInterExtra (the medians with the extra frames' compensations
+// instead) where FF and BB serve too; else the clip's frames blended by the time, or the frame
+// before. Dispatched as ((width + 63) / 64, height) workgroups per plane.
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+    if (x >= pc.width)
+        return;
+    int t = pc.time256;
+    uint limit = uint(pc.scdLimit);
+    bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;
+    uint result;
+    if (!fb) {
+        uint s = uint(clipSrc[y * pc.clipStride + x]);
+        result = (pc.flags & kBlend) != 0 ? (s * uint(256 - t) + uint(clipRef[y * pc.clipStride + x]) * uint(t)) >> 8u : s;
+    } else {
+        bool extra = (pc.flags & kHaveExtra) != 0 && counts[2] <= limit && counts[3] <= limit;
+        Weights(x, y);
+        ivec2 vF = VectorAt(0), vB = VectorAt(1);
+        int mF = MaskAt(0), mB = MaskAt(pc.nbx * pc.nby);
+        int xBase = x * kPel, yBase = y * kPel;
+        int vxF = (vF.x * t) >> 8, vyF = (vF.y * t) >> 8;
+        int vxB = (vB.x * (256 - t)) >> 8, vyB = (vB.y * (256 - t)) >> 8;
+        int dF = int(Sample(false, xBase + vxF, yBase + vyF)), dB = int(Sample(true, xBase + vxB, yBase + vyB));
+        int blended;
+        if (extra) {
+            ivec2 vFF = VectorAt(2), vBB = VectorAt(3);
+            int vxFF = (vFF.x * t) >> 8, vyFF = (vFF.y * t) >> 8;
+            int vxBB = (vBB.x * (256 - t)) >> 8, vyBB = (vBB.y * (256 - t)) >> 8;
+            int dFF = int(Sample(false, xBase + vxFF, yBase + vyFF)), dBB = int(Sample(true, xBase + vxBB, yBase + vyBB));
+            int minfb = min(dB, dF), maxfb = max(dB, dF);
+            int medianBB = max(minfb, min(dBB, maxfb)), medianFF = max(minfb, min(dFF, maxfb));
+            blended = ((((medianBB * mF + dF * (256 - mF)) + 256) >> 8) * (256 - t) + (((medianFF * mB + dB * (256 - mB)) + 256) >> 8) * t) >> 8;
+        } else {
+            int dF0 = int(Sample(false, xBase, yBase)), dB0 = int(Sample(true, xBase, yBase));
+            int occF = (dF * (256 - mF) + ((mF * (dB * (256 - mB) + mB * dF0) + 256) >> 8) + 256) >> 8;
+            int occB = (dB * (256 - mB) + ((mB * (dF * (256 - mF) + mF * dB0) + 256) >> 8) + 256) >> 8;
+            blended = (occF * (256 - t) + occB * t) >> 8;
+        }
+        result = uint(blended - 1);
+    }
+    outPx[y * pc.outStride + x] = uint8_t(result);
+}
