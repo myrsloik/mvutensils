@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """mvgpu.Degrain against mvu.Degrain, byte for byte.
 
-Both denoise the same 8-bit clip with the same vectors. By default they are mvgpu.AnalyseMany's:
+Both denoise the same clip with the same vectors. By default they are mvgpu.AnalyseMany's:
 mvu.Degrain gets them on a carrier clip that holds mvgpu's analysis description under mvu's property
 names, so mvu never searches. With --vectors mvu they are mvu.Analyse's, and mvgpu.Degrain gets them
-on the frames of its super, as mvgpu.Analyse would attach them: for grids and formats mvgpu.Analyse
-doesn't search yet. Each side builds its super with the same settings (mvgpu.Super's planes are
-mvu.Super's). Every pixel of every frame and plane is compared.
+on the frames of its super, as mvgpu.Analyse would attach them: vectors mvgpu's search wouldn't
+find, and frames narrower than the 192 pixels mvgpu.Analyse needs. Each side builds its super with
+the same settings (mvgpu.Super's planes are mvu.Super's). With --analyse8 the vectors come from an
+8-bit copy of a high bit depth clip, as mvu lets vectors analysed on 8 bits serve the clip. Every
+pixel of every frame and plane is compared.
 
     check_degrain.py --src noisy.nv12 --size 1920x1080 --frames 52 --pel 4 --blksize 16 --overlap 8
                      [--format YUV444P8] [--vectors mvu] [--radius 2] [--thsad 400 300] [--thsad2 150]
                      [--planes 0 2] [--limit 3 2] [--thscd1 400] [--thscd2 51] [--weights 1 2 3 2 1]
-                     [--centersuper] [--crop 1914x1074]
+                     [--centersuper] [--crop 1914x1074] [--analyse8]
 
---format converts the 8-bit 4:2:0 source first (resize.Bicubic). --centersuper gives both a separate
-centre super, of the clip blurred, as scripts that denoise with the super of another clip do.
+--format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a
+quarter pixel to more than 8 bits). --centersuper gives both a separate centre super, of the clip
+blurred, as scripts that denoise with the super of another clip do.
 """
 import argparse
 import os
@@ -24,7 +27,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
+from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
 
 
 def main():
@@ -32,7 +35,8 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
-    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8 or YUV444P8')
+    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, YUV420P10, ...')
+    ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu'], default='mvgpu', help="whose vectors both sides use")
     ap.add_argument('--blksize', type=int, default=16)
     ap.add_argument('--overlap', type=int, default=8)
@@ -59,9 +63,7 @@ def main():
     if not hasattr(core, 'mvu'):
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
-    clip = nv12_clip(core, args.src, w, h, args.frames)
-    if args.format != 'YUV420P8':
-        clip = core.resize.Bicubic(clip, format=getattr(vs, args.format))
+    clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -72,13 +74,17 @@ def main():
 
     gsup = core.mvgpu.Super(gclip, **sk)
     csup = core.mvu.Super(clip, **sk)
+    # The supers the vectors come from: the clip's, or an 8-bit copy's
+    aclip = eight_bit(core, clip) if args.analyse8 else clip
+    gasup = core.mvgpu.Super(core.std.GPUUpload(aclip), **sk) if args.analyse8 else gsup
+    casup = core.mvu.Super(aclip, **sk) if args.analyse8 else csup
     if args.vectors == 'mvgpu':
-        fields = core.mvgpu.AnalyseMany(gsup, radius=args.radius)
+        fields = core.mvgpu.AnalyseMany(gasup, radius=args.radius)
         cvec = [mvu_vectors(core, an, clip, args.frames) for an in fields]
     else:
         deltas = [d for r in range(1, args.radius + 1) for d in (r, -r)]
-        cvec = [core.mvu.Analyse(csup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
-        fields = [gpu_vectors(core, an, gsup) for an in cvec]
+        cvec = [core.mvu.Analyse(casup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
+        fields = [gpu_vectors(core, an, gasup) for an in cvec]
     # Degrain's supers: the analysis one, or one with the render block size and overlap
     rk = dict(sk, blksize=args.render[0], overlap=args.render[1]) if args.render else sk
     if args.render:
@@ -99,7 +105,7 @@ def main():
     for n in range(args.frames):
         a, b, s = gout.get_frame(n), cout.get_frame(n), clip.get_frame(n)
         for p in range(3):
-            pa, pb = np.asarray(a[p]).astype(np.int16), np.asarray(b[p]).astype(np.int16)
+            pa, pb = np.asarray(a[p]).astype(np.int32), np.asarray(b[p]).astype(np.int32)
             changed += np.count_nonzero(pa != np.asarray(s[p]))
             d = np.count_nonzero(pa != pb)
             if d:
@@ -110,7 +116,7 @@ def main():
                     first = (n, p, int(xs[0]), int(ys[0]), int(pa[ys[0], xs[0]]), int(pb[ys[0], xs[0]]))
     total = args.frames * w * h
     total_c = args.frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h)
-    print(f'{args.format} {args.frames} frames, {100 * changed / (total + 2 * total_c):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}, '
+    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} {args.frames} frames, {100 * changed / (total + 2 * total_c):.1f}% of the pixels denoised: differing pixels Y {differ[0]} of {total}, '
           f'U {differ[1]}, V {differ[2]} of {total_c} each'
           + (f'; largest difference {worst}; first at frame {first[0]} plane {first[1]} ({first[2]}, {first[3]}): '
              f'mvgpu {first[4]}, mvu {first[5]}' if first else ''))

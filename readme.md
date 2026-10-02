@@ -20,18 +20,22 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
   (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
   the GPU search's own, reduced with `rfilter`'s filter.
-* `Analyse` so far takes 8-bit 4:2:0 supers, and `Degrain`, `FlowInter` and `FlowFPS` 8-bit 4:2:0
-  and 4:4:4 supers, at `pel=2` or `pel=4` with square blocks of 8×8, 16×16 or 32×32; all with the
-  same overlap and padding horizontally and vertically, MVUtensils' extended grids included. Other
-  supers, and the Analyse values not implemented yet (`satd`, `fields`, an Analyse grid other than
-  the super's), are errors.
+* `Analyse`, `AnalyseMany`, `Degrain`, `FlowInter` and `FlowFPS` so far take 4:2:0 and 4:4:4
+  supers of 8 to 16-bit samples at `pel=2` or `pel=4` with square blocks of 8×8, 16×16 or 32×32,
+  with the same overlap and padding horizontally and vertically (an even padding at 4:2:0),
+  MVUtensils' extended grids included. Other supers (float ones among them), and the Analyse values
+  not implemented yet (`satd`, `fields`, an Analyse grid other than the super's), are errors. As in
+  mvu, vectors analysed on an 8-bit copy of a clip serve `Degrain`, `FlowInter` and `FlowFPS` on the
+  9 to 16-bit clip, their SAD thresholds scaled to the depth the vectors were analysed at.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`; `plevel` scales the coarse levels'
   lambda as mvu scales it per level), a wide search for the blocks still
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
   half-pel step. At `pel=4` the seeds and the passes stay on the half-pel grid (chained and
   inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the half-pel one.
-  With `chroma=False` every SAD is luma's alone, at every level.
+  With `chroma=False` every SAD is luma's alone, at every level. Above 8 bits `mvlambda`, `lsad` and
+  `badsad` are scaled to the depth as mvu scales them, and `lsad` relaxes lambda by the worst
+  neighbour's SAD in steps of 2^(bits − 8), as the search tabulates it.
   `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`, `globalmv`,
   `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
   The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
@@ -55,9 +59,9 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   the memory of a `pel=4` super that computes them. A `pelclip` at `pel=2` works as in mvu.
 * `Degrain` takes all of mvu.Degrain's arguments, on mvgpu's supers and vectors. Given the same
   vectors its output is mvu.Degrain's bit for bit, at `pel=2` and `pel=4` (`test/check_degrain.py`
-  runs both on mvgpu.AnalyseMany's vectors, or on mvu.Analyse's for grids and formats mvgpu.Analyse
-  doesn't search yet); its weights, which mvu computes in double precision, are reproduced exactly
-  in integers.
+  runs both on mvgpu.AnalyseMany's vectors, or on mvu.Analyse's, which mvgpu's search wouldn't find
+  and which also cover frames narrower than the 192 pixels mvgpu.Analyse needs); its weights, which
+  mvu computes in double precision, are reproduced exactly in integers.
 * `FlowInter` and `FlowFPS` take all of mvu's arguments, on mvgpu's supers and vectors, and given
   the same vectors their output is mvu's bit for bit (`test/check_flow.py`, on mvgpu.Analyse's
   vectors, mvu.Analyse's, or constant fields with scene changes in between). mvu resizes the blocks'

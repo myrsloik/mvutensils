@@ -7,16 +7,18 @@ layout(local_size_x = 64) in;
 // One checkerboard pass over the blocks of colour pc.colour, (bx + by) % 2 == colour: each tries
 // its seeds, its four neighbours' vectors and then the 8 positions one pixel around the winner,
 // under Analyse's cost. Neighbours are of the other colour, so nothing read here changes during the
-// dispatch. 8 blocks of the colour per workgroup in a row, 8 lanes per block: lane i costs seeds i
-// and i + 8 and measures and costs neighbour i (lanes 0-3), then position i around the winner, and
-// each step's best comes from one minimum of CandidateKey over the group, in the CPU's order of
-// seeds, then neighbours, then positions. Blocks whose inputs haven't changed since their last
-// evaluation are skipped (see LastChange). Dispatched as (((nbx + 1) / 2 + 7) / 8, nby).
+// dispatch. kGroupBlocks blocks of the colour per workgroup in a row, kGroupLanes lanes per block:
+// lane i of each 8 (kSplit) costs seeds i and i + 8 and measures and costs neighbour i (lanes 0-3),
+// then position i around the winner, and each step's best comes from one minimum of CandidateKey
+// over the group, in the CPU's order of seeds, then neighbours, then positions. Blocks whose inputs
+// haven't changed since their last evaluation are skipped (see LastChange). Dispatched as
+// (((nbx + 1) / 2 + kGroupBlocks - 1) / kGroupBlocks, nby).
 void main() {
     uint lane = WorkgroupLane();
-    int group = int(lane >> 3u), sub = int(lane & 7u);
+    int group = int(lane) / kGroupLanes, sub = int(lane & 7u), inGroup = int(lane) & (kGroupLanes - 1);
+    gHalf = inGroup >> 3;
     int by = int(gl_WorkGroupID.y);
-    int bx = 2 * (int(gl_WorkGroupID.x) * 8 + group) + ((by + pc.colour) & 1);
+    int bx = 2 * (int(gl_WorkGroupID.x) * kGroupBlocks + group) + ((by + pc.colour) & 1);
     bool live = bx < pc.nbx;
     bx = min(bx, pc.nbx - 1);
     int b = by * pc.nbx + bx;
@@ -29,7 +31,7 @@ void main() {
         if (by + 1 < pc.nby) dirty = dirty || lastChange[b + pc.nbx] > seen;
         live = dirty;
     }
-    LoadBlock(group, sub, 8, bx, by, live);
+    LoadBlock(group, inGroup, kGroupLanes, bx, by, live);
     barrier();
 
     ivec2 p;
@@ -89,7 +91,7 @@ void main() {
         best = wv;
         bestSad = ws;
     }
-    if (live && sub == 0) {
+    if (live && inGroup == 0) {
         atomicAdd(counters[2 * pc.stamp], 1u);
         if (best != vecA[b]) {
             lastChange[b] = pc.stamp;

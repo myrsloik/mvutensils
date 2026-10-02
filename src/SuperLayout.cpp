@@ -7,8 +7,9 @@ namespace {
 
 // SuperGPULayout: what the kernels expect of the frames. 2: any format, pel 1, separate
 // horizontal and vertical geometry. 3: chroma at pel 4 as one image of its quarter-pel grid. 4: only
-// subsampled chroma; 4:4:4 keeps four half-pel planes, as luma does.
-constexpr int kLayoutVersion = 4;
+// subsampled chroma; 4:4:4 keeps four half-pel planes, as luma does. 5: the coarse levels' chroma
+// border covers chroma's reach in either direction (4:4:4's as far as luma's).
+constexpr int kLayoutVersion = 5;
 
 int AlignUp(int v, int a) {
     return (v + a - 1) / a * a;
@@ -77,9 +78,9 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
 
     // Level L halves level L - 1 rounding up, luma and chroma separately, as the CPU reference's
     // Reduce does. Each plane sits inside a border of repeated edge pixels, so no level SAD clamps:
-    // a block reaches up to pad >> L pixels past the luma edges, about half that past the chroma
-    // edges, and LevelSadOf's words up to 3 bytes further on either side of a row. Rows are whole
-    // words apart, planes start on 16 samples.
+    // a block reaches up to pad >> L pixels past the luma edges, that divided by the subsampling
+    // (rounded up) past the chroma edges, and LevelSadOf's words up to 3 bytes further on either
+    // side of a row. Rows are whole words apart, planes start on 16 samples.
     s.levels.assign(s.topLevel + 1, LevelEntry{});
     int offset = 0;
     auto addPlane = [&](int w, int h, int border, int32_t &stride) {
@@ -103,7 +104,7 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
         if (format.chroma) {
             e.wc = wc;
             e.hc = hc;
-            e.borderC = (levelPad + 1) / 2 + 4;
+            e.borderC = std::max((levelPad + format.xr - 1) / format.xr, (levelPad + format.yr - 1) / format.yr) + 4;
             e.offU = addPlane(wc, hc, e.borderC, e.strideC);
             e.offV = addPlane(wc, hc, e.borderC, e.strideC);
         }
@@ -130,12 +131,9 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
     return s;
 }
 
-std::string SuperLayout::Unsupported(Use use) const {
-    const bool search = use == Use::Search;
-    if (search && (format.bits != 8 || !format.chroma || format.xr != 2 || format.yr != 2))
-        return "only 8-bit 4:2:0 supers are implemented so far";
-    if (format.bits != 8 || !format.chroma || format.xr != format.yr)
-        return "only 8-bit 4:2:0 and 4:4:4 supers are implemented so far";
+std::string SuperLayout::Unsupported([[maybe_unused]] Use use) const {
+    if (format.Kind() == 2 || !format.chroma || format.xr != format.yr)
+        return "only 4:2:0 and 4:4:4 supers of 8 to 16-bit samples are implemented so far";
     if (pel != 2 && pel != 4)
         return "only supers with pel=2 or pel=4 are implemented so far";
     if (blk != blkY || (blk != 8 && blk != 16 && blk != 32))
@@ -285,8 +283,12 @@ VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *
 }
 
 bool SameStorage(const SuperLayout &a, const SuperLayout &b) {
-    return a.width == b.width && a.height == b.height && a.format == b.format && a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY &&
-           a.pel == b.pel;
+    return SameGeometry(a, b) && a.format == b.format;
+}
+
+bool SameGeometry(const SuperLayout &a, const SuperLayout &b) {
+    return a.width == b.width && a.height == b.height && a.format.chroma == b.format.chroma && a.format.xr == b.format.xr && a.format.yr == b.format.yr &&
+           a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY && a.pel == b.pel;
 }
 
 void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi) {

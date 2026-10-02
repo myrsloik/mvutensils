@@ -3,22 +3,27 @@
 // Shared by mvgpu.FlowInter's and mvgpu.FlowFPS's kernels (FlowInterpolate.cpp): flow_prep.comp
 // counts each vector frame's blocks above thscd1 and makes the blocks' occlusion masks, and
 // flow_inter.comp makes every pixel of a plane of the frame between two frames from their supers,
-// the blocks' vectors and masks resized to the plane at it. The arithmetic is mvu's for 8-bit clips
-// (FlowShared.h's FlowInter, FlowInterExtra and Blend, MotionBlockPyramid.cpp's
+// the blocks' vectors and masks resized to the plane at it. The arithmetic is mvu's for 8-bit and 9
+// to 16-bit clips (FlowShared.h's FlowInter, FlowInterExtra and Blend, MotionBlockPyramid.cpp's
 // MakeVectorOcclusionMask, MakeSmallVectorMasks and IsSceneChange), the resize too: zimg's bilinear
 // one in 64 x 64 tiles, as mvu's MaskResizer makes it, whose taps the host computes as zimg does.
 //
 // The kernels run in the Main layout (VulkanContext.h, FlowBinding) with push constants of their own.
 
 #extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_control_flow_attributes : require
 
-// The vectors' units per pixel, 2 or 4 (specialization constant 5), and chroma's subsampling
-// (specialization constant 6): bit 0 horizontal, bit 1 vertical, so 3 for 4:2:0 and 0 for 4:4:4
+// The vectors' units per pixel, 2 or 4 (specialization constant 5), and the variant (specialization
+// constant 6): chroma's subsampling in bits 0 (horizontal) and 1 (vertical), so 3 for 4:2:0 and 0
+// for 4:4:4, and bit 2 set for 16-bit samples
 layout(constant_id = 5) const int kPel = 2;
-layout(constant_id = 6) const int kChromaLog = 3;
+layout(constant_id = 6) const int kVariant = 3;
+const int kChromaLog = kVariant & 3;
 const int kLogX = kChromaLog & 1, kLogY = kChromaLog >> 1;
+const bool kWide = (kVariant & 4) != 0;
 const bool kImage = kPel == 4 && kChromaLog != 0; // subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h)
 const int kChromaPlanes = kImage ? 16 : 4;        // U's half-pel planes (or image), then V's as many plane sizes on
 
@@ -44,11 +49,16 @@ const int kHaveFB = 1, kHaveExtra = 2, kBlend = 4;
 // then B's; the scene change counts of F, B, FF, BB; the clip's plane in both frames; the output;
 // the resize's taps, for each column of each plane's output, then each row (FlowInterpolate.cpp's
 // ResizeTaps): the block to its left (above it) << 15 | that block's 14-bit weight, the next block
-// taking the rest
+// taking the rest. The planes' samples are bytes, or 16 bits each for 9 to 16-bit clips (kWide),
+// every plane buffer declared both ways.
 layout(std430, set = 0, binding = 0) readonly buffer SrcLuma { uint8_t srcY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer SrcChroma { uint8_t srcC[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma { uint8_t refY[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint8_t refC[]; };
+layout(std430, set = 0, binding = 0) readonly buffer SrcLuma16 { uint16_t srcY16[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SrcChroma16 { uint16_t srcC16[]; };
+layout(std430, set = 0, binding = 2) readonly buffer RefLuma16 { uint16_t refY16[]; };
+layout(std430, set = 0, binding = 3) readonly buffer RefChroma16 { uint16_t refC16[]; };
 layout(std430, set = 0, binding = 4) readonly buffer VecF { ivec4 vecF[]; };
 layout(std430, set = 0, binding = 5) readonly buffer VecB { ivec4 vecB[]; };
 layout(std430, set = 0, binding = 6) readonly buffer VecFF { ivec4 vecFF[]; };
@@ -58,4 +68,7 @@ layout(std430, set = 0, binding = 9) buffer Counts { uint counts[]; };
 layout(std430, set = 0, binding = 10) readonly buffer ClipSrc { uint8_t clipSrc[]; };
 layout(std430, set = 0, binding = 11) readonly buffer ClipRef { uint8_t clipRef[]; };
 layout(std430, set = 0, binding = 12) writeonly buffer Out { uint8_t outPx[]; };
+layout(std430, set = 0, binding = 10) readonly buffer ClipSrc16 { uint16_t clipSrc16[]; };
+layout(std430, set = 0, binding = 11) readonly buffer ClipRef16 { uint16_t clipRef16[]; };
+layout(std430, set = 0, binding = 12) writeonly buffer Out16 { uint16_t outPx16[]; };
 layout(std430, set = 0, binding = 13) readonly buffer Taps { int taps[]; };

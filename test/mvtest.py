@@ -28,6 +28,24 @@ def nv12_clip(core, path, w, h, frames):
     return core.std.ModifyFrame(blank, blank, fill)
 
 
+def format_clip(core, clip, fmt):
+    """The 8-bit clip in the VapourSynth preset format fmt (resize.Bicubic). Converted to more than 8
+    bits it is shifted a quarter pixel on the way, so that the low bits hold picture, not zeros."""
+    f = core.get_video_format(getattr(vs, fmt))
+    if f.bits_per_sample > 8:
+        return core.resize.Bicubic(clip, format=f.id, src_left=0.25, src_top=0.25)
+    return clip if f.id == clip.format.id else core.resize.Bicubic(clip, format=f.id)
+
+
+def eight_bit(core, clip):
+    """An 8-bit copy of a clip, rounded, for analysing a high bit depth clip on 8 bits"""
+    f = clip.format
+    if f.bits_per_sample == 8:
+        return clip
+    eight = core.query_video_format(f.color_family, vs.INTEGER, 8, f.subsampling_w, f.subsampling_h)
+    return core.resize.Point(clip, format=eight.id, dither_type='none')
+
+
 def mvu_vectors(core, analysis, carrier, frames):
     """mvgpu's vectors of one field clip on a CPU carrier clip, as mvu.Analyse would attach them"""
     props = analysis.get_frame(0).props
@@ -57,8 +75,8 @@ def mvu_vectors(core, analysis, carrier, frames):
 
 def gpu_vectors(core, analysis, gsup):
     """mvu.Analyse's vectors of one field clip as mvgpu.Analyse would attach them, on the frames of
-    gsup, the mvgpu super of the same clip with the same arguments: for testing mvgpu's consumers of
-    vectors on grids and formats mvgpu.Analyse doesn't search yet"""
+    gsup, the mvgpu super of the same clip with the same arguments: for testing mvgpu's consumers on
+    vectors mvgpu's search wouldn't find, and on frames narrower than mvgpu.Analyse takes"""
     props = analysis.get_frame(0).props
     desc = {k.replace('MVUtensils', 'MVGPUtensils', 1): int(props[k]) for k in props.keys()
             if k.startswith('MVUtensilsAnalysis') and k not in ('MVUtensilsAnalysisVectors', 'MVUtensilsAnalysisSAD')}

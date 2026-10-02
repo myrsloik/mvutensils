@@ -5,27 +5,15 @@
 layout(local_size_x = 64) in;
 
 // mvu.Degrain's DegrainWeight, 256 (1 - r^2) / (1 + r^2) truncated with r = sad / th in double
-// precision: exactly floor(256 (th^2 - sad^2) / (th^2 + sad^2)). The double's error is far below
-// the distance of that fraction from an integer, which is one only at sad 0, so both truncate alike
-// (for every th below 2^20 provably, and by an exhaustive check up to 6000 and 2 * 10^8 samples to
-// 2^31). The 8 quotient bits come by long division: the numerator stays below 2^64.
-uint Weight(int th, int sad) {
-    if (sad >= th)
-        return 0u;
-    if (sad == 0)
-        return 256u;
-    uint64_t t2 = uint64_t(th) * uint64_t(th), s2 = uint64_t(sad) * uint64_t(sad);
-    uint64_t num = t2 - s2, den = t2 + s2;
-    uint q = 0u;
-    for (int i = 0; i < 8; ++i) {
-        num <<= 1;
-        q <<= 1u;
-        if (num >= den) {
-            num -= den;
-            q |= 1u;
-        }
-    }
-    return q;
+// precision, from the reference's 256 weight steps at tables[at] (Degrain.cpp's WeightSteps): the
+// largest k whose step, the least SAD with a weight under k, is above the SAD, by binary search. The
+// weight never rises with the SAD, so the steps give exactly mvu's at every SAD.
+uint Weight(int at, int sad) {
+    uint k = 0u;
+    for (uint jump = 128u; jump != 0u; jump >>= 1u)
+        if (sad < tables[at + int(k + jump) - 1])
+            k += jump;
+    return k == 255u && sad < tables[at + 255] ? 256u : k;
 }
 
 // normaliseWeights' share of a weighted reference weight a of the total s, int(a * (256.0 / s))
@@ -86,8 +74,8 @@ void main() {
     for (int r = 0; r < pc.refs; ++r) {
         if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
             int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
-            totalL += int(Weight(tables[pc.thOff + r], sad)) * uw;
-            totalC += int(Weight(tables[pc.thOff + pc.refs + r], sad)) * uw;
+            totalL += int(Weight(pc.thOff + 256 * r, sad)) * uw;
+            totalC += int(Weight(pc.thOff + 256 * (pc.refs + r), sad)) * uw;
         }
     }
     int centreL = 256, centreC = 256;
@@ -95,8 +83,8 @@ void main() {
         uint wl = 0u, wc = 0u;
         if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
             int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
-            wl = Normalised(Weight(tables[pc.thOff + r], sad) * uint(uw), uint(totalL));
-            wc = Normalised(Weight(tables[pc.thOff + pc.refs + r], sad) * uint(uw), uint(totalC));
+            wl = Normalised(Weight(pc.thOff + 256 * r, sad) * uint(uw), uint(totalL));
+            wc = Normalised(Weight(pc.thOff + 256 * (pc.refs + r), sad) * uint(uw), uint(totalC));
         }
         centreL -= int(wl);
         centreC -= int(wc);

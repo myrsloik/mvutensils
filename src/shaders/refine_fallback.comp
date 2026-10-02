@@ -22,11 +22,11 @@ layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; 
 // block's current vector and no more than every position measured so far, and its cost only grows
 // as its SAD adds up. So a position whose partial cost passes that bound is dropped; the winner
 // never is, since the bound never falls below its cost. The SAD adds up in kUnits equal units,
-// unit u being luma rows 2u and 2u + 1 and chroma row u of U and V (the luma rows alone without
-// chroma), in three phases: every position's first units, then the next for the positions still
-// within the bound, then the rest for those still within it, each phase's survivors gathered into
-// a list so that every lane stays busy. Measured on the CPU at 16x16, 8-24% of the positions
-// survive five units.
+// unit u being luma rows 2u and 2u + 1 and the chroma rows of U and V beside them, row u at 4:2:0,
+// 2u and 2u + 1 at 4:4:4 (the luma rows alone without chroma), in three phases: every position's
+// first units, then the next for the positions still within the bound, then the rest for those
+// still within it, each phase's survivors gathered into a list so that every lane stays busy.
+// Measured on the CPU at 16x16, 8-24% of the positions survive five units.
 // (Dropping each position at whichever unit passes the bound, every lane moving on by itself,
 // saved more units but was slower: the lanes then diverge at every step.)
 
@@ -69,9 +69,9 @@ void Append(int list, bool keep, uint pos, uint cost) {
         sList[list][base + subgroupBallotExclusiveBitCount(ballot)] = uvec2(pos, cost);
 }
 
-// The lane's position: its SAD's word addresses and shifts as LaneSad computes them (at pel 4 its
-// chroma rows' sample addresses in the images), its lambda term (saturated to 32 bits: anything that
-// large passes every bound), and the partial sums of the units measured
+// The lane's position: its SAD's word addresses and shifts as LaneSad computes them (or its chroma
+// rows' sample addresses in the quarter-pel images), its lambda term (saturated to 32 bits: anything
+// that large passes every bound), and the partial sums of the units measured
 int64_t gLam;
 uint gW, gShift, gWU, gWV, gShiftC, gSa, gSm;
 
@@ -84,17 +84,17 @@ void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     }
     int idx = (X & 1) | ((Y & 1) << 1); // the search's positions are whole pels; at pel 2 a clamped one near it may not be
     uint a = uint(idx * pc.wp * pc.hp + (Y >> 1) * pc.wp + (X >> 1));
-    gW = a >> 2u;
-    gShift = (a & 3u) << 3u;
-    int Xc = kPel * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = kPel * (gY / 2 + pc.padc) + ChromaComponent(v.y);
+    gW = WordOf(a);
+    gShift = ShiftOf(a);
+    int Xc = kPel * ((gX >> kLogC) + pc.padc) + ChromaComponent(v.x), Yc = kPel * ((gY >> kLogC) + pc.padc) + ChromaComponent(v.y);
     uint ac = ChromaAddr(Xc, Yc);
-    if (kPel == 4) {
+    if (kImage) {
         gWU = ac;
         gWV = ac + ChromaV();
     } else {
-        gWU = ac >> 2u;
-        gWV = (ac + ChromaV()) >> 2u;
-        gShiftC = (ac & 3u) << 3u;
+        gWU = WordOf(ac);
+        gWV = WordOf(ac + ChromaV());
+        gShiftC = ShiftOf(ac);
     }
     int dx = v.x - p.x, dy = v.y - p.y;
     gLam = (lambda * int64_t(dx * dx + dy * dy)) >> 8;
@@ -104,7 +104,7 @@ void Setup(ivec2 v, ivec2 p, int64_t lambda) {
 
 // Adds unit u of the lane's position to its partial sums
 void Unit(int u) {
-    uint stride = uint(pc.wp) >> 2u, strideC = uint(pc.wc) >> 2u;
+    uint stride = uint(pc.wp) >> uint(kLogSPW), strideC = uint(pc.wc) >> uint(kLogSPW);
     [[unroll]] for (int jj = 0; jj < 2; ++jj) {
         int j = 2 * u + jj;
         uint wj = gW + uint(j) * stride;
@@ -118,28 +118,32 @@ void Unit(int u) {
     if (!kChroma)
         return;
     int curU = kLumaWords, curV = curU + kChromaWords;
-    if (kPel == 4) {
-        uint au = gWU + uint(u * ChromaRow()), av = gWV + uint(u * ChromaRow());
-        [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-            PackedStep(Strided4(au + uint(16 * i)), curU + u * kRowWordsC + i, gSa, gSm);
-            PackedStep(Strided4(av + uint(16 * i)), curV + u * kRowWordsC + i, gSa, gSm);
+    // chroma rows 2u >> kLogC up to before (2u + 2) >> kLogC
+    [[unroll]] for (int jj = 0; jj < (2 >> kLogC); ++jj) {
+        int jc = ((2 * u) >> kLogC) + jj;
+        if (kImage) {
+            uint au = gWU + uint(jc * ChromaRow()), av = gWV + uint(jc * ChromaRow());
+            [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
+                PackedStep(StridedWord(au + uint(4 * kSPW * i)), curU + jc * kRowWordsC + i, gSa, gSm);
+                PackedStep(StridedWord(av + uint(4 * kSPW * i)), curV + jc * kRowWordsC + i, gSa, gSm);
+            }
+            continue;
         }
-        return;
-    }
-    uint ru = gWU + uint(u) * strideC, rv = gWV + uint(u) * strideC;
-    uint loU = refC[ru], loV = refC[rv];
-    [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-        uint hiU = refC[ru + uint(i) + 1u], hiV = refC[rv + uint(i) + 1u];
-        PackedStep(Bytes4(loU, hiU, gShiftC), curU + u * kRowWordsC + i, gSa, gSm);
-        PackedStep(Bytes4(loV, hiV, gShiftC), curV + u * kRowWordsC + i, gSa, gSm);
-        loU = hiU;
-        loV = hiV;
+        uint ru = gWU + uint(jc) * strideC, rv = gWV + uint(jc) * strideC;
+        uint loU = refC[ru], loV = refC[rv];
+        [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
+            uint hiU = refC[ru + uint(i) + 1u], hiV = refC[rv + uint(i) + 1u];
+            PackedStep(Bytes4(loU, hiU, gShiftC), curU + jc * kRowWordsC + i, gSa, gSm);
+            PackedStep(Bytes4(loV, hiV, gShiftC), curV + jc * kRowWordsC + i, gSa, gSm);
+            loU = hiU;
+            loV = hiV;
+        }
     }
 }
 
-// The SAD of units ua .. ub - 1, measured since Setup
+// The SAD of units ua .. ub - 1, measured since Setup (16-bit samples sum the SAD itself)
 uint UnitsSad(int ua, int ub) {
-    return gSa + (sUnitBefore[ub] - sUnitBefore[ua]) - 2u * gSm;
+    return kWide ? gSa : gSa + (sUnitBefore[ub] - sUnitBefore[ua]) - 2u * gSm;
 }
 
 void main() {
@@ -157,18 +161,18 @@ void main() {
     barrier();
     uint partial = 0u;
     for (int k = lane; k < kBlockWords; k += lanes) {
-        uint px[4];
+        uint px[4] = uint[4](0u, 0u, 0u, 0u);
         int unit;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kSPW; ++i) {
             if (k < kLumaWords) {
-                px[i] = uint(curY[(gY + pc.pad + k / kRowWords) * pc.wp + gX + pc.pad + (k % kRowWords) * 4 + i]);
+                px[i] = CurLuma((gY + pc.pad + k / kRowWords) * pc.wp + gX + pc.pad + (k % kRowWords) * kSPW + i);
                 unit = k / kRowWords / 2;
             } else {
                 int kc = k - kLumaWords;
                 uint plane = kc < kChromaWords ? 0u : ChromaV();
                 kc %= kChromaWords;
-                px[i] = uint(curC[plane + ChromaPixel(gX / 2 + pc.padc + (kc % kRowWordsC) * 4 + i, gY / 2 + pc.padc + kc / kRowWordsC)]);
-                unit = kc / kRowWordsC;
+                px[i] = CurChroma(plane + ChromaPixel((gX >> kLogC) + pc.padc + (kc % kRowWordsC) * kSPW + i, (gY >> kLogC) + pc.padc + kc / kRowWordsC));
+                unit = ((kc / kRowWordsC) << kLogC) / 2;
             }
         }
         uint sum = px[0] + px[1] + px[2] + px[3];
@@ -197,10 +201,10 @@ void main() {
             before += sUnitSum[u];
         }
         sUnitBefore[kUnits] = before;
-        // capped below 2^32 - 2^20, so that a cost within it plus a SAD stays within 32 bits; the
-        // positions searched cost far less (a SAD below 2^17, and lambda * |v - p|^2 / 256 within
-        // a window of a few hundred half-pels)
-        sBound = uint(clamp(bestCost - 1, int64_t(0), int64_t(0xFFF00000)));
+        // capped below 2^32 - 2^20 (2^32 - 2^28 for 16-bit samples), so that a cost within it plus a
+        // SAD stays within 32 bits; the positions searched cost far less (a SAD below 2^20, or 2^28,
+        // and lambda * |v - p|^2 / 256 within a window of a few hundred half-pels)
+        sBound = uint(clamp(bestCost - 1, int64_t(0), int64_t(kWide ? 0xF0000000u : 0xFFF00000u)));
     }
     barrier();
 

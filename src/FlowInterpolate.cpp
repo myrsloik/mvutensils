@@ -25,8 +25,9 @@
 // bilinear resize in mvu, in 64 x 64 tiles, which flow_inter.comp reproduces with the taps zimg
 // computes for each tile (ResizeTaps).
 //
-// Implemented: all of their arguments, on mvgpu.Super's 8-bit 4:2:0 and 4:4:4 supers at pel 2 and 4
-// with square blocks of 8, 16 or 32, and vectors made from them as mvgpu.Analyse makes them.
+// Implemented: all of their arguments, on mvgpu.Super's 4:2:0 and 4:4:4 supers of 8 to 16-bit
+// samples at pel 2 and 4 with square blocks of 8, 16 or 32, and vectors made from such supers, of
+// any of those bit depths, as mvgpu.Analyse makes them.
 
 namespace {
 
@@ -397,6 +398,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 d->profile->Stamp(vc, cmd, queries, stage);
         };
 
+        const ptrdiff_t bytes = L.format.Bytes(); // strides in samples
         FlowParams pc = {};
         pc.nbx = d->nbx;
         pc.nby = d->nby;
@@ -406,9 +408,9 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.padY = L.padY;
         pc.padc = L.padc;
         pc.padcY = L.padcY;
-        pc.wp = static_cast<int32_t>(lumaStride);
+        pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride);
+        pc.wc = static_cast<int32_t>(chromaStride / bytes);
         pc.hc = L.hc;
         pc.time256 = time256;
         pc.thscd1 = d->thscd1;
@@ -444,8 +446,8 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
-            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p));
-            pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p));
+            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
+            pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
             pc.colOff = d->colOff[p ? 1 : 0];
             pc.rowOff = d->rowOff[p ? 1 : 0];
             rec.Bind(kFlClipSrc, clipSrc[p].buffer);
@@ -524,7 +526,7 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         const SuperLayout &L = d->layout;
         if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
             throw std::runtime_error(unsupported);
-        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != 8 ||
+        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != L.format.bits ||
             (1 << d->vi.format.subSamplingW) != L.format.xr || (1 << d->vi.format.subSamplingH) != L.format.yr || d->vi.width != L.width || d->vi.height != L.height)
             throw std::runtime_error("super clip is not compatible with source clip");
 
@@ -533,17 +535,16 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         d->mvbw = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         d->mvfw = vsapi->mapGetNode(in, "vectors", 1, nullptr);
 
-        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one (mvu's
-        // IsCompatibleWithAnalysis), both on one grid (IsCompatible), with opposite deltas. The grid
-        // is theirs, as in mvu; the super only supplies the planes.
+        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
+        // depth (mvu's IsCompatibleWithAnalysis), both on one grid (IsCompatible), with opposite
+        // deltas. The grid is theirs, as in mvu; the super only supplies the planes.
         VectorInfo info[2];
         VSNode *nodes[2] = {d->mvfw, d->mvbw};
         for (int i = 0; i < 2; ++i) {
             const VectorInfo &v = info[i] = ReadVectorInfo(nodes[i], d->prefix, vsapi);
             const SuperLayout analysed = ImportSuperLayout(nodes[i], d->prefix, vsapi);
-            if (i == 0 && (!SameStorage(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
-                           v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || v.bits != L.format.bits ||
-                           (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
+            if (i == 0 && (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
+                           v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
                 throw std::runtime_error("wrong source or super clip frame size");
             if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
                 v.nby != analysed.nby)
@@ -562,7 +563,7 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         d->nbx = fw.nbx;
         d->nby = fw.nby;
 
-        // mvu's ScaleThSCD and GetThSCDScaleFactor, for mvfw's block size, chroma and 8 bits
+        // mvu's ScaleThSCD and GetThSCDScaleFactor, for mvfw's block size, chroma and bit depth
         constexpr int maxSAD = 8 * 8 * 255;
         if (thscd1 < 0 || thscd1 > maxSAD)
             throw std::runtime_error("thscd1 must be between 0 and " + std::to_string(maxSAD));
@@ -597,7 +598,7 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
         d->prep = vc.Pipeline(Kernel::FlowPrep, 0, L.pel, chromaLog);
-        d->pixels = vc.Pipeline(Kernel::FlowInter, 0, L.pel, chromaLog);
+        d->pixels = vc.Pipeline(Kernel::FlowInter, 0, L.pel, chromaLog | (L.format.bits > 8 ? 4 : 0));
         if (static_cast<VkDeviceSize>(2) * d->nbx * d->nby * 4 > vc.limits.maxStorageBufferRange)
             throw std::runtime_error("the frame is too large for the device's storage buffers");
 

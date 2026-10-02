@@ -2,7 +2,8 @@
 //
 // The CPU reference of mvgpu.Analyse and mvgpu.AnalyseMany: the GPU search step for step, in plain
 // C++, so that test/check_reference.py can compare the plugin's vectors with it byte for byte. It
-// reads raw 8-bit planar frames and builds what mvgpu.Super builds from them (mvu.Super's planes:
+// reads raw planar frames of 8 to 16-bit samples and builds what mvgpu.Super builds from them
+// (mvu.Super's planes:
 // edge-padded, half-pel Wiener planes, quarter samples computed from them at pel 4; and the coarse
 // pyramid, halved with rfilter 1's filter), then refines every field:
 //
@@ -20,19 +21,22 @@
 // The SAD is MVUtensils': luma plus U and V at the chroma block size, the chroma vector the luma
 // vector divided by the subsampling, toward zero; with --chroma 0 luma only. The cost is
 // SAD + ((lambda * |v - p|^2) >> 8), p the component-wise median of the four neighbours, lambda
-// relaxed by (lsad / (lsad + worst neighbour SAD / 2))^2.
+// relaxed by (lsad / (lsad + worst neighbour SAD / 2))^2, the worst SAD / 2 taken in steps of
+// 2^(bits - 8) (Analyse.cpp tabulates lambda by it). mvlambda, lsad and badsad are scaled to the bit
+// depth as mvu.Analyse scales them, by (2^bits - 1) / 255.
 //
 // Build:  clang-cl /nologo /O2 /std:c++20 /EHsc reference.cpp   (or meson compile mvgpu_reference)
 //
 // Usage:  reference --src frames.yuv --size WxH --frames N --out vectors.bin [--format 420|444]
-//                   [--blksize 16] [--overlap 8] [--pad 16] [--pel 2] [--radius 2] [--delta 1]
-//                   [--standalone] [--chroma 1] [--plevel 1] [--mvlambda 1000] [--lsad 400]
-//                   [--badsad 1000] [--badrange 40] [--badstep 2] [--threads 16]
+//                   [--bits 8] [--blksize 16] [--overlap 8] [--pad 16] [--pel 2] [--radius 2]
+//                   [--delta 1] [--standalone] [--chroma 1] [--plevel 1] [--mvlambda 1000]
+//                   [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2] [--threads 16]
 //
 // The arguments are mvgpu.Super's and mvgpu.AnalyseMany's (--standalone: an Analyse per delta,
 // without chained or inverted seeds); badsad is per 8x8 block, as mvgpu takes it. The frames are
-// raw 8-bit planar Y, U, V, at 4:2:0 or 4:4:4 (mvgpu.Analyse searches 4:2:0 so far); with
-// subsampled chroma the padding must be even, as mvgpu has it. The output holds every field (n, d)
+// raw planar Y, U, V, at 4:2:0 or 4:4:4, bytes at 8 bits and 16-bit little-endian samples at 9 to
+// 16 (--bits); with subsampled chroma the padding must be even, as mvgpu has it. The output holds
+// every field (n, d)
 // as six 32-bit ints, n, d, nbx, nby, pel and 1, then the nbx * nby x components, the y components
 // and the SADs.
 //
@@ -97,70 +101,75 @@ constexpr int kMaxSeeds = 10;   // seed slots per block
 // ---------------------------------------------------------------------------------------------
 // The super's planes
 
-// One plane of one frame as mvu.Super pel 2 holds it: edge-padded, plus the three half-pel planes
+// One plane of one frame as mvu.Super pel 2 holds it: edge-padded, plus the three half-pel planes;
+// samples of type T, bytes or 16 bits
+template <typename T>
 struct Plane {
-    int w = 0, h = 0;          // padded size
-    std::vector<uint8_t> p[4]; // full, x + 1/2, y + 1/2, both
+    int w = 0, h = 0;    // padded size
+    std::vector<T> p[4]; // full, x + 1/2, y + 1/2, both
 };
 
-uint8_t Avg(int a, int b) {
-    return static_cast<uint8_t>((a + b + 1) >> 1);
+int Avg(int a, int b) {
+    return (a + b + 1) >> 1;
 }
 
-uint8_t Wiener(int m0, int m1, int m2, int m3, int m4, int m5) {
+int Wiener(int m0, int m1, int m2, int m3, int m4, int m5, int pixelMax) {
     const int m = (((m2 + m3) * 4 - (m1 + m4)) * 5 + m0 + m5 + 16) >> 5;
-    return static_cast<uint8_t>(std::clamp(m, 0, 255));
+    return std::clamp(m, 0, pixelMax);
 }
 
 // SuperPyramid.cpp's HorizontalWiener and VerticalWiener, border handling included
-void HorizontalWiener(uint8_t *dst, const uint8_t *src, int w, int h) {
+template <typename T>
+void HorizontalWiener(T *dst, const T *src, int w, int h, int pixelMax) {
     for (int j = 0; j < h; ++j) {
-        const uint8_t *s = src + static_cast<size_t>(j) * w;
-        uint8_t *d = dst + static_cast<size_t>(j) * w;
-        d[0] = Avg(s[0], s[1]);
-        d[1] = Avg(s[1], s[2]);
+        const T *s = src + static_cast<size_t>(j) * w;
+        T *d = dst + static_cast<size_t>(j) * w;
+        d[0] = static_cast<T>(Avg(s[0], s[1]));
+        d[1] = static_cast<T>(Avg(s[1], s[2]));
         for (int i = 2; i < w - 4; ++i)
-            d[i] = Wiener(s[i - 2], s[i - 1], s[i], s[i + 1], s[i + 2], s[i + 3]);
+            d[i] = static_cast<T>(Wiener(s[i - 2], s[i - 1], s[i], s[i + 1], s[i + 2], s[i + 3], pixelMax));
         for (int i = w - 4; i < w - 1; ++i)
-            d[i] = Avg(s[i], s[i + 1]);
+            d[i] = static_cast<T>(Avg(s[i], s[i + 1]));
         d[w - 1] = s[w - 1];
     }
 }
 
-void VerticalWiener(uint8_t *dst, const uint8_t *src, int w, int h) {
-    auto row = [&](const uint8_t *base, int j) { return base + static_cast<size_t>(j) * w; };
+template <typename T>
+void VerticalWiener(T *dst, const T *src, int w, int h, int pixelMax) {
+    auto row = [&](const T *base, int j) { return base + static_cast<size_t>(j) * w; };
     for (int j = 0; j < 2; ++j)
         for (int i = 0; i < w; ++i)
-            dst[static_cast<size_t>(j) * w + i] = Avg(row(src, j)[i], row(src, j + 1)[i]);
+            dst[static_cast<size_t>(j) * w + i] = static_cast<T>(Avg(row(src, j)[i], row(src, j + 1)[i]));
     for (int j = 2; j < h - 4; ++j) {
-        const uint8_t *r0 = row(src, j - 2), *r1 = row(src, j - 1), *r2 = row(src, j), *r3 = row(src, j + 1), *r4 = row(src, j + 2), *r5 = row(src, j + 3);
-        uint8_t *d = dst + static_cast<size_t>(j) * w;
+        const T *r0 = row(src, j - 2), *r1 = row(src, j - 1), *r2 = row(src, j), *r3 = row(src, j + 1), *r4 = row(src, j + 2), *r5 = row(src, j + 3);
+        T *d = dst + static_cast<size_t>(j) * w;
         for (int i = 0; i < w; ++i)
-            d[i] = Wiener(r0[i], r1[i], r2[i], r3[i], r4[i], r5[i]);
+            d[i] = static_cast<T>(Wiener(r0[i], r1[i], r2[i], r3[i], r4[i], r5[i], pixelMax));
     }
     for (int j = h - 4; j < h - 1; ++j)
         for (int i = 0; i < w; ++i)
-            dst[static_cast<size_t>(j) * w + i] = Avg(row(src, j)[i], row(src, j + 1)[i]);
-    memcpy(dst + static_cast<size_t>(h - 1) * w, row(src, h - 1), w);
+            dst[static_cast<size_t>(j) * w + i] = static_cast<T>(Avg(row(src, j)[i], row(src, j + 1)[i]));
+    memcpy(dst + static_cast<size_t>(h - 1) * w, row(src, h - 1), w * sizeof(T));
 }
 
 // w x h pixels of src, extended to the block-aligned aw x ah and padded by padX and padY, repeating
 // the edge pixels, as CopyAndPadPlane does; then its half-pel planes
-Plane MakePlane(const uint8_t *src, int w, int h, int padX, int padY, int aw, int ah) {
-    Plane pl;
+template <typename T>
+Plane<T> MakePlane(const T *src, int w, int h, int padX, int padY, int aw, int ah, int pixelMax) {
+    Plane<T> pl;
     pl.w = aw + 2 * padX;
     pl.h = ah + 2 * padY;
     for (auto &p : pl.p)
         p.resize(static_cast<size_t>(pl.w) * pl.h);
-    uint8_t *d = pl.p[0].data();
+    T *d = pl.p[0].data();
     for (int y = 0; y < pl.h; ++y) {
         const int sy = std::clamp(y - padY, 0, h - 1);
         for (int x = 0; x < pl.w; ++x)
             d[static_cast<size_t>(y) * pl.w + x] = src[static_cast<size_t>(sy) * w + std::clamp(x - padX, 0, w - 1)];
     }
-    HorizontalWiener(pl.p[1].data(), pl.p[0].data(), pl.w, pl.h);
-    VerticalWiener(pl.p[2].data(), pl.p[0].data(), pl.w, pl.h);
-    HorizontalWiener(pl.p[3].data(), pl.p[2].data(), pl.w, pl.h);
+    HorizontalWiener(pl.p[1].data(), pl.p[0].data(), pl.w, pl.h, pixelMax);
+    VerticalWiener(pl.p[2].data(), pl.p[0].data(), pl.w, pl.h, pixelMax);
+    HorizontalWiener(pl.p[3].data(), pl.p[2].data(), pl.w, pl.h, pixelMax);
     return pl;
 }
 
@@ -168,23 +177,26 @@ Plane MakePlane(const uint8_t *src, int w, int h, int padX, int padY, int aw, in
 // exactly as mvu.Super's quarter planes hold it (SuperPyramid.cpp's GeneratePelQuarters): on the
 // half-pel grid that plane's sample; otherwise the rounded average of its two neighbours on the
 // grid, diagonally the average of the two vertical averages
-uint8_t QuarterSample(const Plane &pl, int X, int Y) {
+template <typename T>
+int QuarterSample(const Plane<T> &pl, int X, int Y) {
     auto at = [&](int Xh, int Yh) { return static_cast<int>(pl.p[(Xh & 1) | ((Yh & 1) << 1)][static_cast<size_t>(Yh >> 1) * pl.w + (Xh >> 1)]); };
     const int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
     return Avg(Avg(at(Xa, Ya), at(Xa, Yb)), Avg(at(Xb, Ya), at(Xb, Yb)));
 }
 
 // One plane of the pyramid: halved repeatedly, unpadded, edges repeated on access
+template <typename T>
 struct SmallPlane {
     int w = 0, h = 0;
-    std::vector<uint8_t> p;
-    uint8_t At(int x, int y) const { return p[static_cast<size_t>(std::clamp(y, 0, h - 1)) * w + std::clamp(x, 0, w - 1)]; }
+    std::vector<T> p;
+    int At(int x, int y) const { return p[static_cast<size_t>(std::clamp(y, 0, h - 1)) * w + std::clamp(x, 0, w - 1)]; }
 };
 
 // SuperPyramid.cpp's RB2BilinearFiltered (mvu.Super's default rfilter=1): 1/8, 3/8, 3/8, 1/8 in
 // both directions, a plain average at the edges
-SmallPlane Reduce(const SmallPlane &src) {
-    SmallPlane d;
+template <typename T>
+SmallPlane<T> Reduce(const SmallPlane<T> &src) {
+    SmallPlane<T> d;
     d.w = (src.w + 1) / 2;
     d.h = (src.h + 1) / 2;
     d.p.resize(static_cast<size_t>(d.w) * d.h);
@@ -196,20 +208,21 @@ SmallPlane Reduce(const SmallPlane &src) {
             else
                 tmp[x] = (src.At(x, 2 * y - 1) + (src.At(x, 2 * y) + src.At(x, 2 * y + 1)) * 3 + src.At(x, 2 * y + 2) + 4) >> 3;
         }
-        uint8_t *row = d.p.data() + static_cast<size_t>(y) * d.w;
-        row[0] = static_cast<uint8_t>((tmp[0] + tmp[1] + 1) >> 1);
+        T *row = d.p.data() + static_cast<size_t>(y) * d.w;
+        row[0] = static_cast<T>((tmp[0] + tmp[1] + 1) >> 1);
         for (int x = 1; x < d.w - 1; ++x)
-            row[x] = static_cast<uint8_t>((tmp[2 * x - 1] + (tmp[2 * x] + tmp[2 * x + 1]) * 3 + tmp[2 * x + 2] + 4) >> 3);
+            row[x] = static_cast<T>((tmp[2 * x - 1] + (tmp[2 * x] + tmp[2 * x + 1]) * 3 + tmp[2 * x + 2] + 4) >> 3);
         if (d.w > 1)
-            row[d.w - 1] = static_cast<uint8_t>((tmp[2 * (d.w - 1)] + tmp[2 * (d.w - 1) + 1] + 1) >> 1);
+            row[d.w - 1] = static_cast<T>((tmp[2 * (d.w - 1)] + tmp[2 * (d.w - 1) + 1] + 1) >> 1);
     }
     return d;
 }
 
+template <typename T>
 struct Frame {
-    Plane y, u, v;
+    Plane<T> y, u, v;
     // levels[L - 1] holds Y, U, V at 1 / 2^L of the frame's size, L = 1 .. top level
-    std::vector<std::array<SmallPlane, 3>> levels;
+    std::vector<std::array<SmallPlane<T>, 3>> levels;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -239,6 +252,31 @@ int BlockSad(const uint8_t *a, ptrdiff_t pa, const uint8_t *b, ptrdiff_t pb, int
     return sad;
 }
 
+int BlockSad(const uint16_t *a, ptrdiff_t pa, const uint16_t *b, ptrdiff_t pb, int bw, int bh) {
+#ifdef REFERENCE_SSE2
+    if (bw % 8 == 0) {
+        const __m128i zero = _mm_setzero_si128();
+        __m128i acc = zero;
+        for (int y = 0; y < bh; ++y) {
+            const uint16_t *ra = a + y * pa, *rb = b + y * pb;
+            for (int x = 0; x < bw; x += 8) {
+                const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ra + x)), vb = _mm_loadu_si128(reinterpret_cast<const __m128i *>(rb + x));
+                const __m128i d = _mm_or_si128(_mm_subs_epu16(va, vb), _mm_subs_epu16(vb, va)); // |a - b|
+                acc = _mm_add_epi32(acc, _mm_add_epi32(_mm_unpacklo_epi16(d, zero), _mm_unpackhi_epi16(d, zero)));
+            }
+        }
+        acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+        acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+        return _mm_cvtsi128_si32(acc);
+    }
+#endif
+    int sad = 0;
+    for (int y = 0; y < bh; ++y)
+        for (int x = 0; x < bw; ++x)
+            sad += std::abs(a[y * pa + x] - b[y * pb + x]);
+    return sad;
+}
+
 using Key = std::pair<int, int>; // field (n, d)
 
 struct Vec {
@@ -252,10 +290,11 @@ struct Field {
     std::vector<int> sad;
 };
 
+template <typename T>
 struct Search {
     // The clip: frames of w x h, chroma subsampled by xr and yr (1 or 2)
     int w = 0, h = 0, frames = 0, xr = 2, yr = 2;
-    std::vector<Frame> clip;
+    std::vector<Frame<T>> clip;
     // The grid: blk x blk blocks, step apart, nbx x nby of them covering the block-aligned aw x ah,
     // extended by a column or row while they fall short of the frame, as mvu.Super and mvu.Analyse
     // have it; the planes padded by pad, chroma by padc horizontally and padcY vertically
@@ -273,6 +312,15 @@ struct Search {
     int badSad = 0;          // scaled to the block size
     int fallbackRadius = 0;  // px; 0 = no fallback
     int fallbackStep = 1;    // px between the positions it searches, then the positions around the best
+    int depthShift = 0;      // bits - 8: lambda is relaxed by the worst SAD / 2 in steps of 2^depthShift
+
+    // lambda relaxed by lsad for the worst neighbour SAD, which counts in steps of 2^depthShift
+    // halves (Analyse.cpp's tables)
+    int64_t Relaxed(int64_t lambda, int worst) const {
+        const int64_t half = static_cast<int64_t>(worst >> (1 + depthShift)) << depthShift;
+        const double sc = static_cast<double>(lsad) / std::max<int64_t>(lsad + half, 1);
+        return static_cast<int64_t>(lambda * sc * sc);
+    }
 
     // Block b's position in the frame
     int BX(int b) const { return (b % nbx) * step; }
@@ -299,22 +347,22 @@ struct Search {
 
     // One plane's bw x bh block at (X, Y), 1 / pel pixels of the padded plane, against the current
     // block: read in place when the position is on the half-pel grid, else computed (pel 4)
-    int PlaneSad(const uint8_t *cur, ptrdiff_t curStride, const Plane &ref, int X, int Y, int bw, int bh) const {
+    int PlaneSad(const T *cur, ptrdiff_t curStride, const Plane<T> &ref, int X, int Y, int bw, int bh) const {
         if (pel == 2 || ((X | Y) & 1) == 0) {
             const int Xh = pel == 2 ? X : X >> 1, Yh = pel == 2 ? Y : Y >> 1;
             return BlockSad(cur, curStride, ref.p[(Xh & 1) | ((Yh & 1) << 1)].data() + static_cast<size_t>(Yh >> 1) * ref.w + (Xh >> 1), ref.w, bw, bh);
         }
-        std::vector<uint8_t> tmp(static_cast<size_t>(bw) * bh);
+        std::vector<T> tmp(static_cast<size_t>(bw) * bh);
         for (int j = 0; j < bh; ++j)
             for (int i = 0; i < bw; ++i)
-                tmp[j * bw + i] = QuarterSample(ref, X + 4 * i, Y + 4 * j);
+                tmp[j * bw + i] = static_cast<T>(QuarterSample(ref, X + 4 * i, Y + 4 * j));
         return BlockSad(cur, curStride, tmp.data(), bw, bw, bh);
     }
 
     // The SAD of the block at (x, y) of frame n against frame r displaced by v
     int Sad(int n, int r, int x, int y, Vec v) const {
-        const Frame &cf = clip[n], &rf = clip[r];
-        const uint8_t *cur = cf.y.p[0].data() + static_cast<size_t>(y + pad) * cf.y.w + (x + pad);
+        const Frame<T> &cf = clip[n], &rf = clip[r];
+        const T *cur = cf.y.p[0].data() + static_cast<size_t>(y + pad) * cf.y.w + (x + pad);
         int sad = PlaneSad(cur, cf.y.w, rf.y, pel * (x + pad) + v.x, pel * (y + pad) + v.y, blk, blk);
         if (!chroma)
             return sad;
@@ -330,7 +378,7 @@ struct Search {
     // pels of that level: luma plus U and V at the chroma block size, edges repeated
     int CoarseSad(int n, int r, int L, int x, int y, Vec v) const {
         const auto &cl = clip[n].levels[L - 1], &rl = clip[r].levels[L - 1];
-        const SmallPlane &cy = cl[0], &ry = rl[0];
+        const SmallPlane<T> &cy = cl[0], &ry = rl[0];
         int sad = 0;
         if (x + v.x >= 0 && y + v.y >= 0 && x + v.x + 8 <= ry.w && y + v.y + 8 <= ry.h && x + 8 <= cy.w && y + 8 <= cy.h) {
             sad = BlockSad(cy.p.data() + static_cast<size_t>(y) * cy.w + x, cy.w, ry.p.data() + static_cast<size_t>(y + v.y) * ry.w + x + v.x, ry.w, 8, 8);
@@ -380,11 +428,12 @@ struct LevelField {
     std::vector<int> sad;
 };
 
+template <typename T>
 struct Pyramid {
-    const Search &s;
+    const Search<T> &s;
     int n, r;
     int PadAt(int L) const { return std::max(1, s.pad >> L); }
-    const SmallPlane &Luma(int L) const { return s.clip[n].levels[L - 1][0]; }
+    const SmallPlane<T> &Luma(int L) const { return s.clip[n].levels[L - 1][0]; }
     // Keep the reference block within the level's (scaled-down) padding
     Vec Bound(int L, int x, int y, Vec v) const {
         const int pad = PadAt(L);
@@ -421,8 +470,7 @@ struct Pyramid {
                     std::sort(xs, xs + 4);
                     std::sort(ys, ys + 4);
                     const Vec p{(xs[1] + xs[2]) / 2, (ys[1] + ys[2]) / 2};
-                    const double sc = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (worst >> 1), 1);
-                    const int64_t lambda = static_cast<int64_t>(lambdaL * sc * sc);
+                    const int64_t lambda = s.Relaxed(lambdaL, worst);
                     auto cost = [&](int sad, Vec v) {
                         const int64_t dx = v.x - p.x, dy = v.y - p.y;
                         return sad + ((lambda * (dx * dx + dy * dy)) >> 8);
@@ -459,16 +507,16 @@ struct Pyramid {
 
     // The finest level's field
     LevelField Run() const {
-        const int T = s.topLevel;
-        LevelField cur = Blank(T);
+        const int top = s.topLevel;
+        LevelField cur = Blank(top);
         ParallelFor(cur.nby, [&](int by) {
             for (int bx = 0; bx < cur.nbx; ++bx) {
                 const int b = by * cur.nbx + bx, x = bx * 8, y = by * 8;
-                const Vec lo = Bound(T, x, y, {-kTopRadius, -kTopRadius}), hi = Bound(T, x, y, {kTopRadius, kTopRadius});
+                const Vec lo = Bound(top, x, y, {-kTopRadius, -kTopRadius}), hi = Bound(top, x, y, {kTopRadius, kTopRadius});
                 int bestLen = INT32_MAX;
                 for (int vy = lo.y; vy <= hi.y; ++vy)
                     for (int vx = lo.x; vx <= hi.x; ++vx) {
-                        const int sad = s.CoarseSad(n, r, T, x, y, {vx, vy});
+                        const int sad = s.CoarseSad(n, r, top, x, y, {vx, vy});
                         const int len = vx * vx + vy * vy;
                         if (sad < cur.sad[b] || (sad == cur.sad[b] && len < bestLen)) {
                             cur.sad[b] = sad;
@@ -478,15 +526,15 @@ struct Pyramid {
                     }
             }
         });
-        Passes(T, cur);
-        for (int L = T - 1; L >= kFinest; --L) {
+        Passes(top, cur);
+        for (int L = top - 1; L >= kFinest; --L) {
             LevelField next = Blank(L);
             std::vector<int> mx, my;
             for (const Vec &v : cur.v) {
                 mx.push_back(2 * v.x);
                 my.push_back(2 * v.y);
             }
-            const Vec global{Search::Median(mx), Search::Median(my)};
+            const Vec global{Search<T>::Median(mx), Search<T>::Median(my)};
             ParallelFor(next.nby, [&](int by) {
                 for (int bx = 0; bx < next.nbx; ++bx) {
                     const int b = by * next.nbx + bx, x = bx * 8, y = by * 8;
@@ -529,7 +577,8 @@ struct Pyramid {
 // The seeds of every block of field (n, d): zero, the field's median, the chained and inverted
 // vectors of the fields already refined, the finest coarse level's vectors around the block;
 // clamped, on the half-pel grid, without duplicates
-std::vector<std::vector<Vec>> BuildSeeds(const Search &s, int n, int d, const LevelField &co, const std::map<Key, Field> &done) {
+template <typename T>
+std::vector<std::vector<Vec>> BuildSeeds(const Search<T> &s, int n, int d, const LevelField &co, const std::map<Key, Field> &done) {
     const int nb = s.nbx * s.nby;
     const int scale = s.pel << kFinest; // the finest level's full pels in the grid's units
     std::vector<std::vector<Vec>> seeds(nb);
@@ -544,7 +593,7 @@ std::vector<std::vector<Vec>> BuildSeeds(const Search &s, int n, int d, const Le
         mx.push_back(v.x * scale);
         my.push_back(v.y * scale);
     }
-    const Vec global{Search::Median(mx), Search::Median(my)};
+    const Vec global{Search<T>::Median(mx), Search<T>::Median(my)};
 
     // (n, d) chains (n, u) and (n + u, d - u), u the step toward d, and for d > 0 inverts (n + d, -d)
     const int u = d > 0 ? s.delta : -s.delta;
@@ -611,7 +660,8 @@ std::vector<std::vector<Vec>> BuildSeeds(const Search &s, int n, int d, const Le
 
 // The seeds measured, then pairs of checkerboard passes, the fallback, the half-pel step and at
 // pel 4 the quarter-pel step (see the top of the file)
-Field Refine(const Search &s, int n, int d, const std::vector<std::vector<Vec>> &seeds) {
+template <typename T>
+Field Refine(const Search<T> &s, int n, int d, const std::vector<std::vector<Vec>> &seeds) {
     const int nb = s.nbx * s.nby;
     const int r = n + d;
     Field f;
@@ -634,11 +684,8 @@ Field Refine(const Search &s, int n, int d, const std::vector<std::vector<Vec>> 
         }
     });
 
-    // The lambda of every (worst neighbour SAD) >> 1, as Analyse.cpp tabulates it
-    auto lambdaOf = [&](int worst) {
-        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (worst >> 1), 1);
-        return static_cast<int64_t>(s.lambda0 * scale * scale);
-    };
+    // The lambda of a worst neighbour SAD, as Analyse.cpp tabulates it
+    auto lambdaOf = [&](int worst) { return s.Relaxed(s.lambda0, worst); };
     // Predictor and relaxed lambda of block b from its four neighbours
     auto context = [&](int b, Vec &p, int64_t &lambda) {
         const int bx = b % s.nbx, by = b / s.nbx;
@@ -819,66 +866,23 @@ void WriteField(FILE *f, int n, int d, int pel, const Field &fl) {
     fwrite(a.data(), 4, a.size(), f);
 }
 
-} // namespace
-
-int main(int argc, char **argv) {
+// The arguments, as main parses them
+struct Options {
     std::string srcPath, outPath, format = "420";
-    int w = 0, h = 0, frames = 0, blk = 16, overlap = 8, pad = 16, pel = 2, radius = 2, delta = 1, plevel = 1, badrange = 40, badstep = 2;
+    int w = 0, h = 0, frames = 0, bits = 8, blk = 16, overlap = 8, pad = 16, pel = 2, radius = 2, delta = 1, plevel = 1, badrange = 40, badstep = 2;
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
     bool standalone = false, chroma = true;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&]() -> std::string {
-            if (i + 1 >= argc)
-                Die("missing value for " + a);
-            return argv[++i];
-        };
-        if (a == "--src") srcPath = next();
-        else if (a == "--size") { if (sscanf(next().c_str(), "%dx%d", &w, &h) != 2) Die("--size takes WxH"); }
-        else if (a == "--frames") frames = atoi(next().c_str());
-        else if (a == "--out") outPath = next();
-        else if (a == "--format") format = next();
-        else if (a == "--blksize") blk = atoi(next().c_str());
-        else if (a == "--overlap") overlap = atoi(next().c_str());
-        else if (a == "--pad") pad = atoi(next().c_str());
-        else if (a == "--pel") pel = atoi(next().c_str());
-        else if (a == "--radius") radius = atoi(next().c_str());
-        else if (a == "--delta") delta = atoi(next().c_str());
-        else if (a == "--standalone") standalone = true;
-        else if (a == "--chroma") chroma = atoi(next().c_str()) != 0;
-        else if (a == "--plevel") plevel = atoi(next().c_str());
-        else if (a == "--mvlambda") mvlambda = atoll(next().c_str());
-        else if (a == "--lsad") lsad = atoll(next().c_str());
-        else if (a == "--badsad") badsad = atoll(next().c_str());
-        else if (a == "--badrange") badrange = atoi(next().c_str());
-        else if (a == "--badstep") badstep = atoi(next().c_str());
-        else if (a == "--threads") gThreads = std::max(1, atoi(next().c_str()));
-        else Die("unknown option " + a);
-    }
-    if (srcPath.empty() || outPath.empty() || w < 1 || h < 1 || frames < 1)
-        Die("usage: reference --src frames.yuv --size WxH --frames N --out vectors.bin [options]; see the top of reference.cpp");
-    if (format != "420" && format != "444")
-        Die("--format takes 420 or 444");
-    if (blk != 8 && blk != 16 && blk != 32)
-        Die("--blksize takes 8, 16 or 32");
-    if (overlap < 0 || overlap > blk / 2 || (format == "420" && overlap % 2))
-        Die("the overlap must be at most half the block size, and even at 4:2:0");
-    if (pel != 2 && pel != 4)
-        Die("--pel takes 2 or 4");
-    if (radius < 1 || delta < 1)
-        Die("--radius and --delta must be positive");
-    if (plevel < 0 || plevel > 2)
-        Die("--plevel takes 0, 1 or 2");
-    if (pad < 1)
-        Die("--pad must be positive");
-    if (badstep < 1 || badstep > 8)
-        Die("--badstep takes 1 to 8");
+};
 
-    Search s;
+// The search over samples of type T: bytes at 8 bits, 16 bits at 9 to 16
+template <typename T>
+int Run(const Options &o) {
+    const int w = o.w, h = o.h, frames = o.frames, blk = o.blk, overlap = o.overlap, pad = o.pad, pel = o.pel;
+    Search<T> s;
     s.w = w;
     s.h = h;
     s.frames = frames;
-    s.xr = s.yr = format == "420" ? 2 : 1;
+    s.xr = s.yr = o.format == "420" ? 2 : 1;
     if (w % s.xr || h % s.yr)
         Die("4:2:0 frames need even dimensions");
     if (pad % s.xr || pad % s.yr)
@@ -900,19 +904,24 @@ int main(int argc, char **argv) {
     if (s.nbx < 1 || s.nby < 1)
         Die("the frame is too small to hold a single block");
     s.pel = pel;
-    s.radius = radius;
-    s.delta = delta;
-    s.standalone = standalone;
-    s.chroma = chroma;
-    s.plevel = plevel;
-    // mvu.Analyse's scaling for 8-bit and the block size, lambda divided by pel squared at full size
+    s.radius = o.radius;
+    s.delta = o.delta;
+    s.standalone = o.standalone;
+    s.chroma = o.chroma;
+    s.plevel = o.plevel;
+    // mvu.Analyse's scaling: to the bit depth, rounded, then to the block size; lambda divided by
+    // pel squared at full size
+    const int pixelMax = (1 << o.bits) - 1;
+    auto toDepth = [&](int64_t v) { return static_cast<int64_t>(static_cast<double>(v) * pixelMax / 255.0 + 0.5); };
+    const int64_t mvlambda = toDepth(o.mvlambda), lsad = toDepth(o.lsad), badsad = toDepth(o.badsad);
     const int64_t area = static_cast<int64_t>(blk) * blk;
     s.lambda0 = mvlambda * area / 64 / (pel * pel);
     s.lambdaBlock = mvlambda * area / 64;
     s.lsad = lsad * area / 64;
     s.badSad = static_cast<int>(std::min<int64_t>(badsad * area / 64, INT32_MAX));
-    s.fallbackRadius = std::abs(badrange);
-    s.fallbackStep = badstep;
+    s.fallbackRadius = std::abs(o.badrange);
+    s.fallbackStep = o.badstep;
+    s.depthShift = o.bits - 8;
     for (int cw = w; cw / 2 >= kTopWidth; cw = (cw + 1) / 2)
         ++s.topLevel;
     if (s.topLevel < kFinest)
@@ -920,25 +929,29 @@ int main(int argc, char **argv) {
 
     // The frames: the super's planes and the pyramid
     const int wc = w / s.xr, hc = h / s.yr;
-    const size_t lumaBytes = static_cast<size_t>(w) * h, chromaBytes = static_cast<size_t>(wc) * hc, frameBytes = lumaBytes + 2 * chromaBytes;
+    const size_t lumaSamples = static_cast<size_t>(w) * h, chromaSamples = static_cast<size_t>(wc) * hc, frameSamples = lumaSamples + 2 * chromaSamples;
     {
-        std::vector<std::vector<uint8_t>> raw(frames, std::vector<uint8_t>(frameBytes));
-        FILE *f = fopen(srcPath.c_str(), "rb");
+        std::vector<std::vector<T>> raw(frames, std::vector<T>(frameSamples));
+        FILE *f = fopen(o.srcPath.c_str(), "rb");
         if (!f)
-            Die("cannot open " + srcPath);
+            Die("cannot open " + o.srcPath);
         for (auto &r : raw)
-            if (fread(r.data(), 1, frameBytes, f) != frameBytes)
+            if (fread(r.data(), sizeof(T), frameSamples, f) != frameSamples)
                 Die("the source holds fewer frames");
         fclose(f);
+        for (const auto &r : raw)
+            for (T v : r)
+                if (v > pixelMax)
+                    Die("the source holds samples above " + std::to_string(pixelMax) + ", more than --bits " + std::to_string(o.bits) + " take");
         s.clip.resize(frames);
         ParallelFor(frames, [&](int i) {
-            const uint8_t *py = raw[i].data(), *pu = py + lumaBytes, *pv = pu + chromaBytes;
-            Frame &fr = s.clip[i];
-            fr.y = MakePlane(py, w, h, pad, pad, s.aw, s.ah);
-            fr.u = MakePlane(pu, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr);
-            fr.v = MakePlane(pv, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr);
-            std::array<SmallPlane, 3> level;
-            const uint8_t *src[3] = {py, pu, pv};
+            const T *py = raw[i].data(), *pu = py + lumaSamples, *pv = pu + chromaSamples;
+            Frame<T> &fr = s.clip[i];
+            fr.y = MakePlane(py, w, h, pad, pad, s.aw, s.ah, pixelMax);
+            fr.u = MakePlane(pu, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
+            fr.v = MakePlane(pv, wc, hc, s.padc, s.padcY, s.aw / s.xr, s.ah / s.yr, pixelMax);
+            std::array<SmallPlane<T>, 3> level;
+            const T *src[3] = {py, pu, pv};
             for (int p = 0; p < 3; ++p) {
                 level[p].w = p ? wc : w;
                 level[p].h = p ? hc : h;
@@ -987,17 +1000,74 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    FILE *out = fopen(outPath.c_str(), "wb");
+    FILE *out = fopen(o.outPath.c_str(), "wb");
     if (!out)
-        Die("cannot write " + outPath);
+        Die("cannot write " + o.outPath);
     std::map<Key, Field> done;
     for (const Key &k : s.Order()) {
-        const LevelField co = Pyramid{s, k.first, k.first + k.second}.Run();
+        const LevelField co = Pyramid<T>{s, k.first, k.first + k.second}.Run();
         Field f = Refine(s, k.first, k.second, BuildSeeds(s, k.first, k.second, co, done));
         WriteField(out, k.first, k.second, pel, f);
-        if (!standalone)
+        if (!o.standalone)
             done[k] = std::move(f);
     }
     fclose(out);
     return 0;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc)
+                Die("missing value for " + a);
+            return argv[++i];
+        };
+        if (a == "--src") o.srcPath = next();
+        else if (a == "--size") { if (sscanf(next().c_str(), "%dx%d", &o.w, &o.h) != 2) Die("--size takes WxH"); }
+        else if (a == "--frames") o.frames = atoi(next().c_str());
+        else if (a == "--out") o.outPath = next();
+        else if (a == "--format") o.format = next();
+        else if (a == "--bits") o.bits = atoi(next().c_str());
+        else if (a == "--blksize") o.blk = atoi(next().c_str());
+        else if (a == "--overlap") o.overlap = atoi(next().c_str());
+        else if (a == "--pad") o.pad = atoi(next().c_str());
+        else if (a == "--pel") o.pel = atoi(next().c_str());
+        else if (a == "--radius") o.radius = atoi(next().c_str());
+        else if (a == "--delta") o.delta = atoi(next().c_str());
+        else if (a == "--standalone") o.standalone = true;
+        else if (a == "--chroma") o.chroma = atoi(next().c_str()) != 0;
+        else if (a == "--plevel") o.plevel = atoi(next().c_str());
+        else if (a == "--mvlambda") o.mvlambda = atoll(next().c_str());
+        else if (a == "--lsad") o.lsad = atoll(next().c_str());
+        else if (a == "--badsad") o.badsad = atoll(next().c_str());
+        else if (a == "--badrange") o.badrange = atoi(next().c_str());
+        else if (a == "--badstep") o.badstep = atoi(next().c_str());
+        else if (a == "--threads") gThreads = std::max(1, atoi(next().c_str()));
+        else Die("unknown option " + a);
+    }
+    if (o.srcPath.empty() || o.outPath.empty() || o.w < 1 || o.h < 1 || o.frames < 1)
+        Die("usage: reference --src frames.yuv --size WxH --frames N --out vectors.bin [options]; see the top of reference.cpp");
+    if (o.format != "420" && o.format != "444")
+        Die("--format takes 420 or 444");
+    if (o.bits < 8 || o.bits > 16)
+        Die("--bits takes 8 to 16");
+    if (o.blk != 8 && o.blk != 16 && o.blk != 32)
+        Die("--blksize takes 8, 16 or 32");
+    if (o.overlap < 0 || o.overlap > o.blk / 2 || (o.format == "420" && o.overlap % 2))
+        Die("the overlap must be at most half the block size, and even at 4:2:0");
+    if (o.pel != 2 && o.pel != 4)
+        Die("--pel takes 2 or 4");
+    if (o.radius < 1 || o.delta < 1)
+        Die("--radius and --delta must be positive");
+    if (o.plevel < 0 || o.plevel > 2)
+        Die("--plevel takes 0, 1 or 2");
+    if (o.pad < 1)
+        Die("--pad must be positive");
+    if (o.badstep < 1 || o.badstep > 8)
+        Die("--badstep takes 1 to 8");
+    return o.bits == 8 ? Run<uint8_t>(o) : Run<uint16_t>(o);
 }

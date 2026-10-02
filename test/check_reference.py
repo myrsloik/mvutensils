@@ -7,13 +7,16 @@ runs it on the frames it gives mvgpu, dumped as raw planar frames, with the same
 compared: x, y and SAD of every block.
 
     check_reference.py --src noisy.nv12 --size 1920x1080 --frames 52 --reference reference.exe
-                       [--blksize 16] [--overlap 8] [--pel 2] [--pad 16] [--radius 2] [--delta 1]
-                       [--standalone] [--chroma 0] [--plevel 2] [--mvlambda 1000] [--lsad 400]
-                       [--badsad 1000] [--badrange 40] [--badstep 2] [--crop WxH] [--work DIR]
+                       [--format YUV444P8] [--blksize 16] [--overlap 8] [--pel 2] [--pad 16]
+                       [--radius 2] [--delta 1] [--standalone] [--chroma 0] [--plevel 2]
+                       [--mvlambda 1000] [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2]
+                       [--crop WxH] [--work DIR]
 
---standalone makes an Analyse per delta, without chained or inverted seeds, instead of AnalyseMany.
---crop crops the frames first, for grids that end inside a block. --work keeps the dumped frames
-and the reference's vectors in that directory instead of a temporary one.
+--format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a quarter
+pixel to more than 8 bits). --standalone makes an Analyse per delta, without chained or inverted
+seeds, instead of AnalyseMany. --crop crops the frames first, for grids that end inside a block.
+--work keeps the dumped frames and the reference's vectors in that directory instead of a
+temporary one.
 """
 import argparse
 import os
@@ -25,7 +28,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import nv12_clip  # noqa: E402
+from mvtest import format_clip, nv12_clip  # noqa: E402
 
 
 def load_fields(path):
@@ -55,6 +58,7 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
+    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name, 4:2:0 or 4:4:4 at 8 to 16 bits: YUV420P8, YUV444P16, ...')
     ref = ap.add_mutually_exclusive_group(required=True)
     ref.add_argument('--reference', help='the reference executable, run with matching arguments')
     ref.add_argument('--ref', help='a vector file the reference wrote')
@@ -83,7 +87,7 @@ def main():
     if args.plugin:
         core.std.LoadPlugin(args.plugin)
     w, h = (int(v) for v in args.size.split('x'))
-    clip = nv12_clip(core, args.src, w, h, args.frames)
+    clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -94,7 +98,8 @@ def main():
         work = args.work or tempfile.mkdtemp(prefix='mvgpu_reference_')
         os.makedirs(work, exist_ok=True)
         frames, vectors = os.path.join(work, 'frames.yuv'), os.path.join(work, 'reference.bin')
-        cmd = [args.reference, '--src', frames, '--size', f'{w}x{h}', '--frames', str(args.frames), '--out', vectors, '--format', '420',
+        cmd = [args.reference, '--src', frames, '--size', f'{w}x{h}', '--frames', str(args.frames), '--out', vectors,
+               '--format', '420' if clip.format.subsampling_w else '444', '--bits', str(clip.format.bits_per_sample),
                '--blksize', str(args.blksize), '--overlap', str(args.overlap), '--pel', str(args.pel), '--pad', str(args.pad),
                '--radius', str(args.radius), '--delta', str(args.delta)] + (['--standalone'] if args.standalone else [])
         for k, v in search.items():

@@ -30,9 +30,9 @@
 // submission completes: 2 * radius references, each with its super's two planes and its vectors,
 // don't fit a push descriptor set.
 //
-// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's 8-bit 4:2:0 and 4:4:4 supers at
-// pel 2 and 4 with square blocks of 8, 16 or 32, and vectors made from them as mvgpu.Analyse makes
-// them.
+// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's 4:2:0 and 4:4:4 supers of 8 to
+// 16-bit samples at pel 2 and 4 with square blocks of 8, 16 or 32, and vectors made from such
+// supers, of any of those bit depths, as mvgpu.Analyse makes them.
 
 namespace {
 
@@ -95,6 +95,36 @@ int64_t InterpolateThSAD(int64_t thsad, int64_t thsad2, int d, int tr) {
     const double x = (d - 1) * kPi / (tr - 1);
     const double lerp = (1.0 - std::cos(x)) * 0.5;
     return static_cast<int64_t>(std::floor(thsad + lerp * static_cast<double>(thsad2 - thsad) + 0.5));
+}
+
+// mvu's DegrainWeight, in double precision as mvu computes it
+int DegrainWeight(int64_t thSAD, int64_t blockSAD) {
+    if (blockSAD >= thSAD)
+        return 0;
+    const double r = static_cast<double>(blockSAD) / static_cast<double>(thSAD);
+    return static_cast<uint16_t>(256.0 * (1.0 - r * r) / (1.0 + r * r));
+}
+
+// The SADs at which DegrainWeight(thSAD, sad) drops below 1, 2, ... 256: entry k - 1 the least SAD
+// whose weight is under k, so that a SAD's weight is the largest k whose entry is above it
+// (degrain_weights.comp). Every operation of the weight rounds monotonically, so the weight never
+// rises with the SAD and these thresholds give it exactly at every SAD, where an integer formula
+// equals mvu's double precision only while the double's error stays below the distance to the next
+// integer (no longer at the thresholds of 16-bit clips, scaled 257 times).
+std::vector<int32_t> WeightSteps(int64_t thSAD) {
+    std::vector<int32_t> steps(256);
+    for (int k = 1; k <= 256; ++k) {
+        int64_t lo = 0, hi = std::max<int64_t>(thSAD, 0); // the weight at hi is 0, under k
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if (DegrainWeight(thSAD, mid) < k)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        steps[k - 1] = static_cast<int32_t>(lo);
+    }
+    return steps;
 }
 
 // mvu's FramePyramid::IsCompatible: the same storage, padded for the same block size
@@ -207,7 +237,7 @@ struct DegrainData {
     int thscd1 = 0;              // scaled
     int scdLimit = 0;            // a reference with more blocks above thscd1 is at a scene change
     int winOff[2] = {};          // tables: luma's windows, chroma's
-    int thOff = 0, uwOff = 0;    // tables: each reference's thsad (luma's, then chroma's), the user weights
+    int thOff = 0, uwOff = 0;    // tables: each reference's WeightSteps (luma's, then chroma's), the user weights
 
     std::shared_ptr<VulkanContext> vc;
     VSGPUExecPool *pool = nullptr;
@@ -454,11 +484,12 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.nby = d->nby;
         pc.step = d->step;
         pc.overlap = d->overlap;
+        const ptrdiff_t bytes = L.format.Bytes();
         pc.pad = L.pad;
         pc.padc = L.padc;
-        pc.wp = static_cast<int32_t>(lumaStride);
+        pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride);
+        pc.wc = static_cast<int32_t>(chromaStride / bytes);
         pc.hc = L.hc;
         pc.recStride = static_cast<int32_t>(recBytes / 16);
         pc.refs = refs;
@@ -469,6 +500,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.thOff = d->thOff;
         pc.uwOff = d->uwOff;
         pc.nb = nb;
+        pc.pixelMax = (1 << L.format.bits) - 1;
 
         // The scene change test's counts start at zero, and stay there when no count can exceed
         // the limit
@@ -489,7 +521,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
-            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p));
+            pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
             pc.limit = d->limit[p];
             pc.winOff = d->winOff[p ? 1 : 0];
             dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
@@ -587,17 +619,18 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         if (const std::string unsupported = L.Unsupported(SuperLayout::Use::Compensation); !unsupported.empty())
             throw std::runtime_error(unsupported);
 
-        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one (mvu's
-        // IsCompatibleWithAnalysis), all on one grid (IsCompatible), deltas in mvu's order. The grid
-        // is theirs, as in mvu.Degrain; the super only supplies the planes.
+        // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
+        // depth (mvu's IsCompatibleWithAnalysis: vectors analysed on an 8-bit copy serve the 16-bit
+        // clip), all on one grid (IsCompatible), deltas in mvu's order. The grid is theirs, as in
+        // mvu.Degrain; the super only supplies the planes.
         VectorInfo first;
         for (int r = 0; r < refs; ++r) {
             const VectorInfo v = ReadVectorInfo(d->vectors[r], d->prefix, vsapi);
             if (r == 0)
                 first = v;
             const SuperLayout analysed = ImportSuperLayout(d->vectors[r], d->prefix, vsapi);
-            if (!SameStorage(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
-                v.vpad != L.padY || v.pel != L.pel || v.bits != L.format.bits || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
+            if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
+                v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
                 throw std::runtime_error("The motion vectors passed are not compatible with the super clip");
             if (v.blkX != first.blkX || v.blkY != first.blkY || v.overlapX != first.overlapX || v.overlapY != first.overlapY || v.nbx != first.nbx ||
                 v.nby != first.nby || v.chroma != first.chroma)
@@ -619,7 +652,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         d->nbx = first.nbx;
         d->nby = first.nby;
 
-        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != 8 ||
+        if (!vsh::isConstantVideoFormat(&d->vi) || d->vi.format.colorFamily != cfYUV || d->vi.format.sampleType != stInteger || d->vi.format.bitsPerSample != L.format.bits ||
             (1 << d->vi.format.subSamplingW) != L.format.xr || (1 << d->vi.format.subSamplingH) != L.format.yr || d->vi.width != L.width || d->vi.height != L.height)
             throw std::runtime_error("super clip is not compatible with the source clip");
 
@@ -631,7 +664,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         GetPairArgument(thsadRaw[0], thsadRaw[1], "thsad", 400, 400, in, vsapi);
         GetPairArgument(thsad2Raw[0], thsad2Raw[1], "thsad2", thsadRaw[0], thsadRaw[1], in, vsapi);
 
-        // mvu's ScaleThSCD and GetThSCDScaleFactor, for the vectors' block size, chroma and 8 bits
+        // mvu's ScaleThSCD and GetThSCDScaleFactor, for the vectors' block size, chroma and bit depth
         constexpr int maxSAD = 8 * 8 * 255;
         if (thscd1 < 0 || thscd1 > maxSAD)
             throw std::runtime_error("thscd1 must be between 0 and " + std::to_string(maxSAD));
@@ -662,12 +695,12 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
                 continue;
             if (fLimit[i] <= 0.0f)
                 throw std::runtime_error("limit must be non-negative");
-            if (fLimit[i] < 255.0f)
+            if (fLimit[i] < static_cast<float>((1 << L.format.bits) - 1))
                 d->limit[i] = static_cast<int>(fLimit[i] + 0.5f);
         }
 
-        // The tables: the overlap windows of luma's and chroma's blocks, each reference's thsad,
-        // luma's then chroma's, and the user weights
+        // The tables: the overlap windows of luma's and chroma's blocks, each reference's weight
+        // steps for its thsad, luma's then chroma's, and the user weights
         std::vector<int32_t> tables;
         if (d->overlap > 0) {
             const int xr = L.format.xr, yr = L.format.yr;
@@ -679,20 +712,24 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
             tables.insert(tables.end(), chromaWin.begin(), chromaWin.end());
         }
         d->thOff = static_cast<int>(tables.size());
-        for (int p = 0; p < 2; ++p)
-            for (int r = 0; r < refs; ++r)
-                tables.push_back(static_cast<int32_t>(InterpolateThSAD(thsadScaled[p], thsad2Scaled[p], r / 2 + 1, d->radius)));
+        for (int p = 0; p < 2; ++p) {
+            for (int r = 0; r < refs; ++r) {
+                const std::vector<int32_t> steps = WeightSteps(InterpolateThSAD(thsadScaled[p], thsad2Scaled[p], r / 2 + 1, d->radius));
+                tables.insert(tables.end(), steps.begin(), steps.end());
+            }
+        }
         d->uwOff = static_cast<int>(tables.size());
         tables.insert(tables.end(), userWeights.begin(), userWeights.end());
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
         vc.RequireDegrain();
-        // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical
+        // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical, and for
+        // the pixels bit 2 for 16-bit samples
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
         d->count = vc.Pipeline(Kernel::DegrainCount, d->blk, L.pel, chromaLog);
         d->weights = vc.Pipeline(Kernel::DegrainWeights, d->blk, L.pel, chromaLog);
-        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel, chromaLog);
+        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel, chromaLog | (L.format.bits > 8 ? 4 : 0));
         const VkDeviceSize metaBytes = static_cast<VkDeviceSize>(refs + 1) * d->nbx * d->nby * 4;
         if (metaBytes > vc.limits.maxStorageBufferRange)
             throw std::runtime_error("the frame is too large for the device's storage buffers");

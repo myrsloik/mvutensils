@@ -14,8 +14,9 @@ layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; 
 // of the two vertical averages where both coordinates fall between. Every lane reads the four runs
 // of its position's neighbours, the two of a coordinate on the grid being the same run: the 8
 // positions around a vector all differ in phase, so reading only what each needs would only make
-// the lanes diverge (probe/qpel_bench.cpp measured it slower). Chroma comes from its quarter-pel
-// image, unless the SAD is luma's alone.
+// the lanes diverge (probe/qpel_bench.cpp measured it slower). Subsampled chroma comes from its
+// quarter-pel image; 4:4:4 chroma's samples are computed from its half-pel planes as luma's are.
+// With kSplit 2 the lane measures every other row, and SadOf adds the other lane's.
 int LaneSadQuarter(ivec2 v) {
     int cur = gGroup * kBlockWords;
     uint sa = 0u, sm = 0u;
@@ -23,7 +24,7 @@ int LaneSadQuarter(ivec2 v) {
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
     uint plane = uint(pc.wp * pc.hp);
     uint aa = HalfAddr(Xa, Ya, plane, pc.wp), ab = HalfAddr(Xa, Yb, plane, pc.wp), ba = HalfAddr(Xb, Ya, plane, pc.wp), bb = HalfAddr(Xb, Yb, plane, pc.wp);
-    for (int j = 0; j < pc.blockRows; ++j) {
+    for (int j = gHalf; j < pc.blockRows; j += kSplit) {
         uint o = uint(j * pc.wp), r0[kRowWords], r1[kRowWords], r2[kRowWords], r3[kRowWords];
         RunY(aa + o, r0);
         RunY(ab + o, r1);
@@ -33,35 +34,56 @@ int LaneSadQuarter(ivec2 v) {
             PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), cur + j * kRowWords + i, sa, sm);
     }
     if (!kChroma)
-        return int(sa + gSumCur - 2u * sm);
-    int Xc = 4 * (gX / 2 + pc.padc) + ChromaComponent(v.x), Yc = 4 * (gY / 2 + pc.padc) + ChromaComponent(v.y);
-    uint ac = ChromaAddr(Xc, Yc);
+        return SadOf(sa, sm);
+    int Xc = 4 * ((gX >> kLogC) + pc.padc) + ChromaComponent(v.x), Yc = 4 * ((gY >> kLogC) + pc.padc) + ChromaComponent(v.y);
     int curU = cur + kLumaWords;
-    for (int j = 0; j < pc.blockRows / 2; ++j) {
-        [[unroll]] for (int p = 0; p < 2; ++p) {
-            uint r[kRowWordsC];
-            RunC(ac + uint(p) * ChromaV() + uint(j * ChromaRow()), r);
-            int at = curU + p * kChromaWords + j * kRowWordsC;
-            [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
-                PackedStep(r[i], at + i, sa, sm);
+    if (kImage) {
+        uint ac = ChromaAddr(Xc, Yc);
+        for (int j = gHalf; j < pc.blockRows >> kLogC; j += kSplit) {
+            [[unroll]] for (int p = 0; p < 2; ++p) {
+                uint r[kRowWordsC];
+                RunC(ac + uint(p) * ChromaV() + uint(j * ChromaRow()), r);
+                int at = curU + p * kChromaWords + j * kRowWordsC;
+                [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+                    PackedStep(r[i], at + i, sa, sm);
+            }
+        }
+    } else {
+        int Xca = Xc >> 1, Xcb = Xca + (Xc & 1), Yca = Yc >> 1, Ycb = Yca + (Yc & 1);
+        uint planeC = uint(pc.wc * pc.hc);
+        uint ca = HalfAddr(Xca, Yca, planeC, pc.wc), cb = HalfAddr(Xca, Ycb, planeC, pc.wc), cc = HalfAddr(Xcb, Yca, planeC, pc.wc),
+             cd = HalfAddr(Xcb, Ycb, planeC, pc.wc);
+        for (int j = gHalf; j < pc.blockRows; j += kSplit) {
+            [[unroll]] for (int p = 0; p < 2; ++p) {
+                uint o = uint(p) * ChromaV() + uint(j * pc.wc), r0[kRowWordsC], r1[kRowWordsC], r2[kRowWordsC], r3[kRowWordsC];
+                RunC(ca + o, r0);
+                RunC(cb + o, r1);
+                RunC(cc + o, r2);
+                RunC(cd + o, r3);
+                int at = curU + p * kChromaWords + j * kRowWordsC;
+                [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+                    PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), at + i, sa, sm);
+            }
         }
     }
-    return int(sa + gSumCur - 2u * sm);
+    return SadOf(sa, sm);
 }
 
 // pel 4: the 8 quarter-pel positions around each block's vector, against its neighbours as the
 // half-pel step left them: Analyse.cpp binds the half-pel step's field (B) as field A here. Like
-// refine_halfpel.comp, 8 blocks per workgroup in a row, lane i of a block's group measuring position
-// i, the best by one minimum of CandidateKey over the group, anywhere in the range
-// ValidateVectors accepts; writes the output. Dispatched as ((nbx + 7) / 8, nby) workgroups.
+// refine_halfpel.comp, kGroupBlocks blocks per workgroup in a row, lane i of each 8 of a block's
+// group measuring position i, the best by one minimum of CandidateKey over the group, anywhere in
+// the range ValidateVectors accepts; writes the output. Dispatched as
+// ((nbx + kGroupBlocks - 1) / kGroupBlocks, nby) workgroups.
 void main() {
     uint lane = WorkgroupLane();
-    int group = int(lane >> 3u), sub = int(lane & 7u);
-    int by = int(gl_WorkGroupID.y), bx = int(gl_WorkGroupID.x) * 8 + group;
+    int group = int(lane) / kGroupLanes, sub = int(lane & 7u), inGroup = int(lane) & (kGroupLanes - 1);
+    gHalf = inGroup >> 3;
+    int by = int(gl_WorkGroupID.y), bx = int(gl_WorkGroupID.x) * kGroupBlocks + group;
     bool live = bx < pc.nbx;
     bx = min(bx, pc.nbx - 1);
     int b = by * pc.nbx + bx;
-    LoadBlock(group, sub, 8, bx, by, live);
+    LoadBlock(group, inGroup, kGroupLanes, bx, by, live);
     barrier();
 
     ivec2 p;
@@ -81,6 +103,6 @@ void main() {
         best = wv;
         bestSad = ws;
     }
-    if (live && sub == 0)
+    if (live && inGroup == 0)
         outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
 }

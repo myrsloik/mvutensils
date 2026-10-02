@@ -7,14 +7,16 @@
   super    check_super.py: mvgpu.Super against mvu.Super over formats, pels, filters, pelclips,
            grids and paddings
   analyse  check_reference.py: mvgpu.AnalyseMany and Analyse against the CPU reference
-           (test/reference/reference.cpp, --reference) over block sizes, overlaps, pels, chroma,
-           plevel, radii, deltas, the fallback's and the cost's arguments and paddings
-  degrain  check_degrain.py: mvgpu.Degrain against mvu.Degrain over formats, block sizes, pels,
-           radii and every argument; on mvgpu.AnalyseMany's vectors where it searches the grid, on
-           mvu.Analyse's elsewhere
-  flow     check_flow.py: mvgpu.FlowInter and mvgpu.FlowFPS against mvu's over formats, block sizes,
-           pels, frame rates and every argument; on mvgpu.Analyse's vectors where it searches the
-           grid, on mvu.Analyse's elsewhere, and on constant fields with scene changes in between
+           (test/reference/reference.cpp, --reference) over formats and bit depths, block sizes,
+           overlaps, pels, chroma, plevel, radii, deltas, the fallback's and the cost's arguments
+           and paddings
+  degrain  check_degrain.py: mvgpu.Degrain against mvu.Degrain over formats and bit depths, block
+           sizes, pels, radii and every argument; on mvgpu.AnalyseMany's vectors (of the clip, or of
+           an 8-bit copy of a high bit depth clip), and on mvu.Analyse's in a few cases
+  flow     check_flow.py: mvgpu.FlowInter and mvgpu.FlowFPS against mvu's over formats and bit
+           depths, block sizes, pels, frame rates and every argument; on mvgpu.Analyse's vectors (of
+           the clip, or of an 8-bit copy of a high bit depth clip), on mvu.Analyse's in a few cases,
+           and on constant fields with scene changes in between
 
 --clips is the directory of test clips, NAME/noisy.nv12 for the clips in CLIPS below (raw 8-bit
 NV12). --reference (or MVGPU_REFERENCE) is the built CPU reference, for the analyse suite. --only
@@ -118,8 +120,64 @@ def analyse_cases():
         ('pad 8 32/16', ff, ['--frames', '10', '--pad', '8'] + grid(32, 16)),
         ('pad 24 16/8 pel 4', ff, ['--frames', '10', '--pad', '24'] + grid(16, 8, 4)),
         ('pad 6 16/8', ff, ['--frames', '10', '--pad', '6'] + grid(16, 8)),
+        # 4:4:4: every block size and pel, and the arguments that touch chroma
+        ('444 8/4 pel 2', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(8, 4)),
+        ('444 8/4 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(8, 4, 4)),
+        ('444 16/8 pel 2', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(16, 8)),
+        ('444 16/8 pel 4', ob, ['--frames', '10', '--format', 'YUV444P8'] + grid(16, 8, 4)),
+        ('444 32/16 pel 2', ob, ['--frames', '10', '--format', 'YUV444P8'] + grid(32, 16)),
+        ('444 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(32, 16, 4)),
+        ('444 chroma 0 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8', '--chroma', '0'] + grid(16, 8, 4)),
+        ('444 plevel 2 32/16', ff, ['--frames', '10', '--format', 'YUV444P8', '--plevel', '2'] + grid(32, 16)),
+        ('444 standalone 8/4 pel 4', ob, ['--frames', '10', '--format', 'YUV444P8', '--standalone'] + grid(8, 4, 4)),
+        ('444 radius 3 16/8', ff, ['--frames', '12', '--format', 'YUV444P8', '--radius', '3'] + grid(16, 8)),
+        ('444 delta 2 32/16 pel 4', ob, ['--frames', '12', '--format', 'YUV444P8', '--delta', '2'] + grid(32, 16, 4)),
+        ('444 16/6 pel 4 1915x1071', ff, ['--frames', '10', '--format', 'YUV444P8', '--crop', '1915x1071'] + grid(16, 6, 4)),
+        ('444 8/3 1913x1077', ff, ['--frames', '10', '--format', 'YUV444P8', '--crop', '1913x1077'] + grid(8, 3)),
+        ('444 32/0 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(32, 0, 4)),
+        ('444 pad 7 16/8', ff, ['--frames', '10', '--format', 'YUV444P8', '--pad', '7'] + grid(16, 8)),
+        ('444 badsad 300 badrange 24 badstep 3 32/16', ob, ['--frames', '10', '--format', 'YUV444P8', '--badsad', '300', '--badrange', '24',
+                                                             '--badstep', '3'] + grid(32, 16)),
+        ('444 mvlambda 3000 lsad 2000 8/4', ff, ['--frames', '10', '--format', 'YUV444P8', '--mvlambda', '3000', '--lsad', '2000'] + grid(8, 4)),
+        # High bit depths: every block size and pel at 16 bits, both formats; the other depths; and
+        # the arguments the depth scales (mvlambda, lsad, badsad) or that meet the lane split
+        ('YUV420P16 8/4 pel 2', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(8, 4)),
+        ('YUV420P16 8/4 pel 4', ob, ['--frames', '10', '--format', 'YUV420P16'] + grid(8, 4, 4)),
+        ('YUV420P16 16/8 pel 2', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(16, 8)),
+        ('YUV420P16 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(16, 8, 4)),
+        ('YUV420P16 32/16 pel 2', ob, ['--frames', '10', '--format', 'YUV420P16'] + grid(32, 16)),
+        ('YUV420P16 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(32, 16, 4)),
+        ('YUV444P16 8/4 pel 2', ff, ['--frames', '10', '--format', 'YUV444P16'] + grid(8, 4)),
+        ('YUV444P16 8/4 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16'] + grid(8, 4, 4)),
+        ('YUV444P16 16/8 pel 2', ob, ['--frames', '10', '--format', 'YUV444P16'] + grid(16, 8)),
+        ('YUV444P16 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16'] + grid(16, 8, 4)),
+        ('YUV444P16 32/16 pel 2', ff, ['--frames', '10', '--format', 'YUV444P16'] + grid(32, 16)),
+        ('YUV444P16 32/16 pel 4', ob, ['--frames', '10', '--format', 'YUV444P16'] + grid(32, 16, 4)),
+        ('YUV420P10 16/8 pel 2', ff, ['--frames', '10', '--format', 'YUV420P10'] + grid(16, 8)),
+        ('YUV420P10 32/16 pel 4 chroma 0', ff, ['--frames', '10', '--format', 'YUV420P10', '--chroma', '0'] + grid(32, 16, 4)),
+        ('YUV444P10 8/4 pel 4', ob, ['--frames', '10', '--format', 'YUV444P10'] + grid(8, 4, 4)),
+        ('YUV420P12 16/8 pel 4 standalone', ff, ['--frames', '10', '--format', 'YUV420P12', '--standalone'] + grid(16, 8, 4)),
+        ('YUV444P12 32/16 pel 2 plevel 2', ff, ['--frames', '10', '--format', 'YUV444P12', '--plevel', '2'] + grid(32, 16)),
+        ('YUV420P14 8/4 pel 2 radius 3', ff, ['--frames', '12', '--format', 'YUV420P14', '--radius', '3'] + grid(8, 4)),
+        ('YUV444P16 chroma 0 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16', '--chroma', '0'] + grid(16, 8, 4)),
+        ('YUV420P16 chroma 0 32/16 plevel 0', ob, ['--frames', '10', '--format', 'YUV420P16', '--chroma', '0', '--plevel', '0'] + grid(32, 16)),
+        ('YUV420P16 delta 2 16/8 pel 4', ff, ['--frames', '12', '--format', 'YUV420P16', '--delta', '2'] + grid(16, 8, 4)),
+        ('YUV420P16 badsad 300 badrange 24 badstep 1 32/16', ob, ['--frames', '10', '--format', 'YUV420P16', '--badsad', '300', '--badrange', '24',
+                                                                  '--badstep', '1'] + grid(32, 16)),
+        ('YUV444P16 badsad 2000 badstep 3 16/8', ff, ['--frames', '10', '--format', 'YUV444P16', '--badsad', '2000', '--badstep', '3'] + grid(16, 8)),
+        ('YUV420P16 mvlambda 4000 lsad 1200 16/8', ff, ['--frames', '10', '--format', 'YUV420P16', '--mvlambda', '4000', '--lsad', '1200'] + grid(16, 8)),
+        ('YUV444P10 mvlambda 0 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV444P10', '--mvlambda', '0'] + grid(32, 16, 4)),
+        ('YUV420P16 lsad 0 8/4', ff, ['--frames', '10', '--format', 'YUV420P16', '--lsad', '0'] + grid(8, 4)),
+        ('YUV420P16 32/12 1906x1070', ff, ['--frames', '10', '--format', 'YUV420P16', '--crop', '1906x1070'] + grid(32, 12)),
+        ('YUV444P16 16/6 pel 4 1915x1071', ff, ['--frames', '10', '--format', 'YUV444P16', '--crop', '1915x1071'] + grid(16, 6, 4)),
+        ('YUV444P16 8/3 1913x1077', ob, ['--frames', '10', '--format', 'YUV444P16', '--crop', '1913x1077'] + grid(8, 3)),
+        ('YUV420P16 pad 6 16/8', ff, ['--frames', '10', '--format', 'YUV420P16', '--pad', '6'] + grid(16, 8)),
+        ('YUV444P16 pad 7 32/0 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16', '--pad', '7'] + grid(32, 0, 4)),
         # 4K
         ('4K 32/16 pel 4', k4, ['--frames', '6'] + grid(32, 16, 4)),
+        ('4K YUV420P16 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV420P16'] + grid(16, 8, 4)),
+        ('4K YUV444P10 32/16 pel 2', k4, ['--frames', '6', '--format', 'YUV444P10'] + grid(32, 16)),
+        ('4K 444 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV444P8'] + grid(16, 8, 4)),
         ('4K 16/8 chroma 0 plevel 2', k4, ['--frames', '6', '--chroma', '0', '--plevel', '2'] + grid(16, 8)),
         ('4K 8/4 pel 2', k4, ['--frames', '6'] + grid(8, 4)),
     ]
@@ -133,7 +191,7 @@ def degrain_cases():
     for fmt in ('YUV420P8', 'YUV444P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
-                vec = 'mvgpu' if fmt == 'YUV420P8' else 'mvu'
+                vec = 'mvgpu'
                 cases.append((f'{fmt} {blk}/{blk // 2} pel {pel} {vec} vectors', ff,
                               ['--frames', '8', '--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel), '--vectors', vec]))
     cases += [
@@ -190,6 +248,43 @@ def degrain_cases():
         ('4K 8/4 pel 2', k4, ['--frames', '6', '--blksize', '8', '--overlap', '4']),
         ('4K 444 32/16 pel 4', k4, ['--frames', '6', '--pel', '4', '--format', 'YUV444P8', '--blksize', '32', '--overlap', '16', '--vectors', 'mvu']),
     ]
+    # High bit depths: every block size and pel at 16 bits on vectors of an 8-bit copy, then other
+    # depths, mvu's vectors analysed at the clip's depth (thresholds scaled to it), and the arguments
+    # that meet the samples' range
+    a8 = ['--analyse8']
+    for fmt in ('YUV420P16', 'YUV444P16'):
+        for blk in (8, 16, 32):
+            for pel in (2, 4):
+                cases.append((f'{fmt} {blk}/{blk // 2} pel {pel} analysed on 8 bits', ff,
+                              ['--frames', '8', '--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel)] + a8))
+    for fmt in ('YUV420P16', 'YUV444P16'):
+        for blk in (8, 16, 32):
+            cases.append((f'{fmt} {blk}/{blk // 2} pel 4 mvgpu vectors', ff,
+                          ['--frames', '8', '--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', '4']))
+    cases += [
+        ('YUV420P10 16/8 pel 2 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV420P10'] + a8),
+        ('YUV420P10 16/8 pel 2 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV420P10']),
+        ('YUV444P12 8/4 pel 2 radius 3 mvgpu vectors', ff, ['--frames', '12', '--format', 'YUV444P12', '--blksize', '8', '--overlap', '4', '--radius', '3']),
+        ('YUV420P16 thscd1 150 thscd2 20 mvgpu vectors', ob, ['--frames', '12', '--format', 'YUV420P16', '--thscd1', '150', '--thscd2', '20']),
+        ('YUV420P10 8/4 pel 4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV420P10', '--blksize', '8', '--overlap', '4', '--pel', '4', '--vectors', 'mvu']),
+        ('YUV444P12 32/16 pel 4 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV444P12', '--blksize', '32', '--overlap', '16', '--pel', '4'] + a8),
+        ('YUV420P14 16/4 pel 2 1914x1074 mvu vectors', ff, ['--frames', '8', '--format', 'YUV420P14', '--blksize', '16', '--overlap', '4', '--crop', '1914x1074', '--vectors', 'mvu']),
+        ('YUV420P16 16/8 pel 2 mvu vectors', ff, ['--frames', '8', '--format', 'YUV420P16', '--vectors', 'mvu']),
+        ('YUV444P16 32/16 pel 4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV444P16', '--blksize', '32', '--overlap', '16', '--pel', '4', '--vectors', 'mvu']),
+        ('YUV420P16 radius 3 thsad 600 300 thsad2 200', ff, ['--frames', '12', '--format', 'YUV420P16', '--radius', '3', '--thsad', '600', '300', '--thsad2', '200'] + a8),
+        ('YUV444P16 32/16 thsad 20000 mvu vectors', ff, ['--frames', '8', '--format', 'YUV444P16', '--blksize', '32', '--overlap', '16', '--thsad', '20000', '--vectors', 'mvu']),
+        ('YUV420P16 limit 300 200', ff, ['--frames', '8', '--format', 'YUV420P16', '--limit', '300', '200'] + a8),
+        ('YUV420P10 limit 3 1023', ff, ['--frames', '8', '--format', 'YUV420P10', '--limit', '3', '1023'] + a8),
+        ('YUV420P16 thscd1 300 thscd2 50 mvu vectors', ob, ['--frames', '12', '--format', 'YUV420P16', '--thscd1', '300', '--thscd2', '50', '--vectors', 'mvu']),
+        ('YUV420P16 thscd1 150 thscd2 20', ob, ['--frames', '12', '--format', 'YUV420P16', '--thscd1', '150', '--thscd2', '20'] + a8),
+        ('YUV420P16 weights 1 2 3 2 1 planes 0 2', ff, ['--frames', '8', '--format', 'YUV420P16', '--weights', '1', '2', '3', '2', '1', '--planes', '0', '2'] + a8),
+        ('YUV444P16 centersuper pel 4', ff, ['--frames', '8', '--format', 'YUV444P16', '--centersuper', '--pel', '4'] + a8),
+        ('YUV420P16 render 8/4 for 16/8 vectors', ff, ['--frames', '8', '--format', 'YUV420P16', '--render', '8', '4'] + a8),
+        ('YUV420P16 radius 6 8/0 pel 4 1914x1074', ff, ['--frames', '16', '--format', 'YUV420P16', '--radius', '6', '--blksize', '8', '--overlap', '0', '--pel', '4',
+                                                        '--crop', '1914x1074'] + a8),
+        ('4K YUV420P16 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV420P16', '--pel', '4'] + a8),
+        ('4K YUV444P10 32/16 pel 2 mvu vectors', k4, ['--frames', '6', '--format', 'YUV444P10', '--blksize', '32', '--overlap', '16', '--vectors', 'mvu']),
+    ]
     return cases
 
 
@@ -200,7 +295,7 @@ def flow_cases():
     for fmt in ('YUV420P8', 'YUV444P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
-                vec = 'mvgpu' if fmt == 'YUV420P8' else 'mvu'
+                vec = 'mvgpu'
                 grid = ['--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel), '--vectors', vec]
                 cases.append((f'inter {fmt} {blk}/{blk // 2} pel {pel} {vec} vectors', ff, ['--frames', '8'] + grid))
                 if blk == 16:
@@ -254,6 +349,39 @@ def flow_cases():
         ('4K inter 16/8 pel 4', k4, ['--frames', '6', '--pel', '4'] + inter),
         ('4K fps 8/4', k4, ['--frames', '6', '--blksize', '8', '--overlap', '4', '--num', '60', '--den', '1'] + fps),
         ('4K inter 444 32/16 pel 4', k4, ['--frames', '6', '--pel', '4', '--format', 'YUV444P8', '--blksize', '32', '--overlap', '16', '--vectors', 'mvu'] + inter),
+    ]
+    # High bit depths: every block size and pel at 16 bits on vectors of an 8-bit copy, then other
+    # depths, mvu's vectors analysed at the clip's depth, constant fields and the arguments
+    a8 = ['--analyse8']
+    for fmt in ('YUV420P16', 'YUV444P16'):
+        for blk in (8, 16, 32):
+            for pel in (2, 4):
+                grid = ['--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', str(pel)] + a8
+                cases.append((f'inter {fmt} {blk}/{blk // 2} pel {pel} analysed on 8 bits', ff, ['--frames', '8'] + grid + inter))
+                if blk == 16:
+                    cases.append((f'fps {fmt} {blk}/{blk // 2} pel {pel} analysed on 8 bits', ff, ['--frames', '8', '--num', '60', '--den', '1'] + grid + fps))
+    for fmt in ('YUV420P16', 'YUV444P16'):
+        for blk in (8, 32):
+            cases.append((f'inter {fmt} {blk}/{blk // 2} pel 4 mvgpu vectors', ff,
+                          ['--frames', '8', '--format', fmt, '--blksize', str(blk), '--overlap', str(blk // 2), '--pel', '4'] + inter))
+    cases += [
+        ('inter YUV420P10 16/8 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV420P10'] + a8 + inter),
+        ('fps YUV420P10 16/8 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV420P10', '--num', '60', '--den', '1'] + fps),
+        ('inter YUV444P12 16/8 pel 4 delta 2 mvgpu vectors', ff, ['--frames', '12', '--format', 'YUV444P12', '--pel', '4', '--delta', '2'] + inter),
+        ('inter YUV444P12 8/4 pel 4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV444P12', '--blksize', '8', '--overlap', '4', '--pel', '4', '--vectors', 'mvu'] + inter),
+        ('inter YUV420P16 mvu vectors', ff, ['--frames', '8', '--format', 'YUV420P16', '--vectors', 'mvu'] + inter),
+        ('fps YUV444P16 32/16 pel 4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV444P16', '--blksize', '32', '--overlap', '16', '--pel', '4', '--vectors', 'mvu',
+                                                       '--num', '60', '--den', '1'] + fps),
+        ('inter const YUV420P16', ff, ['--frames', '15', '--vectors', 'const', '--format', 'YUV420P16'] + inter),
+        ('fps const YUV444P10 extramask 0 blend 0', ff, ['--frames', '15', '--vectors', 'const', '--format', 'YUV444P10', '--num', '50', '--den', '1', '--extramask', '0',
+                                                         '--blend', '0'] + fps),
+        ('inter YUV420P16 time 33.3 ml 3', ff, ['--frames', '8', '--format', 'YUV420P16', '--time', '33.3', '--ml', '3'] + a8 + inter),
+        ('inter YUV420P16 thscd1 150 thscd2 20 blend 0', ob, ['--frames', '12', '--format', 'YUV420P16', '--thscd1', '150', '--thscd2', '20', '--blend', '0'] + a8 + inter),
+        ('fps YUV420P16 24 to 72 delta 2', ff, ['--frames', '10', '--format', 'YUV420P16', '--num', '72', '--den', '1', '--delta', '2'] + a8 + fps),
+        ('inter YUV444P16 8/2 pel 4 1913x1077', ff, ['--frames', '8', '--format', 'YUV444P16', '--blksize', '8', '--overlap', '2', '--pel', '4', '--crop', '1913x1077'] + a8 + inter),
+        ('4K inter YUV420P16 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV420P16', '--pel', '4'] + a8 + inter),
+        ('4K fps YUV444P10 32/16 mvu vectors', k4, ['--frames', '6', '--format', 'YUV444P10', '--blksize', '32', '--overlap', '16', '--vectors', 'mvu', '--num', '60',
+                                                    '--den', '1'] + fps),
     ]
     return cases
 

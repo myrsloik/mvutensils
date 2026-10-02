@@ -5,8 +5,8 @@ Both interpolate the same 8-bit clip with the same vectors, each side with its o
 the same settings (mvgpu.Super's planes are mvu.Super's). The vectors:
 
   mvgpu  mvgpu.Analyse's, on a carrier clip for mvu (mvtest.mvu_vectors).
-  mvu    mvu.Analyse's, on the frames of mvgpu's super (mvtest.gpu_vectors): for grids and formats
-         mvgpu.Analyse doesn't search yet.
+  mvu    mvu.Analyse's, on the frames of mvgpu's super (mvtest.gpu_vectors): vectors mvgpu's
+         search wouldn't find, and frames narrower than the 192 pixels mvgpu.Analyse needs.
   const  mvu.Analyse's description with every block of a frame given one vector, a different one for
          each frame and direction, and the SADs of some frames' blocks at and just past the scene
          change limits, so that the scene change fallback runs on some frames and not on frames
@@ -32,16 +32,17 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
+from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip  # noqa: E402
 
 
 def scene_limits(props, thscd1, thscd2):
     """mvu's scaled thscd1 and the largest count of blocks above it that isn't a scene change
-    (ScaleThSCD, IsSceneChange), for 8 bits"""
+    (ScaleThSCD, IsSceneChange), for the vectors' bit depth"""
     blk, nbx, nby = props['MVUtensilsAnalysisBlkSizeX'], props['MVUtensilsAnalysisNBlkX'], props['MVUtensilsAnalysisNBlkY']
     chroma = props['MVUtensilsAnalysisChroma']
     ratio = props['MVUtensilsAnalysisXRatioUV'] * props['MVUtensilsAnalysisYRatioUV']
-    scale = blk * props['MVUtensilsAnalysisBlkSizeY'] / 64.0 * ((1.0 + 2.0 / ratio) if chroma else 1.0)
+    depth = ((1 << min(16, props['MVUtensilsAnalysisBitsPerSample'])) - 1) / 255.0
+    scale = blk * props['MVUtensilsAnalysisBlkSizeY'] / 64.0 * ((1.0 + 2.0 / ratio) if chroma else 1.0) * depth
     th1 = int(thscd1 * scale + 0.5)
     blocks = np.float32(float(np.float32(thscd2)) * nbx * nby / 100.0)
     return th1, int(math.floor(blocks))
@@ -75,7 +76,8 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
-    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8 or YUV444P8')
+    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, YUV420P10, ...')
+    ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--filter', choices=['inter', 'fps'], default='inter')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu', 'const'], default='mvgpu', help='whose vectors both sides use')
@@ -104,9 +106,7 @@ def main():
     if not hasattr(core, 'mvu'):
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
-    clip = nv12_clip(core, args.src, w, h, args.frames)
-    if args.format != 'YUV420P8':
-        clip = core.resize.Bicubic(clip, format=getattr(vs, args.format))
+    clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -118,18 +118,22 @@ def main():
     sk = dict(blksize=args.blksize, overlap=args.overlap, pel=args.pel, pad=args.pad)
     gsup = core.mvgpu.Super(gclip, **sk)
     csup = core.mvu.Super(clip, **sk)
+    # The supers the vectors come from: the clip's, or an 8-bit copy's
+    aclip = eight_bit(core, clip) if args.analyse8 else clip
+    gasup = core.mvgpu.Super(core.std.GPUUpload(aclip), **sk) if args.analyse8 else gsup
+    casup = core.mvu.Super(aclip, **sk) if args.analyse8 else csup
     thscd1 = 400 if args.thscd1 is None else args.thscd1
     thscd2 = 51.0 if args.thscd2 is None else args.thscd2
     deltas = (args.delta, -args.delta)  # mvbw, mvfw
     if args.vectors == 'mvgpu':
-        gvec = [core.mvgpu.Analyse(gsup, delta=d) for d in deltas]
+        gvec = [core.mvgpu.Analyse(gasup, delta=d) for d in deltas]
         cvec = [mvu_vectors(core, an, clip, args.frames) for an in gvec]
     else:
-        cvec = [core.mvu.Analyse(csup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
+        cvec = [core.mvu.Analyse(casup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
         if args.vectors == 'const':
             th1, scd = scene_limits(cvec[0].get_frame(0).props, thscd1, thscd2)
             cvec = [const_vectors(core, an, (args.pad - 1) * args.pel, th1, scd, args.seed * 2 + i) for i, an in enumerate(cvec)]
-        gvec = [gpu_vectors(core, an, gsup) for an in cvec]
+        gvec = [gpu_vectors(core, an, gasup) for an in cvec]
 
     fk = {k: getattr(args, k) for k in ('ml', 'blend', 'thscd1', 'thscd2') if getattr(args, k) is not None}
     if args.filter == 'inter':
@@ -161,7 +165,7 @@ def main():
             if a.props.get(k) != b.props.get(k):
                 props_differ += 1
         for p in range(3):
-            pa, pb = np.asarray(a[p]).astype(np.int16), np.asarray(b[p]).astype(np.int16)
+            pa, pb = np.asarray(a[p]).astype(np.int32), np.asarray(b[p]).astype(np.int32)
             changed += np.count_nonzero(pb != np.asarray(before[p]))
             diff = pa - pb
             d = np.count_nonzero(diff)
@@ -175,8 +179,9 @@ def main():
     total = frames * w * h
     total_c = frames * (w >> clip.format.subsampling_w) * (h >> clip.format.subsampling_h)
     sizes = (total, total_c, total_c)
-    psnr = ['inf' if not sq[p] else f'{10 * math.log10(255 * 255 * sizes[p] / sq[p]):.1f}' for p in range(3)]
-    print(f'{args.filter} {args.format} pel {args.pel} {args.blksize}/{args.overlap} {args.vectors} vectors, {frames} frames, '
+    peak = (1 << clip.format.bits_per_sample) - 1
+    psnr = ['inf' if not sq[p] else f'{10 * math.log10(peak * peak * sizes[p] / sq[p]):.1f}' for p in range(3)]
+    print(f'{args.filter} {args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {args.blksize}/{args.overlap} {args.vectors} vectors, {frames} frames, '
           f'{100 * changed / (total + 2 * total_c):.1f}% of the pixels changed from the frame before: differing pixels Y {differ[0]} of {total}, '
           f'U {differ[1]}, V {differ[2]} of {total_c} each'
           + (f'; largest difference {worst}, PSNR {psnr}; first at frame {first[0]} plane {first[1]} ({first[2]}, {first[3]}): '

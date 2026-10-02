@@ -16,16 +16,12 @@
 // plane, then U, then V, each inside a border of repeated edge pixels (borderY, borderC wide), so
 // a read anywhere a block may reach (Level.pad) sees what SmallPlane::At's clamping would give,
 // and the words LevelSadOf reads around it stay inside. offY, offU and offV point at each plane's
-// first pixel inside the border, its rows strideY or strideC apart, whole words. pyr_reduce.comp
-// builds it, border included, writing through binding 16; the other kernels read the current
+// first pixel inside the border, its rows strideY or strideC apart, whole words; the samples are the
+// super's, kSPW to a word. mvgpu.Super builds it (pyr_reduce.comp); these kernels read the current
 // frame's (16) and each field's reference frame's (17, element z) as words.
 const int kMaxBatch = 16; // fields per batch: VulkanContext.h's kMaxBatch
-#ifdef PYRAMID_BUILD
-layout(std430, set = 0, binding = 16) buffer Pyramid { uint8_t pyr[]; };
-#else
 layout(std430, set = 0, binding = 16) readonly buffer CurPyramid { uint curPyrW[]; };
 layout(std430, set = 0, binding = 17) readonly buffer RefPyramid { uint w[]; } refPyr[kMaxBatch];
-#endif
 // The coarse fields of the fields being searched, levels finest to top one after another, field
 // z's at z * levels[0].fieldTotal; vectors are full pels of their level
 layout(std430, set = 0, binding = 18) buffer LevelVec { ivec2 levelVec[]; };
@@ -43,8 +39,8 @@ struct Level {
     int borderY, borderC, reserved0, reserved1;
 };
 layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
-// lambda by (worst neighbour SAD) >> 1 for each level, mvlambda * 2^(plevel * level) relaxed by
-// lsad, computed on the CPU in double precision as the CPU reference does (Analyse.cpp)
+// lambda by (worst neighbour SAD) >> (1 + kDepthShift) for each level, mvlambda * 2^(plevel * level)
+// relaxed by lsad, computed on the CPU in double precision as the CPU reference does (Analyse.cpp)
 layout(std430, set = 0, binding = 21) readonly buffer LevelLambda { int64_t levelLambda[]; };
 // Medians (median.comp), kMedianSlots per field searched: slot L seeds level L, slot kGlobalSlot
 // is the full-size field's global
@@ -85,13 +81,9 @@ void SetupField(int z) {
     gMedianBase = z * kMedianSlots;
 }
 
-// The byte at index i of the pyramid being built, or of the current frame's
-uint PyrByte(int i) {
-#ifdef PYRAMID_BUILD
-    return uint(pyr[i]);
-#else
-    return (curPyrW[i >> 2] >> ((i & 3) << 3)) & 255u;
-#endif
+// Sample i of the current frame's pyramid
+uint PyrSample(int i) {
+    return (curPyrW[WordOf(uint(i))] >> ShiftOf(uint(i))) & (kWide ? 0xFFFFu : 0xFFu);
 }
 
 // Keeps the reference block within the level's padding, as Pyramid::Bound
@@ -99,26 +91,29 @@ ivec2 LevelBound(Level lv, ivec2 v) {
     return ivec2(clamp(v.x, -(gLX + lv.pad), lv.w + lv.pad - 8 - gLX), clamp(v.y, -(gLY + lv.pad), lv.h + lv.pad - 8 - gLY));
 }
 
-#if !defined(PYRAMID_BUILD) && !defined(NO_BLOCK_CACHE)
+#ifndef NO_BLOCK_CACHE
 // Sets up the lane's level block and copies its current pixels to shared memory in the form
-// PackedStep takes, as LoadBlock does, with their sum in gSumCur: 16 words of luma, then 4 of U
-// and 4 of V unless the SAD is luma's alone. Every lane of the workgroup must call it, after
-// SetupField, and then barrier().
+// PackedStep takes, as LoadBlock does, with their sum in gSumCur: kLevelLumaWords words of luma,
+// then kLevelChromaWords of U and as many of V unless the SAD is luma's alone. Every lane of the
+// workgroup must call it, after SetupField, and then barrier().
 void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int by, bool live) {
     gGroup = group;
     gLX = bx * 8;
     gLY = by * 8;
     uint partial = 0u;
     if (live) {
-        for (int k = sub; k < (kChroma ? 24 : 16); k += lanesPerBlock) {
-            uint b[4];
-            for (int i = 0; i < 4; ++i) {
+        for (int k = sub; k < kLevelWords; k += lanesPerBlock) {
+            uint b[4] = uint[4](0u, 0u, 0u, 0u);
+            for (int i = 0; i < kSPW; ++i) {
                 int at;
-                if (k < 16)
-                    at = lv.offY + (gLY + k / 2) * lv.strideY + gLX + (k % 2) * 4 + i;
-                else
-                    at = (k < 20 ? lv.offU : lv.offV) + (gLY / 2 + (k - 16) % 4) * lv.strideC + gLX / 2 + i;
-                b[i] = PyrByte(at);
+                if (k < kLevelLumaWords) {
+                    at = lv.offY + (gLY + k / kLevelRowWords) * lv.strideY + gLX + (k % kLevelRowWords) * kSPW + i;
+                } else {
+                    int kc = (k - kLevelLumaWords) % kLevelChromaWords;
+                    at = (k - kLevelLumaWords < kLevelChromaWords ? lv.offU : lv.offV) + ((gLY >> kLogC) + kc / kLevelRowWordsC) * lv.strideC + (gLX >> kLogC) +
+                         (kc % kLevelRowWordsC) * kSPW + i;
+                }
+                b[i] = PyrSample(at);
                 partial += b[i];
             }
             StoreWord(group * kLevelWords + k, b[0], b[1], b[2], b[3]);
@@ -127,38 +122,49 @@ void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int
     gSumCur = lanesPerBlock == 8 ? subgroupClusteredAdd(partial, 8u) : subgroupAdd(partial);
 }
 
-// The lane's SAD of its level block for full-pel vector v: luma 8x8 plus U and V 4x4, the chroma
-// vector rounded toward zero, or luma alone (the reference's CoarseSad). The border stands in for
-// the CPU's clamping, so rows are read as words like LaneSad's, with the same packed arithmetic.
+// The lane's SAD of its level block for full-pel vector v: luma 8x8 plus U and V at 8 >> kLogC
+// square, the chroma vector the luma one divided by the subsampling toward zero, or luma alone (the
+// reference's CoarseSad). The border stands in for the CPU's clamping, so rows are read as words
+// like LaneSad's, with the same packed arithmetic. One lane measures the whole SAD (kSplit 1).
 int LevelSadOf(Level lv, ivec2 v) {
     uint a = uint(lv.offY + (gLY + v.y) * lv.strideY + gLX + v.x);
-    uint w = a >> 2u, shift = (a & 3u) << 3u, stride = uint(lv.strideY) >> 2u;
+    uint w = WordOf(a), shift = ShiftOf(a), stride = uint(lv.strideY) >> uint(kLogSPW);
     int cur = gGroup * kLevelWords;
     uint sa = 0u, sm = 0u;
     for (int j0 = 0; j0 < pc.blockRows; j0 += kRowChunk) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint wj = w + uint(j) * stride;
-            uint w0 = refPyr[gField].w[wj], w1 = refPyr[gField].w[wj + 1u], w2 = refPyr[gField].w[wj + 2u];
-            PackedStep(Bytes4(w0, w1, shift), cur + 2 * j, sa, sm);
-            PackedStep(Bytes4(w1, w2, shift), cur + 2 * j + 1, sa, sm);
+            uint lo = refPyr[gField].w[wj];
+            [[unroll]] for (int i = 0; i < kLevelRowWords; ++i) {
+                uint hi = refPyr[gField].w[wj + uint(i) + 1u];
+                PackedStep(Bytes4(lo, hi, shift), cur + kLevelRowWords * j + i, sa, sm);
+                lo = hi;
+            }
         }
     }
     if (!kChroma)
-        return int(sa + gSumCur - 2u * sm);
+        return SadOf(sa, sm);
     int cvx = ChromaComponent(v.x), cvy = ChromaComponent(v.y);
-    int rowC = (gLY / 2 + cvy) * lv.strideC + gLX / 2 + cvx;
+    int rowC = ((gLY >> kLogC) + cvy) * lv.strideC + (gLX >> kLogC) + cvx;
     uint au = uint(lv.offU + rowC), av = uint(lv.offV + rowC);
-    uint wu = au >> 2u, shiftU = (au & 3u) << 3u, wv = av >> 2u, shiftV = (av & 3u) << 3u, strideC = uint(lv.strideC) >> 2u;
-    for (int j0 = 0; j0 < pc.blockRows / 2; j0 += kRowChunk) {
+    uint wu = WordOf(au), shiftU = ShiftOf(au), wv = WordOf(av), shiftV = ShiftOf(av), strideC = uint(lv.strideC) >> uint(kLogSPW);
+    int curU = cur + kLevelLumaWords, curV = curU + kLevelChromaWords;
+    for (int j0 = 0; j0 < pc.blockRows >> kLogC; j0 += kRowChunk) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;
-            PackedStep(Bytes4(refPyr[gField].w[u], refPyr[gField].w[u + 1u], shiftU), cur + 16 + j, sa, sm);
-            PackedStep(Bytes4(refPyr[gField].w[t], refPyr[gField].w[t + 1u], shiftV), cur + 20 + j, sa, sm);
+            uint loU = refPyr[gField].w[u], loV = refPyr[gField].w[t];
+            [[unroll]] for (int i = 0; i < kLevelRowWordsC; ++i) {
+                uint hiU = refPyr[gField].w[u + uint(i) + 1u], hiV = refPyr[gField].w[t + uint(i) + 1u];
+                PackedStep(Bytes4(loU, hiU, shiftU), curU + j * kLevelRowWordsC + i, sa, sm);
+                PackedStep(Bytes4(loV, hiV, shiftV), curV + j * kLevelRowWordsC + i, sa, sm);
+                loU = hiU;
+                loV = hiV;
+            }
         }
     }
-    return int(sa + gSumCur - 2u * sm);
+    return SadOf(sa, sm);
 }
 #endif
 
@@ -181,7 +187,7 @@ void LevelContext(Level lv, int b, out ivec2 p, out int64_t lambda) {
     Sort4(xs);
     Sort4(ys);
     p = ivec2((xs[1] + xs[2]) / 2, (ys[1] + ys[2]) / 2);
-    lambda = levelLambda[lv.lambdaOff + (worst >> 1)];
+    lambda = levelLambda[lv.lambdaOff + (worst >> (1 + kDepthShift))];
 }
 
 // lround(a / b) for b > 0, halves away from zero, exactly

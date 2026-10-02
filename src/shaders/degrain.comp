@@ -9,6 +9,20 @@ uint Avg(uint a, uint b) {
     return (a + b + 1u) >> 1u;
 }
 
+// A sample of the centre's luma or chroma planes, or of reference r's, bytes or 16 bits (kWide)
+uint CurLumaAt(uint i) {
+    return kWide ? uint(curY16[i]) : uint(curY[i]);
+}
+uint CurChromaAt(uint i) {
+    return kWide ? uint(curC16[i]) : uint(curC[i]);
+}
+uint RefLumaAt(int r, uint i) {
+    return kWide ? uint(refY16[r].px[i]) : uint(refY[r].px[i]);
+}
+uint RefChromaAt(int r, uint i) {
+    return kWide ? uint(refC16[r].px[i]) : uint(refC[r].px[i]);
+}
+
 // The address of sample (Xh, Yh) of the half-pel grid of a plane with rows stride samples apart,
 // its four half-pel planes rows rows each
 uint HalfAddrOf(int Xh, int Yh, int stride, int rows) {
@@ -54,8 +68,10 @@ ivec2 ClampVec(ivec2 v, int bx, int by) {
 // block gives the pixel mvu's degrained value, (128 + centre * its weight + the sum of each
 // reference's motion compensated pixel * its weight) >> 8, and the pixel adds those up weighted by
 // the blocks' overlap windows (mvu's OverlapWindows, the 9 of them for the frame's edges and corners,
-// values to 2048, each product >> 6), then (sum + 16) >> 5, clamped; without overlap a pixel's one
-// block gives it its value. limit then keeps it within that of the centre's pixel.
+// values to 2048, each product >> 6), then (sum + 16) >> 5, clamped to the clip's largest value;
+// without overlap a pixel's one block gives it its value. limit then keeps it within that of the
+// centre's pixel, and within the sample type's range (mvu's LimitChanges: 255 or 65535, whatever the
+// bit depth).
 //
 // The motion compensated pixel is read from the reference's super where its vector puts the block,
 // mvu's GetPointer: luma at pel 2 from its half-pel plane; at pel 4 computed from the half-pel planes
@@ -90,7 +106,7 @@ void main() {
         int n = min(kChunk, rows - j0);
         uint centre[kChunk], acc[kChunk];
         [[unroll]] for (int j = 0; j < kChunk; ++j) {
-            centre[j] = j < n ? uint(luma ? curY[cur + uint(j0 + j) * curStride] : curC[cur + uint(j0 + j) * curStride]) : 0u;
+            centre[j] = j < n ? (luma ? CurLumaAt(cur + uint(j0 + j) * curStride) : CurChromaAt(cur + uint(j0 + j) * curStride)) : 0u;
             acc[j] = 0u;
         }
 
@@ -120,7 +136,7 @@ void main() {
                     [[unroll]] for (int j = 0; j < kChunk; ++j) {
                         if (j < jEnd) {
                             uint o = uint(j * pc.wp);
-                            uint p = Avg(Avg(uint(refY[r].px[aa + o]), uint(refY[r].px[ab + o])), Avg(uint(refY[r].px[ba + o]), uint(refY[r].px[bb + o])));
+                            uint p = Avg(Avg(RefLumaAt(r, aa + o), RefLumaAt(r, ab + o)), Avg(RefLumaAt(r, ba + o), RefLumaAt(r, bb + o)));
                             sum[j] += p * w;
                         }
                     }
@@ -129,7 +145,7 @@ void main() {
                     uint a = HalfAddr(X, Y);
                     [[unroll]] for (int j = 0; j < kChunk; ++j)
                         if (j < jEnd)
-                            sum[j] += uint(refY[r].px[a + uint(j * pc.wp)]) * w;
+                            sum[j] += RefLumaAt(r, a + uint(j * pc.wp)) * w;
                 } else {
                     // Chroma at the luma position shifted by the subsampling, rounded down
                     // (GetPointer(blx >> xSubUV, bly >> ySubUV))
@@ -143,7 +159,7 @@ void main() {
                         [[unroll]] for (int j = 0; j < kChunk; ++j) {
                             if (j < jEnd) {
                                 uint o = uint(j * pc.wc);
-                                uint p = Avg(Avg(uint(refC[r].px[aa + o]), uint(refC[r].px[ab + o])), Avg(uint(refC[r].px[ba + o]), uint(refC[r].px[bb + o])));
+                                uint p = Avg(Avg(RefChromaAt(r, aa + o), RefChromaAt(r, ab + o)), Avg(RefChromaAt(r, ba + o), RefChromaAt(r, bb + o)));
                                 sum[j] += p * w;
                             }
                         }
@@ -151,7 +167,7 @@ void main() {
                         uint a = ChromaAddr(Xc, Yc) + vOffset;
                         [[unroll]] for (int j = 0; j < kChunk; ++j)
                             if (j < jEnd)
-                                sum[j] += uint(refC[r].px[a + uint(j * ChromaRow())]) * w;
+                                sum[j] += RefChromaAt(r, a + uint(j * ChromaRow())) * w;
                     }
                 }
             }
@@ -173,10 +189,14 @@ void main() {
 
         [[unroll]] for (int j = 0; j < kChunk; ++j) {
             if (j < n) {
-                uint p = pc.overlap == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, 255u);
+                uint p = pc.overlap == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uint(pc.pixelMax));
                 if (pc.limit >= 0)
-                    p = uint(clamp(int(p), max(int(centre[j]) - pc.limit, 0), min(int(centre[j]) + pc.limit, 255)));
-                outPlane[pc.plane].px[out0 + uint((j0 + j) * pc.outStride)] = uint8_t(p);
+                    p = uint(clamp(int(p), max(int(centre[j]) - pc.limit, 0), min(int(centre[j]) + pc.limit, kWide ? 65535 : 255)));
+                uint o = out0 + uint((j0 + j) * pc.outStride);
+                if (kWide)
+                    outPlane16[pc.plane].px[o] = uint16_t(p);
+                else
+                    outPlane[pc.plane].px[o] = uint8_t(p);
             }
         }
     }

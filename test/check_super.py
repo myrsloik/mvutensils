@@ -165,7 +165,7 @@ def level_table(w, h, chroma, xr, yr, pad):
     for L in range(1, top + 1):
         w, h, wc, hc = (w + 1) // 2, (h + 1) // 2, (wc + 1) // 2, (hc + 1) // 2
         lp = max(1, pad >> L)
-        by, bc = lp + 3, (lp + 1) // 2 + 4
+        by, bc = lp + 3, max((lp + xr - 1) // xr, (lp + yr - 1) // yr) + 4
         sy = up(w + 2 * by, 4)
         offY = offset + by * sy + by
         offset = up(offset + sy * (h + 2 * by), 16)

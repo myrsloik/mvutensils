@@ -122,7 +122,7 @@ struct DegrainParams {
     int32_t thscd1, scdLimit;
     int32_t plane, width, height, outStride;
     int32_t limit, winOff, thOff, uwOff;
-    int32_t nb, reserved0, reserved1, reserved2;
+    int32_t nb, pixelMax, reserved1, reserved2;
 };
 static_assert(sizeof(DegrainParams) == 112, "degrain_common.glsl's Params is 28 ints");
 

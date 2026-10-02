@@ -6,9 +6,21 @@ layout(local_size_x = 64) in;
 
 // A sample of the plane pc.plane of the frame before (src) or the frame after (ref)
 uint Px(bool ref, uint i) {
+    if (kWide) {
+        if (pc.plane == 0)
+            return ref ? uint(refY16[i]) : uint(srcY16[i]);
+        return ref ? uint(refC16[i]) : uint(srcC16[i]);
+    }
     if (pc.plane == 0)
         return ref ? uint(refY[i]) : uint(srcY[i]);
     return ref ? uint(refC[i]) : uint(srcC[i]);
+}
+
+// A sample of the clip's plane in the frame before or the frame after
+uint ClipPx(bool ref, uint i) {
+    if (kWide)
+        return ref ? uint(clipRef16[i]) : uint(clipSrc16[i]);
+    return ref ? uint(clipRef[i]) : uint(clipSrc[i]);
 }
 
 // The rounded average mvu.Super's quarter planes take of two samples
@@ -112,7 +124,9 @@ int MaskAt(int base) {
 // and B have vectors and neither is at a scene change, FlowInter (the two compensations blended
 // through the occlusion masks), or FlowInterExtra (the medians with the extra frames' compensations
 // instead) where FF and BB serve too; else the clip's frames blended by the time, or the frame
-// before. Dispatched as ((width + 63) / 64, height) workgroups per plane.
+// before. FlowInter's inner products reach 256 * 65535 * 256 at 16 bits, past int's range though
+// within uint's (mvu takes int64), so they are unsigned. Dispatched as ((width + 63) / 64, height)
+// workgroups per plane.
 void main() {
     int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= pc.width)
@@ -122,8 +136,8 @@ void main() {
     bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;
     uint result;
     if (!fb) {
-        uint s = uint(clipSrc[y * pc.clipStride + x]);
-        result = (pc.flags & kBlend) != 0 ? (s * uint(256 - t) + uint(clipRef[y * pc.clipStride + x]) * uint(t)) >> 8u : s;
+        uint s = ClipPx(false, uint(y * pc.clipStride + x));
+        result = (pc.flags & kBlend) != 0 ? (s * uint(256 - t) + ClipPx(true, uint(y * pc.clipStride + x)) * uint(t)) >> 8u : s;
     } else {
         bool extra = (pc.flags & kHaveExtra) != 0 && counts[2] <= limit && counts[3] <= limit;
         Weights(x, y);
@@ -144,11 +158,14 @@ void main() {
             blended = ((((medianBB * mF + dF * (256 - mF)) + 256) >> 8) * (256 - t) + (((medianFF * mB + dB * (256 - mB)) + 256) >> 8) * t) >> 8;
         } else {
             int dF0 = int(Sample(false, xBase, yBase)), dB0 = int(Sample(true, xBase, yBase));
-            int occF = (dF * (256 - mF) + ((mF * (dB * (256 - mB) + mB * dF0) + 256) >> 8) + 256) >> 8;
-            int occB = (dB * (256 - mB) + ((mB * (dF * (256 - mF) + mF * dB0) + 256) >> 8) + 256) >> 8;
+            int occF = (dF * (256 - mF) + int((uint(mF) * uint(dB * (256 - mB) + mB * dF0) + 256u) >> 8u) + 256) >> 8;
+            int occB = (dB * (256 - mB) + int((uint(mB) * uint(dF * (256 - mF) + mF * dB0) + 256u) >> 8u) + 256) >> 8;
             blended = (occF * (256 - t) + occB * t) >> 8;
         }
         result = uint(blended - 1);
     }
-    outPx[y * pc.outStride + x] = uint8_t(result);
+    if (kWide)
+        outPx16[y * pc.outStride + x] = uint16_t(result);
+    else
+        outPx[y * pc.outStride + x] = uint8_t(result);
 }

@@ -39,7 +39,8 @@
 // (n + u, d - u), u the step toward d, and for d > 0 inverts (n + d, -d); Analyse on its own
 // seeds from the coarse search only.
 //
-// Implemented: chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
+// Implemented, on 8 to 16-bit supers (mvlambda, lsad and badsad scaled to the depth as mvu scales
+// them): chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
 // scales it per level), badsad and badrange (the fallback's threshold and radius), delta, prefix,
 // plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults are the tested
 // ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which this search would
@@ -57,15 +58,34 @@ constexpr int kPairs = 1;         // checkerboard pass pairs before the fallback
 constexpr int kTopRadius = 32;    // the exhaustive search's radius at the top level, px
 constexpr int kLevelPairs = 2;    // checkerboard pass pairs at every coarse level
 
-// Entries of the full-size grid's lambda table: (largest SAD of a block) >> 1, plus one
-constexpr int LambdaEntries(int blk, bool chroma) {
-    return blk * blk * (chroma ? 3 : 2) / 2 * 255 / 2 + 1;
+// The pixels of a block's SAD: luma's, and U's and V's unless it is luma's alone
+int BlockPixels(const SuperLayout &L, bool chroma) {
+    return L.blk * L.blk + (chroma ? 2 * (L.blk / L.format.xr) * (L.blk / L.format.yr) : 0);
+}
+
+// Entries of the full-size grid's lambda table: (largest SAD of a block) >> (1 + bits - 8), plus one
+int LambdaEntries(const SuperLayout &L, bool chroma) {
+    return static_cast<int>(((static_cast<int64_t>(BlockPixels(L, chroma)) * ((1 << L.format.bits) - 1)) >> (L.format.bits - 7)) + 1);
 }
 
 // The search kernels' variant (specialization constant 6, refine_common.glsl): bit 0 for SADs of
-// luma alone
-int SearchVariant(bool chroma) {
-    return chroma ? 0 : 1;
+// luma alone, bit 1 for chroma that isn't subsampled, bits 4 to 7 the bit depth less 8
+int SearchVariant(const SuperLayout &L, bool chroma) {
+    return (chroma ? 0 : 1) | (L.format.xr == 1 ? 2 : 0) | ((L.format.bits - 8) << 4);
+}
+
+// Lanes per candidate in the kernels that measure 8 candidates per block, init, the passes and the
+// half- and quarter-pel steps (refine_common.glsl's kSplit, log2 of it their variant's bits 2 and
+// 3): 2, and 4 blocks per workgroup instead of 8, for blocks whose current pixels take kSplitBytes
+// or more; 4, and 2 blocks, for those taking kSplit4Bytes or more (16-bit 4:4:4 32x32 blocks), which
+// keeps the workgroup's block cache within 12 KB. Measured against 8 blocks per workgroup at 8 bits
+// (RX 6900 XT, radius 3, serialized profiles), the fields' GPU time: 4:4:4 32x32 -31..-32% (init,
+// the passes and the half-pel step -45..-51%), 4:2:0 32x32 -14..-21%, luma-only 32x32 -3..-7%,
+// 4:4:4 16x16 -2..-4%.
+constexpr int kSplitBytes = 768, kSplit4Bytes = 6144;
+int RefineSplit(const SuperLayout &L, bool chroma) {
+    const int bytes = BlockPixels(L, chroma) * L.format.Bytes();
+    return bytes >= kSplit4Bytes ? 4 : bytes >= kSplitBytes ? 2 : 1;
 }
 
 struct Region {
@@ -87,10 +107,11 @@ private:
     VkDeviceSize align, total = 0;
 };
 
-// mvu.Analyse's scaling for 8-bit and the block size, lambda divided by pel squared at full size,
-// exactly as the CPU reference computes it
+// mvu.Analyse's scaling: mvlambda, lsad and badsad to the bit depth, by (2^bits - 1) / 255 rounded,
+// then to the block size, lambda divided by pel squared at full size, exactly as the CPU reference
+// computes it
 struct Scaled {
-    int64_t lambda0, lsad, lambdaBlock;
+    int64_t lambda0, lsad, lambdaBlock, badSad;
 };
 
 // The ints of one row of the coarse node's frames: a field's global median, then its finest level
@@ -351,6 +372,7 @@ struct AnalyseData {
 
     int deltaFrame = 1;
     bool chroma = true; // the SADs count chroma
+    int split = 1;      // RefineSplit
     int badSad = 0;
     int fallbackRadius = 0;
     int fallbackStep = 1;
@@ -456,11 +478,13 @@ public:
     void Refinement() {
         const int64_t nb = static_cast<int64_t>(L.nbx) * L.nby;
         const uint32_t gx = static_cast<uint32_t>(L.nbx), gy = static_cast<uint32_t>(L.nby);
-        const uint32_t gx8 = (gx + 7) / 8, gxHalf8 = ((gx + 1) / 2 + 7) / 8;
+        // a workgroup's blocks in a row, all of them or those of one colour
+        const uint32_t blocks = static_cast<uint32_t>(8 / d.split);
+        const uint32_t gxAll = (gx + blocks - 1) / blocks, gxHalf = ((gx + 1) / 2 + blocks - 1) / blocks;
         const bool withFallback = d.fallbackRadius > 0;
         const int totalPairs = kPairs + (withFallback ? 1 : 0);
         int step = 0; // init is step 0, every pass and the fallback one more
-        rec.Dispatch(d.init, MakeParams(0, step), gx8, gy);
+        rec.Dispatch(d.init, MakeParams(0, step), gxAll, gy);
         rec.ComputeBarrier();
         Stamp(2);
         if (!withFallback) {
@@ -481,17 +505,17 @@ public:
                 rec.ComputeBarrier();
                 Stamp(4);
             }
-            rec.Dispatch(d.pass, MakeParams(p & 1, ++step), gxHalf8, gy);
+            rec.Dispatch(d.pass, MakeParams(p & 1, ++step), gxHalf, gy);
             rec.ComputeBarrier();
         }
         Stamp(5);
-        rec.Dispatch(d.halfpel, MakeParams(0, step), gx8, gy);
+        rec.Dispatch(d.halfpel, MakeParams(0, step), gxAll, gy);
         if (L.pel == 4) {
             rec.ComputeBarrier();
             Stamp(6);
             rec.Bind(kVecA, scratch, d.vecB.offset, d.vecB.size);
             rec.Bind(kSadA, scratch, d.sadB.offset, d.sadB.size);
-            rec.Dispatch(d.quarter, MakeParams(0, step), gx8, gy);
+            rec.Dispatch(d.quarter, MakeParams(0, step), gxAll, gy);
         } else {
             Stamp(6);
         }
@@ -601,7 +625,9 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0);
 
         const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = vsapi->getStride(cur.chroma, 0);
-        if (lumaStride != vsapi->getStride(rf.luma, 0) || chromaStride != vsapi->getStride(rf.chroma, 0) || lumaStride % 4 || chromaStride % 4)
+        const ptrdiff_t bytes = L.format.Bytes();
+        if (lumaStride != vsapi->getStride(rf.luma, 0) || chromaStride != vsapi->getStride(rf.chroma, 0) || lumaStride % (4 * bytes) ||
+            chromaStride % (4 * bytes))
             return fail("the super frames' storage strides differ");
         const ptrdiff_t coarseRowBytes = vsapi->getStride(coarse, 0);
         if (coarseRowBytes % 8)
@@ -669,7 +695,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         std::function<void(int)> stamp;
         if (d->profile)
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
-        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride), static_cast<int>(chromaStride), static_cast<int>(recBytes / 16),
+        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / bytes), static_cast<int>(recBytes / 16),
                             static_cast<int>(d->coarseRow * coarseRowBytes / 8), std::move(stamp));
         field.SeedLists(flags);
         field.Refinement();
@@ -708,7 +734,10 @@ struct AnalyseArgs {
 
     Scaled Scale() const {
         const int64_t area = static_cast<int64_t>(layout.blk) * layout.blk;
-        return {mvlambda * area / 64 / (layout.pel * layout.pel), lsad * area / 64, mvlambda * area / 64};
+        const int pixelMax = (1 << layout.format.bits) - 1;
+        auto toDepth = [&](int64_t v) { return static_cast<int64_t>(static_cast<double>(v) * pixelMax / 255.0 + 0.5); };
+        const int64_t mvl = toDepth(mvlambda), ls = toDepth(lsad), bs = toDepth(badsad);
+        return {mvl * area / 64 / (layout.pel * layout.pel), ls * area / 64, mvl * area / 64, std::min<int64_t>(bs * area / 64, INT32_MAX)};
     }
 };
 
@@ -740,7 +769,7 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
 
         const bool useSatd = !!vsapi->mapGetInt(in, "satd", 0, &err);
 
-        CheckBlockSize(blkX, blkY, overlapX, overlapY, 1, 1);
+        CheckBlockSize(blkX, blkY, overlapX, overlapY, a.layout.format.xr > 1 ? 1 : 0, a.layout.format.yr > 1 ? 1 : 0);
 
         // levels, search, searchparam and pelsearch steer mvu's hierarchical search
         vsapi->mapGetIntSaturated(in, "levels", 0, &err);
@@ -864,18 +893,19 @@ VSNode *CreateCoarse(const AnalyseArgs &a, const std::vector<int> &deltas, VSCor
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    const int variant = SearchVariant(a.chroma);
+    const int variant = SearchVariant(L, a.chroma);
     d->pyrTop = vc.Pipeline(Kernel::PyrTop, L.blk, 2, variant);
     d->pyrPass = vc.Pipeline(Kernel::PyrPass, L.blk, 2, variant);
     d->pyrSeed = vc.Pipeline(Kernel::PyrSeed, L.blk, 2, variant);
     d->median = vc.Pipeline(Kernel::Median, L.blk, 2);
 
-    // lambda for every (worst neighbour SAD) >> 1 per coarse level, mvlambda * 2^(plevel * level)
-    // relaxed by lsad as the CPU reference does in double precision
+    // lambda for every (worst neighbour SAD) >> (1 + bits - 8) per coarse level, mvlambda *
+    // 2^(plevel * level) relaxed by lsad as the CPU reference does in double precision
+    const int depthShift = L.format.bits - 8;
     std::vector<int64_t> levelLambda(static_cast<size_t>(L.topLevel + 1) * SuperLayout::kLambdaEntries);
     for (int level = 0; level <= L.topLevel; ++level)
         for (int i = 0; i < SuperLayout::kLambdaEntries; ++i) {
-            const double sc = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + i, 1);
+            const double sc = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << depthShift), 1);
             levelLambda[static_cast<size_t>(level) * SuperLayout::kLambdaEntries + i] = static_cast<int64_t>((s.lambdaBlock << (a.plevel * level)) * sc * sc);
         }
     Regions constants(vc);
@@ -938,31 +968,32 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
         d->invNode = vsapi->addNodeRef(invNode);
 
     const SuperLayout &L = d->layout;
-    const int blk = L.blk, area = blk * blk;
+    const int blk = L.blk;
     const Scaled s = a.Scale();
-    d->badSad = static_cast<int>(std::min<int64_t>(a.badsad * area / 64, INT32_MAX));
+    d->badSad = static_cast<int>(s.badSad);
     d->fallbackRadius = std::abs(a.badrange);
     d->fallbackStep = a.badstep;
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    const int pel = L.pel, variant = SearchVariant(a.chroma);
+    d->split = RefineSplit(L, a.chroma);
+    const int pel = L.pel, variant = SearchVariant(L, a.chroma), split = variant | (d->split == 4 ? 8 : d->split == 2 ? 4 : 0);
     d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel);
     d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel);
-    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel, variant);
-    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel, variant);
+    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel, split);
+    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel, split);
     d->flag = vc.Pipeline(Kernel::RefineFlag, blk, pel);
     d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel, variant);
     d->apply = vc.Pipeline(Kernel::RefineApply, blk, pel);
-    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel, variant);
+    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel, split);
     if (pel == 4)
-        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel, variant);
+        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel, split);
 
-    // lambda for every (worst neighbour SAD) >> 1, relaxed by lsad as the CPU reference does in
+    // lambda for every (worst neighbour SAD) >> (1 + bits - 8), relaxed by lsad as the CPU reference does in
     // double precision
-    std::vector<int64_t> lambda(LambdaEntries(blk, a.chroma));
+    std::vector<int64_t> lambda(LambdaEntries(L, a.chroma));
     for (size_t i = 0; i < lambda.size(); ++i) {
-        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + static_cast<int64_t>(i), 1);
+        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << (L.format.bits - 8)), 1);
         lambda[i] = static_cast<int64_t>(s.lambda0 * scale * scale);
     }
     Regions constants(vc);

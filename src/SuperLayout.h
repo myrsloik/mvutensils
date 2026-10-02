@@ -92,8 +92,9 @@ struct SuperLayout {
 
     static constexpr int kFinest = 1;    // the coarse level whose field seeds the full-size grid
     static constexpr int kTopWidth = 96; // a frame is halved while the next level stays at least this wide
-    // Entries of a coarse level's lambda table: (largest SAD of an 8x8 block with chroma) >> 1, plus one
-    static constexpr int kLambdaEntries = 96 * 255 / 2 + 1;
+    // Entries of a coarse level's lambda table: (largest SAD of an 8x8 block with 4:4:4 chroma) >>
+    // (1 + bits - 8), plus one, at any bit depth (the most at 16 bits)
+    static constexpr int kLambdaEntries = (3 * 64 * 65535 >> 9) + 1;
 
     // Frames of width x height samples of format; pyramid adds the coarse levels (as many as the
     // frame is wide enough for, maybe none)
@@ -111,11 +112,11 @@ struct SuperLayout {
     int PyramidRows() const { return (pyramidSamples + wp - 1) / wp + 1; }
 
     // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
-    // compensate motion with its vectors (Degrain)
+    // compensate motion with its vectors (Degrain, FlowInter, FlowFPS)
     enum class Use { Search, Compensation };
-    // What they implement so far: 8-bit at pel 2 or 4, square blocks of 8, 16 or 32 with the same
-    // overlap and padding either way, the padding even with subsampled chroma; the search 4:2:0, the
-    // others 4:2:0 or 4:4:4. Empty when the layout is one of those, else what it lacks.
+    // What they implement so far, either of them: 4:2:0 or 4:4:4 of 8 to 16-bit samples at pel 2 or
+    // 4, square blocks of 8, 16 or 32 with the same overlap and padding either way, the padding even
+    // with subsampled chroma. Empty when the layout is one of those, else what it lacks.
     std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;
@@ -142,6 +143,9 @@ bool GetSuperFrames(const VSFrame *frame, const SuperLayout &layout, const std::
 
 // The same level-0 storage, whatever the levels above it and the grid: the planes the kernels read
 bool SameStorage(const SuperLayout &a, const SuperLayout &b);
+// The same, whatever the samples' bit depth: what mvu requires of the super vectors were analysed
+// on (IsCompatibleWithAnalysis)
+bool SameGeometry(const SuperLayout &a, const SuperLayout &b);
 
 // A vector clip's analysis description, as mvu's filters read it from its first frame
 struct VectorInfo {
