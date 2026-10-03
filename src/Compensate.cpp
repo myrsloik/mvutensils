@@ -60,6 +60,9 @@ struct CompensateData {
     OverlapsFunction OVERS[3];
     COPYFunction BLIT[3];
 
+    AnalysisGeometry geometry;
+    SuperGeometry superGeometry;
+
     std::string prefix;
 
     const VSAPI *vsapi;
@@ -99,7 +102,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
 
         try {
             // Construct (and validate) the vectors inside the try: deserialization can throw on corrupt data.
-            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
+            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi, d->geometry);
 
             const int ySubUV = ilog2(d->yRatioUV);
             const int xSubUV = ilog2(d->xRatioUV);
@@ -126,12 +129,12 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             int num_planes = chroma ? 3 : 1;
 
             const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
-            FramePyramid pSrcGOF(src, 1, d->prefix, vsapi);
+            FramePyramid pSrcGOF(src, 1, d->prefix, vsapi, d->superGeometry);
             const auto &pSrcPlanes = pSrcGOF.GetLevel(0).planes;
 
             if (nref >= 0 && nref < d->vi->numFrames && vectors.IsUsable(d->nSCD1, d->nSCD2)) {
                 const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-                FramePyramid pRefGOF(ref, 1, d->prefix, vsapi);
+                FramePyramid pRefGOF(ref, 1, d->prefix, vsapi, d->superGeometry);
                 const auto &pRefPlanes = pRefGOF.GetLevel(0).planes;
 
                 const VSFrame *realSrc = vsapi->getFrameFilter(n, d->node, frameCtx);
@@ -151,22 +154,18 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
                 }
 
                 if (nOverlapX[0] == 0 && nOverlapY[0] == 0) {
-                    // Uses a more restrictive copy function to the right/bottom when necessary to handle block dimension padded frames
-
-                    size_t blitSizeRight[3] = {};
-                    size_t blitSizeBottom[3] = {};
-
+                    // The vector grid covers the block-aligned frame (its own blksize, which needn't be the super's), so the
+                    // last block row and column are clipped to the frame
+                    int frameWidth[3] = {}, frameHeight[3] = {};
                     for (int plane = 0; plane < num_planes; plane++) {
-                        blitSizeRight[plane] = (nBlkSizeX[plane] - (pSrcPlanes[plane].nWidth - vsapi->getFrameWidth(dst, plane))) * sizeof(PixelType);
-                        blitSizeBottom[plane] = (nBlkSizeY[plane] - (pSrcPlanes[plane].nHeight - vsapi->getFrameHeight(dst, plane)));
+                        frameWidth[plane] = vsapi->getFrameWidth(dst, plane);
+                        frameHeight[plane] = vsapi->getFrameHeight(dst, plane);
                     }
 
                     for (int by = 0; by < nBlkY; by++) {
-                        bool slowBlitY = (by == nBlkY - 1) && (blitSizeBottom[0] > 0);
                         int xx[3] = {};
 
                         for (int bx = 0; bx < nBlkX; bx++) {
-                            bool slowBlitX = (bx == nBlkX - 1) && (blitSizeRight[0] > 0);
                             int i = by * nBlkX + bx;
                             const BlockData block = vectors.GetBlock(i);
 
@@ -185,16 +184,15 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
                             blx[1] = blx[2] = blx[0] >> xSubUV;
                             bly[1] = bly[2] = bly[0] >> ySubUV;
 
-                            if (slowBlitX || slowBlitY) {
-                                for (int plane = 0; plane < num_planes; plane++) {
-                                    mvu_bitblt(pDstCur[plane] + xx[plane], nDstPitches[plane], pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]), pPlanes[plane].nPitch, (slowBlitX && blitSizeRight[plane]) ? blitSizeRight[plane] : (nBlkSizeX[plane] * sizeof(PixelType)), (slowBlitY && blitSizeBottom[plane]) ? blitSizeBottom[plane] : nBlkSizeY[plane]);
-                                    xx[plane] += nBlkSizeX[plane] * sizeof(PixelType);
-                                }
-                            } else {
-                                for (int plane = 0; plane < num_planes; plane++) {
-                                    d->BLIT[plane](pDstCur[plane] + xx[plane], nDstPitches[plane], pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]), pPlanes[plane].nPitch);
-                                    xx[plane] += nBlkSizeX[plane] * sizeof(PixelType);
-                                }
+                            for (int plane = 0; plane < num_planes; plane++) {
+                                const int validW = std::min(nBlkSizeX[plane], frameWidth[plane] - bx * nBlkSizeX[plane]);
+                                const int validH = std::min(nBlkSizeY[plane], frameHeight[plane] - by * nBlkSizeY[plane]);
+                                const uint8_t *pRef = pPlanes[plane].GetPointer<PixelType>(blx[plane], bly[plane]);
+                                if (validW == nBlkSizeX[plane] && validH == nBlkSizeY[plane])
+                                    d->BLIT[plane](pDstCur[plane] + xx[plane], nDstPitches[plane], pRef, pPlanes[plane].nPitch);
+                                else if (validW > 0 && validH > 0)
+                                    mvu_bitblt(pDstCur[plane] + xx[plane], nDstPitches[plane], pRef, pPlanes[plane].nPitch, validW * sizeof(PixelType), validH);
+                                xx[plane] += nBlkSizeX[plane] * sizeof(PixelType);
                             }
                         }
 
@@ -343,6 +341,9 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         if (!super.IsCompatibleWithSource(d->vi))
             throw std::runtime_error("source clip isn't compatible with super clip");
 
+        CheckClipLength(d->super, "super", d->vi->numFrames, "clip", vsapi);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
+
         d->xRatioUV = super.xRatioUV;
         d->yRatioUV = super.yRatioUV;
 
@@ -365,7 +366,10 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         d->supervi = vsapi->getVideoInfo(d->super);
 
         if (!vectors.IsCompatibleWithAnalysis(super))
-            throw std::runtime_error("wrong source or super clip frame size");;
+            throw std::runtime_error("wrong source or super clip frame size");
+
+        d->geometry = vectors.Geometry();
+        d->superGeometry = super.Geometry();
 
         d->chroma = (d->vi->format.colorFamily != cfGray);
 

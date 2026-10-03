@@ -51,7 +51,6 @@ struct DegrainData {
     VSNode *super = nullptr;
     VSNode *centerSuper = nullptr;
     VSNode *vectors[radius * 2] = {};
-    int deltaFrame[radius * 2] = {};
 
     const VSVideoInfo *vi = nullptr;
 
@@ -69,19 +68,14 @@ struct DegrainData {
     OverlapsFunction OVERS[3];
     DenoiseFunction DEGRAIN[3];
 
+    AnalysisGeometry vectorGeometry[radius * 2];
+    SuperGeometry superGeometry;
+    SuperGeometry centerSuperGeometry;
+
     bool process[3];
 
     int xSubUV;
     int ySubUV;
-
-    int nWidth[3];
-    int nHeight[3];
-    int nOverlapX[3];
-    int nOverlapY[3];
-    int nBlkSizeX[3];
-    int nBlkSizeY[3];
-    int nWidth_B[3];
-    int nHeight_B[3];
 
     OverlapWindows OverWins[3];
 
@@ -120,14 +114,14 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             vsapi->requestFrameFilter(n, d->vectors[r + 1], frameCtx);
 
             // Backward
-            int offB = d->deltaFrame[r];
+            int offB = d->vectorGeometry[r].deltaFrame;
             if (n + offB < d->vi->numFrames && n + offB >= 0)
                 vsapi->requestFrameFilter(n + offB, d->super, frameCtx);
 
             vsapi->requestFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx);
 
             // Forward
-            int offF = d->deltaFrame[r + 1];
+            int offF = d->vectorGeometry[r + 1].deltaFrame;
             if (n + offF >= 0 && n + offF < d->vi->numFrames)
                 vsapi->requestFrameFilter(n + offF, d->super, frameCtx);
         }
@@ -164,26 +158,25 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
 
             for (int r = 0; r < radius * 2; r++) {
                 const VSFrame *frame = vsapi->getFrameFilter(n, d->vectors[r], frameCtx);
-                fgops[r].emplace(frame, 1, d->prefix, vsapi);
+                fgops[r].emplace(frame, 1, d->prefix, vsapi, d->vectorGeometry[r]);
                 isUsable[r] = fgops[r]->IsUsable(d->nSCD1, d->nSCD2);
 
                 if (isUsable[r]) {
-                    if (fgops[r]->nDeltaFrame != d->deltaFrame[r])
-                        throw std::runtime_error("vector clip " + std::to_string(r) + " reports delta " + std::to_string(fgops[r]->nDeltaFrame) +
-                            " at frame " + std::to_string(n) + " but was created with delta " + std::to_string(d->deltaFrame[r]) +
-                            "; the delta must be constant for the whole clip");
-
-                    int offset = d->deltaFrame[r];
+                    int offset = d->vectorGeometry[r].deltaFrame;
                     if (n + offset >= 0 && n + offset < d->vi->numFrames)
-                        pRefGOF[r].emplace(vsapi->getFrameFilter(n + offset, d->super, frameCtx), 1, d->prefix, vsapi);
+                        pRefGOF[r].emplace(vsapi->getFrameFilter(n + offset, d->super, frameCtx), 1, d->prefix, vsapi, d->superGeometry);
                     else
                         isUsable[r] = false; // reference out of range was never requested at arInitial; treat as unusable
                 }
             }
 
-            int nLogPel = (fgops[0]->nPel == 4) ? 2 : (fgops[0]->nPel == 2) ? 1 : 0;
+            // the loops are sized for the first frame's vectors, which every frame that carries vectors was checked against
+            const AnalysisGeometry &geometry = d->vectorGeometry[0];
+            const int nLogPel = ilog2(geometry.pel);
 
-            FramePyramid pSrcFrame(vsapi->getFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx), 1, d->prefix, vsapi);
+            // centersuper is checked against its own first frame, since it may have fewer levels than super
+            FramePyramid pSrcFrame(vsapi->getFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx), 1, d->prefix, vsapi,
+                d->centerSuper ? d->centerSuperGeometry : d->superGeometry);
             const auto &srcLevel = pSrcFrame.GetLevel(0);
 
             for (int i = 0; i < d->vi->format.numPlanes; i++) {
@@ -195,14 +188,14 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
 
             const int xSubUV = d->xSubUV;
             const int ySubUV = d->ySubUV;
-            const int nBlkX = fgops[0]->nBlkX;
-            const int nBlkY = fgops[0]->nBlkY;
+            const int nBlkX = geometry.blkX;
+            const int nBlkY = geometry.blkY;
             const ptrdiff_t dstTempPitch = d->dstTempPitch;
-            const int *nOverlapX = d->nOverlapX;
-            const int *nOverlapY = d->nOverlapY;
-            const int *nBlkSizeX = d->nBlkSizeX;
-            const int *nBlkSizeY = d->nBlkSizeY;
-            const int *nWidth_B = d->nWidth_B;
+            const int nOverlapX[3] = { geometry.overlapX, nOverlapX[0] >> xSubUV, nOverlapX[1] };
+            const int nOverlapY[3] = { geometry.overlapY, nOverlapY[0] >> ySubUV, nOverlapY[1] };
+            const int nBlkSizeX[3] = { geometry.blkSizeX, nBlkSizeX[0] >> xSubUV, nBlkSizeX[1] };
+            const int nBlkSizeY[3] = { geometry.blkSizeY, nBlkSizeY[0] >> ySubUV, nBlkSizeY[1] };
+            const int nWidth_B[3] = { nBlkX * (nBlkSizeX[0] - nOverlapX[0]) + nOverlapX[0], nWidth_B[0] >> xSubUV, nWidth_B[1] };
             const auto *thSAD = d->thSAD;
 
             OverlapWindows *OverWins[3] = { &d->OverWins[0], &d->OverWins[1], &d->OverWins[2] };
@@ -236,7 +229,9 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                 if (!d->process[plane])
                     continue;
 
-                for (int r = 0; r < radius * 2; r++) // the kernel steps the references with the centre's stride
+                // the kernel steps the references with the centre's stride; the frames were checked against geometries that
+                // differ at most in the level count when they were loaded, so they share format and padded width, hence the stride
+                for (int r = 0; r < radius * 2; r++)
                     assert(!pPlanes[r] || pPlanes[r]->planes[plane].nPitch == nSrcPitches[plane]);
 
                 if (nOverlapX[0] == 0 && nOverlapY[0] == 0) {
@@ -543,13 +538,13 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
             if (!vectors[r]->IsCompatibleWithAnalysis(super))
                 throw std::runtime_error("The motion vectors passed are not compatible with the super clip");
 
-            d->deltaFrame[r] = vectors[r]->nDeltaFrame;
+            d->vectorGeometry[r] = vectors[r]->Geometry();
 
             if (r % 2 == 1) {
-                if (d->deltaFrame[r] != -d->deltaFrame[r - 1])
+                if (vectors[r]->nDeltaFrame != -vectors[r - 1]->nDeltaFrame)
                     throw std::runtime_error("forward and backward vector clips must be symmetric in their delta frame");
                 if (r >= 2) {
-                    if (abs(d->deltaFrame[r - 2]) >= abs(d->deltaFrame[r]))
+                    if (abs(vectors[r - 2]->nDeltaFrame) >= abs(vectors[r]->nDeltaFrame))
                         throw std::runtime_error("vector clips must have increasing number of delta frames");
                 }
             }
@@ -558,8 +553,20 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         if (!super.IsCompatibleWithSource(d->vi))
             throw std::runtime_error("super clip is not compatible with the source clip");
 
-        if (d->centerSuper && !FramePyramid(d->centerSuper, d->prefix, vsapi).IsCompatible(super))
-            throw std::runtime_error("centersuper must be created with the same Super arguments as super");
+        if (d->centerSuper) {
+            FramePyramid centerSuper(d->centerSuper, d->prefix, vsapi);
+            if (!centerSuper.IsCompatible(super))
+                throw std::runtime_error("centersuper must be created with the same Super arguments as super");
+            d->centerSuperGeometry = centerSuper.Geometry();
+        }
+
+        CheckClipLength(d->super, "super", d->vi->numFrames, "clip", vsapi);
+        if (d->centerSuper)
+            CheckClipLength(d->centerSuper, "centersuper", d->vi->numFrames, "clip", vsapi);
+        for (int r = 0; r < radius * 2; r++)
+            CheckClipLength(d->vectors[r], "vectors", d->vi->numFrames, "clip", vsapi);
+
+        d->superGeometry = super.Geometry();
 
         int64_t thsadRaw[3], thsad2Raw[3];
         GetHVPairArgument(thsadRaw[0], thsadRaw[1], "thsad", 400, 400, in, vsapi);
@@ -606,42 +613,21 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
             }
         }
 
+        // the buffers are set up for the first frame's vectors, which degrainGetFrame sizes its loops for
+        const AnalysisGeometry &geometry = d->vectorGeometry[0];
+
         // accumulator is 1x pixel width for float (bytesPerSample 4), 2x for 8/16-bit integer.
-        d->dstTempPitch = ((vectors[0]->nWidth + 15) / 16) * 16 * d->vi->format.bytesPerSample * (d->vi->format.bytesPerSample == 4 ? 1 : 2);
+        d->dstTempPitch = ((geometry.width + 15) / 16) * 16 * d->vi->format.bytesPerSample * (d->vi->format.bytesPerSample == 4 ? 1 : 2);
 
         d->xSubUV = d->vi->format.subSamplingW;
         d->ySubUV = d->vi->format.subSamplingH;
 
-        d->nWidth[0] = vectors[0]->nWidth;
-        d->nWidth[1] = d->nWidth[2] = d->nWidth[0] >> d->xSubUV;
-
-        d->nHeight[0] = vectors[0]->nHeight;
-        d->nHeight[1] = d->nHeight[2] = d->nHeight[0] >> d->ySubUV;
-
-        d->nOverlapX[0] = vectors[0]->nOverlapX;
-        d->nOverlapX[1] = d->nOverlapX[2] = d->nOverlapX[0] >> d->xSubUV;
-
-        d->nOverlapY[0] = vectors[0]->nOverlapY;
-        d->nOverlapY[1] = d->nOverlapY[2] = d->nOverlapY[0] >> d->ySubUV;
-
-        d->nBlkSizeX[0] = vectors[0]->nBlkSizeX;
-        d->nBlkSizeX[1] = d->nBlkSizeX[2] = d->nBlkSizeX[0] >> d->xSubUV;
-
-        d->nBlkSizeY[0] = vectors[0]->nBlkSizeY;
-        d->nBlkSizeY[1] = d->nBlkSizeY[2] = d->nBlkSizeY[0] >> d->ySubUV;
-
-        d->nWidth_B[0] = vectors[0]->nBlkX * (d->nBlkSizeX[0] - d->nOverlapX[0]) + d->nOverlapX[0];
-        d->nWidth_B[1] = d->nWidth_B[2] = d->nWidth_B[0] >> d->xSubUV;
-
-        d->nHeight_B[0] = vectors[0]->nBlkY * (d->nBlkSizeY[0] - d->nOverlapY[0]) + d->nOverlapY[0];
-        d->nHeight_B[1] = d->nHeight_B[2] = d->nHeight_B[0] >> d->ySubUV;
-
-        if (d->nOverlapX[0] || d->nOverlapY[0]) {
-            d->OverWins[0].Init(d->nBlkSizeX[0], d->nBlkSizeY[0], d->nOverlapX[0], d->nOverlapY[0]);
+        if (geometry.overlapX || geometry.overlapY) {
+            d->OverWins[0].Init(geometry.blkSizeX, geometry.blkSizeY, geometry.overlapX, geometry.overlapY);
 
             if (d->vi->format.colorFamily != cfGray) {
-                d->OverWins[1].Init(d->nBlkSizeX[1], d->nBlkSizeY[1], d->nOverlapX[1], d->nOverlapY[1]);
-                d->OverWins[2].Init(d->nBlkSizeX[2], d->nBlkSizeY[2], d->nOverlapX[2], d->nOverlapY[2]);
+                for (int plane = 1; plane < 3; plane++)
+                    d->OverWins[plane].Init(geometry.blkSizeX >> d->xSubUV, geometry.blkSizeY >> d->ySubUV, geometry.overlapX >> d->xSubUV, geometry.overlapY >> d->ySubUV);
             }
         }
 

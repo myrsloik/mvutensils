@@ -136,6 +136,11 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         int xRatioUV = 1 << d->vi.format.subSamplingW;
         int yRatioUV = 1 << d->vi.format.subSamplingH;
 
+        // The chroma planes are padded by pad / ratio. Rounded down, a luma vector reaching -pad would map below the
+        // chroma padding in the consumers that floor-shift vectors to chroma.
+        if (d->nHPad % xRatioUV || d->nVPad % yRatioUV)
+            throw std::runtime_error("pad must be divisible by the chroma subsampling: the horizontal pad must be even for 4:2:0 and 4:2:2, the vertical pad for 4:2:0 and 4:4:0");
+
         GetHVPairArgument(d->nBlkSizeX, d->nBlkSizeY, "blksize", 8, 8, in, vsapi);
         GetHVPairArgument(d->nOverlapX, d->nOverlapY, "overlap", 0, 0, in, vsapi);
 
@@ -154,9 +159,9 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
 
         d->usePelClip = false;
         if (pelvi && (d->nPel >= 2)) {
-            if ((pelvi->width != d->vi.width * d->nPel) &&
+            if ((pelvi->width != d->vi.width * d->nPel) ||
                 (pelvi->height != d->vi.height * d->nPel))
-                throw std::runtime_error("pelclip's dimensions must be a multiple of the input clip's dimensions");
+                throw std::runtime_error("pelclip's dimensions must be pel times the input clip's dimensions");
 
             if (pelvi->numFrames != d->vi.numFrames)
                 throw std::runtime_error("pelclip's length must match the input clip's length");

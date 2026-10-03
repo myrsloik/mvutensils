@@ -235,6 +235,19 @@ public:
     ~MotionBlockLevel();
 };
 
+// The parameters a vector clip was made with. Consumers size their kernels and buffers, scale their SAD thresholds
+// (block size and chroma) and pick their reference frames (delta) from frame 0 when they are created, and check every
+// frame that carries vectors against it: a spliced clip can mix different analyses. MotionBlockPyramid::IsCompatible
+// compares all but the delta, which the clips passed to one filter together differ in by design.
+struct AnalysisGeometry {
+    int width = 0, height = 0, realWidth = 0, realHeight = 0, hPad = 0, vPad = 0, pel = 0, bitsPerSample = 0;
+    int blkSizeX = 0, blkSizeY = 0, overlapX = 0, overlapY = 0, blkX = 0, blkY = 0;
+    bool chroma = false;
+    int xRatioUV = 0, yRatioUV = 0; // the subsampling chroma was analysed at, 0 for luma-only vectors
+    int deltaFrame = 0; // the reference's offset, positive for backward vectors
+    bool operator==(const AnalysisGeometry &) const = default;
+};
+
 class MotionBlockPyramid {
 public:
     // Note that the implementation doesn't quite handle multiple search/recalculate operations
@@ -285,6 +298,7 @@ public:
     // positive numbers mean that many levels are loaded. When loading from clips passing 1 is usually enough.
     // Object can be in an invalid or limited state after this constructor
     MotionBlockPyramid(const VSFrame *src, bool loadVectors, const std::string &prefix, const VSAPI *vsapi);
+    MotionBlockPyramid(const VSFrame *src, bool loadVectors, const std::string &prefix, const VSAPI *vsapi, const AnalysisGeometry &expected);
 
     // Constructor to load metadata and do nothing else
     MotionBlockPyramid(VSNode *node, const std::string &prefix, const VSAPI *vsapi);
@@ -312,6 +326,8 @@ public:
     void ScaleThSCD(int64_t &thscd1, float &thscd2, int bitsPerSample) const;
     [[nodiscard]] State GetState() const noexcept;
     [[nodiscard]] bool HasMotionVectors() const noexcept;
+
+    [[nodiscard]] AnalysisGeometry Geometry() const noexcept;
 
     [[nodiscard]] bool IsCompatible(const MotionBlockPyramid &other) const noexcept;
     [[nodiscard]] bool IsCompatibleWithAnalysis(const FramePyramid &other) const noexcept;

@@ -50,6 +50,7 @@ struct AnalyseData {
     bool tff_exists;
 
     std::string prefix;
+    SuperGeometry superGeometry;
 
     const VSAPI *vsapi;
 
@@ -76,7 +77,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
     } else if (activationReason == arAllFramesReady) {
         try {
             const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-            FramePyramid srcFramePyramid(src, -1, d->prefix, vsapi);
+            FramePyramid srcFramePyramid(src, -1, d->prefix, vsapi, d->superGeometry);
 
             bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, d->fields, vsapi);
 
@@ -84,7 +85,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
 
             if (nref >= 0 && nref < d->vi->numFrames) {
                 const VSFrame *ref = vsapi->getFrameFilter(nref, d->node, frameCtx);
-                FramePyramid refFramePyramid(ref, -1, d->prefix, vsapi);
+                FramePyramid refFramePyramid(ref, -1, d->prefix, vsapi, d->superGeometry);
 
                 bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, d->fields, vsapi);
 
@@ -125,6 +126,7 @@ static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         d->vi = vsapi->getVideoInfo(d->node);
 
         FramePyramid super(d->node, d->prefix, vsapi);
+        d->superGeometry = super.Geometry();
 
         GetHVPairArgument(d->nBlkSizeX, d->nBlkSizeY, "blksize", super.nBlkSizeX, super.nBlkSizeY, in, vsapi);
         GetHVPairArgument(d->nOverlapX, d->nOverlapY, "overlap", super.nOverlapX, super.nOverlapY, in, vsapi);

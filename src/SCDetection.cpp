@@ -34,6 +34,7 @@ struct SCDetectionData {
 
     int64_t thscd1;
     float thscd2;
+    AnalysisGeometry geometry;
 
     std::string prefix;
 
@@ -59,7 +60,7 @@ static const VSFrame *VS_CC scdetectionGetFrame(int n, int activationReason, voi
         vsapi->freeFrame(src);
 
         try {
-            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
+            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi, d->geometry);
 
             constexpr const char *propNames[2] = { "_SceneChangePrev", "_SceneChangeNext" };
             VSMap *props = vsapi->getFramePropertiesRW(dst);
@@ -101,9 +102,12 @@ static void VS_CC scdetectionCreate(const VSMap *in, VSMap *out, [[maybe_unused]
     d->vi = vsapi->getVideoInfo(d->node);
 
     try {
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
+
         MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
 
         vectors.ScaleThSCD(d->thscd1, d->thscd2, vectors.bitsPerSample);
+        d->geometry = vectors.Geometry();
     } catch (const std::exception &e) {
         vsapi->mapSetError(out, ("SCDetection: " + std::string(e.what())).c_str());
         return;

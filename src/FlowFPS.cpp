@@ -51,6 +51,9 @@ struct FlowFPSData {
     MaskResizer maskResizerFull;
     MaskResizer maskResizerSubSampled;
 
+    AnalysisGeometry mvfwGeometry, mvbwGeometry;
+    SuperGeometry superGeometry;
+
     std::string prefix;
 
     const VSAPI *vsapi;
@@ -140,13 +143,13 @@ static const VSFrame *VS_CC flowfpsGetFrame(int n, int activationReason, void *i
 
             bool vectorsLoadFrame = (nleft < d->oldvi->numFrames && nright < d->oldvi->numFrames);
 
-            MotionBlockPyramid vectorsF(vectorsLoadFrame ? vsapi->getFrameFilter(nright, d->mvfw, frameCtx) : nullptr, 1, d->prefix, vsapi);
-            MotionBlockPyramid vectorsB(vectorsLoadFrame ? vsapi->getFrameFilter(nleft, d->mvbw, frameCtx) : nullptr, 1, d->prefix, vsapi);
+            MotionBlockPyramid vectorsF(vectorsLoadFrame ? vsapi->getFrameFilter(nright, d->mvfw, frameCtx) : nullptr, 1, d->prefix, vsapi, d->mvfwGeometry);
+            MotionBlockPyramid vectorsB(vectorsLoadFrame ? vsapi->getFrameFilter(nleft, d->mvbw, frameCtx) : nullptr, 1, d->prefix, vsapi, d->mvbwGeometry);
 
             if (vectorsB.IsUsable(d->thscd1, d->thscd2) && vectorsF.IsUsable(d->thscd1, d->thscd2)) {
                 // If both are usable, that means both nleft and nright are less than oldvi->numFrames. Thus there is no need to check nleft and nright here.
-                FramePyramid src(vsapi->getFrameFilter(nleft, d->super, frameCtx), 1, d->prefix, vsapi);
-                FramePyramid ref(vsapi->getFrameFilter(nright, d->super, frameCtx), 1, d->prefix, vsapi);
+                FramePyramid src(vsapi->getFrameFilter(nleft, d->super, frameCtx), 1, d->prefix, vsapi, d->superGeometry);
+                FramePyramid ref(vsapi->getFrameFilter(nright, d->super, frameCtx), 1, d->prefix, vsapi, d->superGeometry);
                 const VSFrame *dstPropSrc = vsapi->getFrameFilter(nleft, d->node, frameCtx);
                 dst = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, dstPropSrc, core);
                 vsapi->freeFrame(dstPropSrc);
@@ -170,8 +173,8 @@ static const VSFrame *VS_CC flowfpsGetFrame(int n, int activationReason, void *i
                 auto bufSmallBX = MaskResizer::MakeBufferPair(SmallB->VXSmallY, SmallB->pitchVSmallY, dstTileXB.get());
                 auto bufSmallBY = MaskResizer::MakeBufferPair(SmallB->VYSmallY, SmallB->pitchVSmallY, dstTileYB.get());
 
-                MotionBlockPyramid vectorsFF(d->extraMask ? vsapi->getFrameFilter(nleft, d->mvfw, frameCtx) : nullptr, 1, d->prefix, vsapi);
-                MotionBlockPyramid vectorsBB(d->extraMask ? vsapi->getFrameFilter(nright, d->mvbw, frameCtx) : nullptr, 1, d->prefix, vsapi);
+                MotionBlockPyramid vectorsFF(d->extraMask ? vsapi->getFrameFilter(nleft, d->mvfw, frameCtx) : nullptr, 1, d->prefix, vsapi, d->mvfwGeometry);
+                MotionBlockPyramid vectorsBB(d->extraMask ? vsapi->getFrameFilter(nright, d->mvbw, frameCtx) : nullptr, 1, d->prefix, vsapi, d->mvbwGeometry);
 
                 if (d->extraMask && vectorsBB.IsUsable(d->thscd1, d->thscd2) && vectorsFF.IsUsable(d->thscd1, d->thscd2)) {
                     // get vector mask from extra frames
@@ -360,6 +363,10 @@ static void VS_CC flowfpsCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         d->mvbw = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         d->mvfw = vsapi->mapGetNode(in, "vectors", 1, nullptr);
 
+        CheckClipLength(d->super, "super", d->oldvi->numFrames, "clip", vsapi);
+        CheckClipLength(d->mvbw, "vectors", d->oldvi->numFrames, "clip", vsapi);
+        CheckClipLength(d->mvfw, "vectors", d->oldvi->numFrames, "clip", vsapi);
+
         MotionBlockPyramid vectorsFw(d->mvfw, d->prefix, vsapi);
         MotionBlockPyramid vectorsBw(d->mvbw, d->prefix, vsapi);
 
@@ -372,6 +379,10 @@ static void VS_CC flowfpsCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
 
         if (!vectorsFw.IsCompatible(vectorsBw) || (vectorsBw.nDeltaFrame != -vectorsFw.nDeltaFrame) || vectorsFw.nDeltaFrame > 0 || vectorsBw.nDeltaFrame < 0)
             throw std::runtime_error("mvfw and mvbw must be compatible with each other and have opposite sign delta");
+
+        d->mvfwGeometry = vectorsFw.Geometry();
+        d->mvbwGeometry = vectorsBw.Geometry();
+        d->superGeometry = super.Geometry();
 
         d->maskResizerFull.Init(vectorsFw.nBlkX, vectorsFw.nBlkY, vectorsFw.nBlkSizeX, vectorsFw.nBlkSizeY, vectorsFw.nOverlapX, vectorsFw.nOverlapY,
             d->vi.width, d->vi.height);

@@ -1066,6 +1066,17 @@ void MotionBlockLevel::SearchMVs(const FramePyramidLevel &pSrcFrame, const Frame
 }
 
 
+// A vector component in another pel's units. Exact towards a finer pel; towards a coarser one it rounds to the nearest
+// position the same way for both signs (mvtools' arithmetic shift rounds negative components down, which drifts the
+// field up and left)
+static int RescaleToPel(int v, int nLogPelFrom, int nLogPelTo) noexcept {
+    if (nLogPelTo >= nLogPelFrom)
+        return v * (1 << (nLogPelTo - nLogPelFrom));
+    const int shift = nLogPelFrom - nLogPelTo;
+    const int half = 1 << (shift - 1);
+    return v >= 0 ? (v + half) >> shift : -((half - v) >> shift);
+}
+
 template <int nLogPel, typename PixelType>
 void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
     int nBlkSizeX_, int nBlkSizeY_, int nOverlapX_, int nOverlapY_, bool chroma_,
@@ -1097,7 +1108,8 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
     nBlkSizeY = nBlkSizeY_;
     nOverlapX = nOverlapX_;
     nOverlapY = nOverlapY_;
-    nPel = 1 << nLogPel;
+    nPel = 1 << nLogPel; // the super clip's, the old vectors are rescaled to it below
+    this->nLogPel = nLogPel;
     chroma = chroma_;
 
     xRatioUV = 1;
@@ -1112,30 +1124,17 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
     }
 
     // Calculate new block count
-    int nRealWidth = pSrcFrame.planes[0].nRealWidth;
-    int nRealHeight = pSrcFrame.planes[0].nRealHeight;
-    int nWidth = pSrcFrame.planes[0].nWidth;
-    int nHeight = pSrcFrame.planes[0].nHeight;
-    nBlkX = (nRealWidth - nOverlapX) / (nBlkSizeX - nOverlapX);
-    nBlkY = (nRealHeight - nOverlapY) / (nBlkSizeY - nOverlapY);
+    const int nWidth_B = BlockAlignedDimension(pSrcFrame.planes[0].nRealWidth, nBlkSizeX, nOverlapX);
+    const int nHeight_B = BlockAlignedDimension(pSrcFrame.planes[0].nRealHeight, nBlkSizeY, nOverlapY);
+    nBlkX = (nWidth_B - nOverlapX) / (nBlkSizeX - nOverlapX);
+    nBlkY = (nHeight_B - nOverlapY) / (nBlkSizeY - nOverlapY);
+    nBlkCount = nBlkX * nBlkY;
 
-    int nWidth_B = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-    int nHeight_B = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-
-    while (nWidth_B < nRealWidth) {
-        nBlkX++;
-        nWidth_B = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-    }
-
-    while (nHeight_B < nRealHeight) {
-        nBlkY++;
-        nHeight_B = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-    }
-
-    if (nWidth_B > nWidth || nHeight_B > nHeight)
+    if (nWidth_B > pSrcFrame.planes[0].nWidth || nHeight_B > pSrcFrame.planes[0].nHeight)
         throw MotionBlockPyramidError("The chosen block size has no multiple that will process the entire frame without exceeding the super clip padding, derive a new suitable super clip and try again");
 
-    // Early exit when there are no vectors to recalculate, this usually happens due to Analyse not being able to derive vectors because the reference frame (n+delta) is out of bounds
+    // A frame Analyse left without vectors because its reference (n + delta) is outside the clip: only the metadata
+    // above is recalculated, and the frame stays without vectors
     if (oldVectors.empty())
         return;
 
@@ -1262,8 +1261,8 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
             }
 
             // scale vector to new nPel
-            vectorOld.x = (vectorOld.x << nLogPel) >> nLogPelold;
-            vectorOld.y = (vectorOld.y << nLogPel) >> nLogPelold;
+            vectorOld.x = RescaleToPel(vectorOld.x, nLogPelold, nLogPel);
+            vectorOld.y = RescaleToPel(vectorOld.y, nLogPelold, nLogPel);
 
             predictor = ClipMV(vectorOld);                                                                    // predictor
             predictor.sad = vectorOld.sad * (nBlkSizeX * nBlkSizeY) / (nBlkSizeXold * nBlkSizeYold); // normalized to new block size
@@ -1339,6 +1338,9 @@ void MotionBlockLevel::RecalculateMVs(const FramePyramidLevel &pSrcFrame, const 
     SearchType st, int stp, int64_t lambda, int pnew,
     int fieldShift, int64_t thSAD, bool useSatd, bool smooth, bool meander, int bytesPerSample) {
 
+    // The search runs at the super clip's pel, not the old vectors' (which DoRecalculateMVs rescales)
+    const int nLogPel = ilog2(pSrcFrame.planes[0].nPel);
+
     if (bytesPerSample == 1) {
         if (nLogPel == 0)
             DoRecalculateMVs<0, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
@@ -1390,22 +1392,12 @@ MotionBlockPyramid::MotionBlockPyramid(const FramePyramid &src, int nBlkSizeX, i
     nHPadding = src.nHPad[0];
     nVPadding = src.nVPad[0];
     nPel = src.nPel;
-    nBlkX = (nRealWidth - nOverlapX) / (nBlkSizeX - nOverlapX);
-    nBlkY = (nRealHeight - nOverlapY) / (nBlkSizeY - nOverlapY);
     bitsPerSample = src.bitsPerSample;
 
-    int nWidth_B = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-    int nHeight_B = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-
-    while (nWidth_B < nRealWidth) {
-        nBlkX++;
-        nWidth_B = (nBlkSizeX - nOverlapX) * nBlkX + nOverlapX;
-    }
-
-    while (nHeight_B < nRealHeight) {
-        nBlkY++;
-        nHeight_B = (nBlkSizeY - nOverlapY) * nBlkY + nOverlapY;
-    }
+    const int nWidth_B = BlockAlignedDimension(nRealWidth, nBlkSizeX, nOverlapX);
+    const int nHeight_B = BlockAlignedDimension(nRealHeight, nBlkSizeY, nOverlapY);
+    nBlkX = (nWidth_B - nOverlapX) / (nBlkSizeX - nOverlapX);
+    nBlkY = (nHeight_B - nOverlapY) / (nBlkSizeY - nOverlapY);
 
     if (nWidth_B > nWidth || nHeight_B > nHeight)
         throw MotionBlockPyramidError("The chosen block size has no multiple that will process the entire frame without exceeding the super clip padding, derive a new suitable super clip and try again");
@@ -1575,6 +1567,13 @@ MotionBlockPyramid::MotionBlockPyramid(const VSFrame *src, bool loadVectors, con
     }
 }
 
+// The delegated constructor has completed, so a throw here runs the destructor, which frees the frame
+MotionBlockPyramid::MotionBlockPyramid(const VSFrame *src, bool loadVectors, const std::string &prefix, const VSAPI *vsapi, const AnalysisGeometry &expected) :
+    MotionBlockPyramid(src, loadVectors, prefix, vsapi) {
+    if (HasMotionVectors() && Geometry() != expected)
+        throw MotionBlockPyramidError("a vector clip frame was made with different Analyse/Recalculate arguments than its first frame");
+}
+
 MotionBlockPyramid::MotionBlockPyramid(VSNode *node, const std::string &prefix, const VSAPI *vsapi) :
     vsapi(vsapi) {
     char errorMsg[ERROR_SIZE] = {};
@@ -1608,6 +1607,10 @@ void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyram
 
     if (!IsCompatibleWithAnalysis(pSrcGOF) || !IsCompatibleWithAnalysis(pRefGOF))
         throw MotionBlockPyramidError("Incompatible frame format for motion vector search, bitdepth must match");
+
+    // IsCompatible doesn't compare level counts and GetLevel only asserts, so a spliced super clip could index past them
+    if (pSrcGOF.nLevels < nLevelCount || pRefGOF.nLevels < nLevelCount)
+        throw MotionBlockPyramidError("the super clip frames have different level counts, every frame must be made with the same Super arguments");
 
     int fieldShiftCur = (nLevelCount - 1 == 0) ? fieldShift : 0; // may be non zero for finest level only
 
@@ -1662,12 +1665,16 @@ void MotionBlockPyramid::RecalculateMVs(const FramePyramid &pSrcGOF, const Frame
     if (!pSrcGOF.IsCompatible(pRefGOF))
         throw MotionBlockPyramidError("The two reference frames don't have the same format");
 
+    const bool hasVectors = HasMotionVectors();
     if (pyramidLevels.empty()) {
         if (state != State::MetadataOnly)
             throw MotionBlockPyramidError("The vectors passed are not a valid analysis result");
+        // A frame without vectors still gets the new geometry exported; the empty vector list makes DoRecalculateMVs
+        // stop once the new grid is known instead of searching from made-up zero vectors
         pyramidLevels.resize(1);
         pyramidLevels[0].Initialize(this->nBlkX, this->nBlkY, this->nBlkSizeX, this->nBlkSizeY, this->nPel, 0,
             true, this->chroma, this->nOverlapX, this->nOverlapY, this->xRatioUV, this->yRatioUV, this->bitsPerSample);
+        pyramidLevels[0].vectors.clear();
     }
 
     int bytesPerSample = SelectOnBitsPerSample(pSrcGOF.bitsPerSample, 1, 2, 4);
@@ -1697,7 +1704,7 @@ void MotionBlockPyramid::RecalculateMVs(const FramePyramid &pSrcGOF, const Frame
     this->chroma = chroma;
     this->nDeltaFrame = deltaFrame;
 
-    state = State::AnalysisDone;
+    state = hasVectors ? State::AnalysisDone : State::MetadataOnly;
 }
 
 void MotionBlockPyramid::ExportFrameData(VSFrame *dst, const std::string &prefix, const VSAPI *vsapi) const noexcept {
@@ -1790,29 +1797,16 @@ bool MotionBlockPyramid::HasMotionVectors() const noexcept {
     return state == State::ReadyForRecalculate || state == State::AnalysisDone;
 }
 
+AnalysisGeometry MotionBlockPyramid::Geometry() const noexcept {
+    return { nWidth, nHeight, nRealWidth, nRealHeight, nHPadding, nVPadding, nPel, bitsPerSample,
+        nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, nBlkX, nBlkY,
+        chroma, chroma ? xRatioUV : 0, chroma ? yRatioUV : 0, nDeltaFrame };
+}
+
 bool MotionBlockPyramid::IsCompatible(const MotionBlockPyramid &other) const noexcept {
-    if (nWidth != other.nWidth || nHeight != other.nHeight || nRealWidth != other.nRealWidth || nRealHeight != other.nRealHeight)
-        return false;
-
-    if (nBlkSizeX != other.nBlkSizeX || nBlkSizeY != other.nBlkSizeY || nOverlapX != other.nOverlapX || nOverlapY != other.nOverlapY)
-        return false;
-
-    if (nBlkX != other.nBlkX || nBlkY != other.nBlkY)
-        return false;
-
-    if (nPel != other.nPel)
-        return false;
-
-    if (chroma && other.chroma && (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV))
-        return false;
-
-    if (nHPadding != other.nHPadding || nVPadding != other.nVPadding)
-        return false;
-
-    if (bitsPerSample != other.bitsPerSample)
-        return false;
-
-    return true;
+    AnalysisGeometry otherGeometry = other.Geometry();
+    otherGeometry.deltaFrame = nDeltaFrame; // the clips passed to one filter together differ in direction and distance
+    return Geometry() == otherGeometry;
 }
 
 bool MotionBlockPyramid::IsCompatibleWithAnalysis(const FramePyramid &other) const noexcept {
@@ -1820,6 +1814,12 @@ bool MotionBlockPyramid::IsCompatibleWithAnalysis(const FramePyramid &other) con
         return false;
 
     if (chroma && (xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV))
+        return false;
+
+    // Consumers take the chroma grid from the super clip, block size and overlap divided by its subsampling, also for
+    // vectors analysed on luma only (whose overlap was only checked against their own, possibly GRAY or 4:4:4, format).
+    // A deliberate limitation: such vectors are rejected even by a consumer that only processes luma.
+    if (other.chroma && (nOverlapX % other.xRatioUV || nOverlapY % other.yRatioUV))
         return false;
 
     if (nHPadding != other.nHPad[0] || nVPadding != other.nVPad[0])

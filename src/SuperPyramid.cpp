@@ -265,7 +265,7 @@ static int PlaneDimensionLuma(int numPixels, int ratioUV, int pad) noexcept {
 }
 
 // Level 0 size: the frame dimension grown to the smallest whole block grid covering it
-static int BlockAlignedDimension(int size, int blkSize, int overlap) noexcept {
+int BlockAlignedDimension(int size, int blkSize, int overlap) noexcept {
     int step = blkSize - overlap;
     int size_B = step * ((size - overlap) / step) + overlap;
     return (size_B < size) ? size_B + step : size;
@@ -800,18 +800,6 @@ void PyramidPlane::FromExternalPelPlanes(const VSFrame *pelFrame, int pel, int h
         pPlane[i] = vsapi->getReadPtr(pelFrame, 0) + i * subPelPlaneOffset;
 }
 
-int GetPyramidLevelForBlockSize(int blkSizeX, int blkSizeY, int overlapX, int overlapY, int levels) {
-    int level = 0;
-    while (level < levels - 1) {
-        int levelBlkSizeX = (blkSizeX - overlapX) << level;
-        int levelBlkSizeY = (blkSizeY - overlapY) << level;
-        if (levelBlkSizeX >= 64 || levelBlkSizeY >= 64)
-            break;
-        level++;
-    }
-    return level;
-}
-
 void FramePyramid::SharedInit(const VSFrame *srcFrame, int levels, int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, int hPad, int vPad, RFilterParam rFilter, int pel, VSCore *core, const VSAPI *vsapi) {
     this->vsapi = vsapi;
 
@@ -938,7 +926,7 @@ void FramePyramid::LoadFrameData(const VSFrame *srcFrame, int maxLevel, const st
 
         if (xRatioUV < 1 || yRatioUV < 1 || xRatioUV > 2 || yRatioUV > 2 || nRealWidth[0] > nWidth[0] || nRealHeight[0] > nHeight[0]
             || nVPad[0] < 0 || nHPad[0] < 0 || nRealHeight[0] < 1 || nRealWidth[0] < 1 || nLevels < 1 || (nPel != 1 && nPel != 2 && nPel != 4)
-            || bitsPerSample < 8 || (bitsPerSample > 16 && bitsPerSample != 32))
+            || bitsPerSample < 8 || (bitsPerSample > 16 && bitsPerSample != 32) || (chroma && (nHPad[0] % xRatioUV || nVPad[0] % yRatioUV)))
             throw SuperPyramidError("Invalid super frame metadata");
 
         if (chroma) {
@@ -1019,6 +1007,13 @@ void FramePyramid::LoadFrameData(const VSFrame *srcFrame, int maxLevel, const st
 FramePyramid::FramePyramid(const VSFrame *srcFrame, int maxLevel, const std::string &prefix, const VSAPI *vsapi)
 : vsapi(vsapi) {
     LoadFrameData(srcFrame, maxLevel, prefix);
+}
+
+// The delegated constructor has completed, so a throw here runs the destructor, which frees the frames
+FramePyramid::FramePyramid(const VSFrame *srcFrame, int maxLevel, const std::string &prefix, const VSAPI *vsapi, const SuperGeometry &expected)
+: FramePyramid(srcFrame, maxLevel, prefix, vsapi) {
+    if (Geometry() != expected)
+        throw SuperPyramidError("a super clip frame was made with different Super arguments than its first frame");
 }
 
 FramePyramid::FramePyramid(VSNode *node, const std::string &prefix, const VSAPI *vsapi)
@@ -1122,11 +1117,14 @@ const FramePyramidLevel &FramePyramid::GetLevel(int level) const noexcept {
 }
 
 bool FramePyramid::IsCompatible(const FramePyramid &other) const noexcept {
-    if (nWidth[0] != other.nWidth[0] || nHeight[0] != other.nHeight[0] || nPel != other.nPel || chroma != other.chroma
-        || nRealWidth[0] != other.nRealWidth[0] || nRealHeight[0] != other.nRealHeight[0] || nHPad[0] != other.nHPad[0] || nVPad[0] != other.nVPad[0]
-        || nBlkSizePadX[0] != other.nBlkSizePadX[0] || nBlkSizePadY[0] != other.nBlkSizePadY[0] || xRatioUV != other.xRatioUV || yRatioUV != other.yRatioUV || bitsPerSample != other.bitsPerSample)
-        return false;
-    return true;
+    SuperGeometry otherGeometry = other.Geometry();
+    otherGeometry.levels = nLevels; // a onelevel super (Degrain's centersuper) goes with a full one
+    return Geometry() == otherGeometry;
+}
+
+SuperGeometry FramePyramid::Geometry() const noexcept {
+    return { nWidth[0], nHeight[0], nRealWidth[0], nRealHeight[0], nHPad[0], nVPad[0], nBlkSizePadX[0], nBlkSizePadY[0],
+        nPel, xRatioUV, yRatioUV, bitsPerSample, nLevels, chroma };
 }
 
 bool FramePyramid::IsCompatibleWithSource(const VSVideoInfo *vi) const noexcept {

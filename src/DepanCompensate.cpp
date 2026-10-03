@@ -265,8 +265,7 @@ static void VS_CC depanCompensateCreate(const VSMap *in, VSMap *out, [[maybe_unu
 
         d->data = vsapi->mapGetNode(in, "data", 0, nullptr);
 
-        if (d->vi->numFrames > vsapi->getVideoInfo(d->data)->numFrames)
-            throw std::runtime_error("data must have at least as many frames as clip");
+        CheckClipLength(d->data, "data", d->vi->numFrames, "clip", vsapi);
 
 
         if (!std::isfinite(d->offset))

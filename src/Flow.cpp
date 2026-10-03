@@ -48,6 +48,9 @@ struct FlowData {
     MaskResizer maskResizerFull;
     MaskResizer maskResizerSubSampled;
 
+    AnalysisGeometry geometry;
+    SuperGeometry superGeometry;
+
     std::string prefix;
 
     const VSAPI *vsapi;
@@ -86,7 +89,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         VSFrame *dst = nullptr;
 
         try {
-            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
+            MotionBlockPyramid vectors(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi, d->geometry);
 
             if (nref >= 0 && nref < d->vi->numFrames && vectors.IsUsable(d->thscd1, d->thscd2)) {
                 const VSFrame *propSrc = vsapi->getFrameFilter(n, d->clip, frameCtx);
@@ -94,7 +97,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 vsapi->freeFrame(propSrc);
 
                 const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-                FramePyramid refGOF(ref, 1, d->prefix, vsapi);
+                FramePyramid refGOF(ref, 1, d->prefix, vsapi, d->superGeometry);
 
                 int fieldShift = 0;
                 if (d->fields && vectors.nPel > 1 && ((nref - n) % 2 != 0)) {
@@ -215,6 +218,9 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void 
         if (!super.IsCompatibleWithSource(d->vi))
             throw std::runtime_error("source clip isn't compatible with super clip");
 
+        CheckClipLength(d->super, "super", d->vi->numFrames, "clip", vsapi);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
+
         MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
 
         vectors.ScaleThSCD(d->thscd1, d->thscd2, vectors.bitsPerSample);
@@ -223,6 +229,9 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void 
 
         if (!vectors.IsCompatibleWithAnalysis(super))
             throw std::runtime_error("wrong source or super clip frame size");
+
+        d->geometry = vectors.Geometry();
+        d->superGeometry = super.Geometry();
 
         d->maskResizerFull.Init(vectors.nBlkX, vectors.nBlkY, vectors.nBlkSizeX, vectors.nBlkSizeY, vectors.nOverlapX, vectors.nOverlapY,
             d->vi->width, d->vi->height);

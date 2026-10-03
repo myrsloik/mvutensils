@@ -1212,10 +1212,14 @@ static void VS_CC depanStabiliseCreate(const VSMap *in, VSMap *out, [[maybe_unus
         if (d->vi->fpsNum == 0 || d->vi->fpsDen == 0)
             throw std::runtime_error("clip must have known frame rate");
 
+        // tzoom is in seconds and the adaptive zoom is smoothed over fps * tzoom / 4 frames. Less than one frame makes
+        // method 1 average over an empty window (a NaN zoom) and method 0's zoom time factor 1 / (cutoff * tzoom) blow up.
+        if (d->addzoom && !(static_cast<double>(d->tzoom) * d->vi->fpsNum / d->vi->fpsDen >= 4.0))
+            throw std::runtime_error("with addzoom, tzoom must be at least 4 / fps seconds, so the zoom is smoothed over at least one frame");
+
         d->data = vsapi->mapGetNode(in, "data", 0, nullptr);
 
-        if (d->vi->numFrames > vsapi->getVideoInfo(d->data)->numFrames)
-            throw std::runtime_error("data must have at least as many frames as clip");
+        CheckClipLength(d->data, "data", d->vi->numFrames, "clip", vsapi);
 
         d->zoommax = d->zoommax > 0 ? std::max(d->zoommax, d->initzoom) : -std::max(-d->zoommax, d->initzoom);
 
@@ -1286,8 +1290,9 @@ static void VS_CC depanStabiliseCreate(const VSMap *in, VSMap *out, [[maybe_unus
 
     d->winrz.resize(d->wintsize + 1);
     d->winfz.resize(d->wintsize + 1);
-    d->winrzsize = std::min(d->wintsize, (int)(d->fps * d->tzoom / 4));
-    d->winfzsize = std::min(d->wintsize, (int)(d->fps * d->tzoom / 4));
+    // at least one frame even when float rounding puts fps * tzoom just under 4, and clamped before the conversion as a
+    // huge tzoom would overflow it (tzoom is unused without addzoom)
+    d->winrzsize = d->winfzsize = static_cast<int>(std::clamp(d->fps * d->tzoom / 4, 1.0f, static_cast<float>(d->wintsize)));
     for (int i = 0; i < d->winrzsize; i++)
         d->winrz[i] = cosf(i * 0.5f * PI / d->winrzsize);
     for (int i = d->winrzsize; i <= d->wintsize; i++)

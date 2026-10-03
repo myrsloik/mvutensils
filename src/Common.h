@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <stdexcept>
+#include <string>
 #include <cstring>
 #include <algorithm>
 #include <bit>
@@ -114,6 +115,13 @@ template<typename T>
     if (tff_exists)
         top_field = tff ^ ((n % 2) != 0);
     return top_field;
+}
+
+// Frame requests past the end of a clip are clamped to its last frame, so an input shorter than the clip it is
+// paired with would silently deliver the wrong frames
+inline void CheckClipLength(VSNode *node, const char *name, int minFrames, const char *reference, const VSAPI *vsapi) {
+    if (vsapi->getVideoInfo(node)->numFrames < minFrames)
+        throw std::runtime_error(std::string(name) + " must have at least as many frames as " + reference);
 }
 
 // Compute the sub-pixel vertical field shift between src and ref frames.

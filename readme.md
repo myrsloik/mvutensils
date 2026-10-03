@@ -22,10 +22,15 @@ and adds full high-bit-depth and float support.
 * A vector clip stores block geometry and per-block SAD, never pixels, so it does **not** have to be
   analysed at the same bit depth as the clip it is later applied to. Analysing an 8-bit copy and
   using the result on the 16-bit or float original is a supported way to trade motion precision for
-  analysis speed. Resolution, subsampling, `pel` and the super's padding must still match.
+  analysis speed. Resolution, subsampling, `pel` and the super's padding must still match. Vectors analysed
+  with `chroma=False` are the exception to the subsampling rule (e.g. analysed on a GRAY copy and applied to
+  4:2:0), as long as their overlap is divisible by the clip's subsampling, even if only luma is processed.
   SAD-derived arguments (`thsad`, `thscd1`) are interpreted against the depth the vectors were
   analysed at, so they keep their documented 8-bit 8×8 meaning either way.
   [Recalculate](#recalculate) is the one exception and still requires equal bit depths.
+* Every frame of a super or vector clip must be made with the same arguments, and the vector clips passed
+  to one filter together must match each other, including the `chroma` setting they were analysed with.
+  Splicing clips made with different settings is not supported: filters stop with an error instead.
 * The attached frame properties use the prefix `MVUtensils` by default. Every function accepts a
   `prefix` argument to change it, which lets two independent MVUtensils graphs coexist on one clip.
 * Motion vectors are stored as frame properties: `<prefix>AnalysisVectors` (an int array where the
@@ -156,7 +161,7 @@ core.mvu.Super(vnode clip, int[] blksize, int[] overlap[, int[] pad=[16, 16], in
 | clip | 8–16 bit integer or 32 bit float, GRAY/YUV | | Clip to prepare. |
 | blksize | int[] | (required) | Block size `[h, v]` (a single value sets both). Used to pad the frame so the right/bottom edges are fully covered. Must match the block size you intend to use in `Analyse`. |
 | overlap | int[] | (required) | Block overlap `[h, v]`, must be ≤ blksize/2. Used together with `blksize` for edge padding. |
-| pad | int[] | ([16, 16]) | Border padding `[h, v]` in pixels. One value applies to both axes. |
+| pad | int[] | ([16, 16]) | Border padding `[h, v]` in pixels. One value applies to both axes. It must be divisible by the chroma subsampling: even horizontally for 4:2:0 and 4:2:2, even vertically for 4:2:0 and 4:4:0. |
 | pel | int | 1, 2, 4 (2) | Sub-pixel accuracy: 1 = full-pixel, 2 = half-pixel, 4 = quarter-pixel. Higher needs more memory and time. |
 | sharp | int | 0–2 (2) | Sub-pixel interpolation for `pel` > 1: 0 = bilinear, 1 = bicubic, 2 = Wiener (sharpest). |
 | rfilter | int | 0–2 (1) | Pyramid downscale filter: 0 = simple average, 1 = bilinear, 2 = cubic. |
@@ -287,8 +292,8 @@ out = core.mvu.Degrain(clip, super, vectors)
 
 | Parameter | Type | Options (Default) | Description |
 | --- | --- | --- | --- |
-| super | vnode | (required) | Super clip. Only one level is needed. Unlike the filters that merely consume vectors, its bit depth must equal the one the vectors were analysed at — see [below](#recalculate-and-bit-depth). |
-| vectors | vnode[] | (required) | Vector clip(s) to refine — a single clip or a whole list (e.g. an `AnalyseMany` set). The recalculated clips are returned as a list in the same order. |
+| super | vnode | (required) | Super clip. Only one level is needed. Unlike the filters that merely consume vectors, its bit depth must equal the one the vectors were analysed at — see [below](#recalculate-and-bit-depth). Its `pel` may differ from the vectors': they are rescaled, and the result has the super's `pel`. |
+| vectors | vnode[] | (required) | Vector clip(s) to refine — a single clip or a whole list (e.g. an `AnalyseMany` set). The recalculated clips are returned as a list in the same order, as long as `super`; as in `Analyse`, a frame whose reference lies outside `super` gets no vectors. |
 | thsad | int | (200) | Blocks whose SAD is below this keep their vector; worse blocks are re-searched. |
 | smooth | bint | (True) | Interpolate the new (finer) vector field from neighbours (True) or take the nearest old vector (False). `smooth=False` roughly matches the old `divide=1` behaviour, `smooth=True` ≈ `divide=2`. |
 | blksize | int[] | (super's value) | Finer block size `[h, v]`. Usually half of the original. |
@@ -358,7 +363,7 @@ core.mvu.Degrain(vnode clip, vnode super, vnode[] vectors[, int[] thsad=[400, 40
 | planes | int[] | ([0, 1, 2]) | Which planes to process; unprocessed planes are copied. |
 | limit | float[] | ([inf, inf]) | Maximum absolute change per pixel `[luma, chroma]`. Non-finite (`inf`/`nan`) or a value above the format maximum disables limiting. |
 | weights | int[] | (None) | Optional per-frame bias applied on top of the SAD-derived weights, in temporal order `[bw_radius, …, bw_1, centre, fw_1, …, fw_radius]` — exactly `2·radius + 1` non-negative values. Each reference's (and the source's) weight is multiplied by its entry before the weights are normalised, so only the ratios matter — the upper limit (≈2,800,000 at radius 1, falling to ≈164,000 at radius 25) exists purely to keep the internal weight sum inside a 32-bit int and is far beyond any real use. Omitted (or all-equal) leaves the default SAD weighting unchanged. |
-| centersuper | vnode | (None) | Optional super clip that supplies the centre frame, and the reference for `limit`, instead of `super`, which then only supplies the references. It must be created with the same `blksize`, `overlap`, `pel` and `pad` as `super`; only its first level is used, so `onelevel=True` is enough. See [the centre frame](#the-centre-frame). |
+| centersuper | vnode | (None) | Optional super clip that supplies the centre frame, and the reference for `limit`, instead of `super`, which then only supplies the references. It must be created with the same `blksize`, `overlap`, `pel` and `pad` as `super` and have at least as many frames as `clip`; only its first level is used, so `onelevel=True` is enough. See [the centre frame](#the-centre-frame). |
 
 > **Porting:** the per-direction `mvbw*/mvfw*` arguments are now the single `vectors` list, the
 > `thsad`/`thsadc` pair became `thsad=[luma, chroma]`, the `thsad2`/`thsadc2` pair became
@@ -643,7 +648,7 @@ core.mvu.DepanStabilise(vnode clip, vnode data[, float cutoff=1.0, float damping
 | subpixel | int | 0–2 (2) | Subpixel interpolation: 0=none, 1=bilinear, 2=bicubic. |
 | pixaspect | float | (1.0) | Pixel aspect ratio. |
 | fitlast | int | (0) | Number of trailing frames specially fitted for the clip end. |
-| tzoom | float | (3.0) | Time window (frames) over which zoom is smoothed. |
+| tzoom | float | (3.0) | Time in seconds over which the adaptive zoom (`addzoom`) is smoothed. With `addzoom` it must be at least 4/fps, i.e. at least one frame. |
 | info | bint | (False) | Overlay diagnostic info on the frame. |
 | method | int | (0) | Stabilisation method variant. |
 | fields | bint | (False) | Field-based handling. |

@@ -29,6 +29,7 @@ struct DepanAnalyseData {
     float zerow = 0.0f;
     int64_t thscd1 = 0;
     float thscd2 = 0;
+    AnalysisGeometry geometry;
     bool fields = false;
     bool tff = false;
     bool tff_exists = false;
@@ -175,7 +176,7 @@ static const VSFrame *VS_CC depanAnalyseGetFrame(int n, int activationReason, vo
             int nframemv = backward ? std::max(0, n - 1) : n; // set prev frame number as data frame if backward
 
             const VSFrame *mvn = vsapi->getFrameFilter(nframemv, d->vectors, frameCtx);
-            MotionBlockPyramid vectors(mvn, 1, d->prefix, vsapi);
+            MotionBlockPyramid vectors(mvn, 1, d->prefix, vsapi, d->geometry);
 
             const size_t num_blocks = (size_t)vectors.nBlkX * (size_t)vectors.nBlkY;
 
@@ -373,16 +374,14 @@ static void VS_CC depanAnalyseCreate(const VSMap *in, VSMap *out, [[maybe_unused
 
         // FIXME, check vector clip compatibility
 
-        if (d->vi->numFrames > vsapi->getVideoInfo(d->vectors)->numFrames)
-            throw std::runtime_error("vectors must have at least as many frames as clip");
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
 
         d->mask = vsapi->mapGetNode(in, "mask", 0, &err);
 
         if (d->mask) {
             const VSVideoInfo *maskvi = vsapi->getVideoInfo(d->mask);
 
-            if (d->vi->numFrames > maskvi->numFrames)
-                throw std::runtime_error("mask must have at least as many frames as clip");
+            CheckClipLength(d->mask, "mask", d->vi->numFrames, "clip", vsapi);
 
 
             if (!vsh::isConstantVideoFormat(maskvi) ||
@@ -394,6 +393,7 @@ static void VS_CC depanAnalyseCreate(const VSMap *in, VSMap *out, [[maybe_unused
         }
 
         vectors.ScaleThSCD(d->thscd1, d->thscd2, vectors.bitsPerSample);
+        d->geometry = vectors.Geometry();
 
         if (abs(vectors.nDeltaFrame) != 1)
             throw std::runtime_error("vectors clip must be created with delta=1 or -1");

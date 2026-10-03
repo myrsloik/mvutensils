@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <VapourSynth4.h>
 
 #include "SuperPyramid.h"
@@ -39,6 +40,8 @@ struct RecalculateData {
     bool tff_exists;
 
     std::string prefix;
+    AnalysisGeometry geometry;
+    SuperGeometry superGeometry;
 
     const VSAPI *vsapi;
 
@@ -53,29 +56,39 @@ struct RecalculateData {
 static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
     RecalculateData *d = reinterpret_cast<RecalculateData *>(instanceData);
 
-    int nref = std::clamp(n + d->deltaFrame, 0, d->vi->numFrames - 1);
+    // As in Analyse, a frame whose reference lies outside the super clip gets no vectors, also when the vector clip, which
+    // may be longer, has some for it: they belong to a reference this super doesn't have
+    const int nref = n + d->deltaFrame;
+    const bool hasRef = nref >= 0 && nref < d->vi->numFrames;
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->vectors, frameCtx);
-        vsapi->requestFrameFilter(std::min(n, nref), d->super, frameCtx);
-        vsapi->requestFrameFilter(std::max(n, nref), d->super, frameCtx);
+        if (hasRef) {
+            vsapi->requestFrameFilter(std::min(n, nref), d->super, frameCtx);
+            vsapi->requestFrameFilter(std::max(n, nref), d->super, frameCtx);
+        } else {
+            vsapi->requestFrameFilter(n, d->super, frameCtx);
+        }
     } else if (activationReason == arAllFramesReady) {
         try {
             const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
-            FramePyramid pSrcGOF(src, 1, d->prefix, vsapi);
+            FramePyramid pSrcGOF(src, 1, d->prefix, vsapi, d->superGeometry);
 
             bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, d->fields, vsapi);
 
-            MotionBlockPyramid fgop(vsapi->getFrameFilter(n, d->vectors, frameCtx), 1, d->prefix, vsapi);
+            MotionBlockPyramid fgop(vsapi->getFrameFilter(n, d->vectors, frameCtx), hasRef, d->prefix, vsapi, d->geometry);
 
-            const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-            FramePyramid pRefGOF(ref, 1, d->prefix, vsapi);
-
+            std::optional<FramePyramid> pRefGOF;
             int fieldShift = 0;
-            if (d->fields && d->nPel > 1 && (d->deltaFrame % 2))
-                fieldShift = ComputeFieldShift(src_top_field, GetTopField(ref, nref, d->tff_exists, d->tff, d->fields, vsapi), d->nPel);
+            if (hasRef) {
+                const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
+                pRefGOF.emplace(ref, 1, d->prefix, vsapi, d->superGeometry);
+                if (d->fields && d->nPel > 1 && (d->deltaFrame % 2))
+                    fieldShift = ComputeFieldShift(src_top_field, GetTopField(ref, nref, d->tff_exists, d->tff, d->fields, vsapi), d->nPel);
+            }
 
-            fgop.RecalculateMVs(pSrcGOF, pRefGOF, d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->chroma,
+            // without a reference the old vectors weren't loaded, and recalculating only the metadata never reads it
+            fgop.RecalculateMVs(pSrcGOF, pRefGOF ? *pRefGOF : pSrcGOF, d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->chroma,
                 d->searchType, d->searchparam, d->nLambda, d->pnew, fieldShift, d->thSAD, d->useSatd, d->smooth, d->meander, d->deltaFrame);
 
             VSFrame *dst = vsapi->copyFrame(src, core);
@@ -104,6 +117,7 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         d->super = vsapi->mapGetNode(in, "super", 0, nullptr);
         d->vi = vsapi->getVideoInfo(d->super);
         FramePyramid super(d->super, d->prefix, vsapi);
+        d->superGeometry = super.Geometry();
 
         GetHVPairArgument(d->nBlkSizeX, d->nBlkSizeY, "blksize", super.nBlkSizeX, super.nBlkSizeY, in, vsapi);
         GetHVPairArgument(d->nOverlapX, d->nOverlapY, "overlap", super.nOverlapX, super.nOverlapY, in, vsapi);
@@ -165,12 +179,15 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
             throw std::runtime_error("pnew must be between 0 and 256");
 
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "super", vsapi); // the output is as long as super
 
         MotionBlockPyramid vectors(d->vectors, d->prefix, vsapi);
 
         d->deltaFrame = vectors.nDeltaFrame;
+        d->geometry = vectors.Geometry();
 
-        if (d->fields && vectors.nPel < 2)
+        // The recalculated vectors take the super clip's pel (the old ones are rescaled to it)
+        if (d->fields && super.nPel < 2)
             throw std::runtime_error("fields option requires pel > 1");
 
         int pixelMax = (1 << std::min(16, d->vi->format.bitsPerSample)) - 1; // float SAD uses the 16-bit scale

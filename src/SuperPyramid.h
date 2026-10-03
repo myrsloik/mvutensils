@@ -20,6 +20,20 @@ template <typename T>
 void GetHVPairArgument(T &h, T &v, const char *name, std::type_identity_t<T> defaultH, std::type_identity_t<T> defaultV, const VSMap *in, const VSAPI *vsapi);
 void CheckBlkSize(int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, int subSamplingW, int subSamplingH, bool useSatd = false);
 
+// The smallest span of a block grid (blkSize wide blocks overlapping by overlap) that covers size pixels. Super pads
+// level 0 to it and Analyse/Recalculate lay their blocks out on it, so they must all derive it from this function.
+int BlockAlignedDimension(int size, int blkSize, int overlap) noexcept;
+
+// The parameters a super clip was made with. Consumers capture it from frame 0 when they are created and check every
+// frame they load against it: a spliced super clip can mix different supers. FramePyramid::IsCompatible compares all
+// but the level count, which the supers passed to one filter together may differ in (a onelevel centersuper).
+struct SuperGeometry {
+    int width = 0, height = 0, realWidth = 0, realHeight = 0, hPad = 0, vPad = 0, blkSizePadX = 0, blkSizePadY = 0;
+    int pel = 0, xRatioUV = 0, yRatioUV = 0, bitsPerSample = 0, levels = 0;
+    bool chroma = false;
+    bool operator==(const SuperGeometry &) const = default;
+};
+
 enum class SharpParam {
     Bilinear,
     Bicubic,
@@ -192,6 +206,9 @@ public:
     // Constructor to reconstruct from frame properties, takes ownership of srcFrame and free it even if the constructor throws
     // You can pass maxLevel = -1 to load all levels, maxLevel = 0 to load only metadata and no planes, maxLevel > 0 to load that many levels, note that only analyse uses more than 1 level
     FramePyramid(const VSFrame *srcFrame, int maxLevel, const std::string &prefix, const VSAPI *vsapi);
+    // The same, and the frame must match expected: the geometry of the super clip's first frame that the consumer set
+    // itself up for (a spliced clip can mix differently made supers)
+    FramePyramid(const VSFrame *srcFrame, int maxLevel, const std::string &prefix, const VSAPI *vsapi, const SuperGeometry &expected);
 
     // Constructor to load metadata from a node and do nothing else
     FramePyramid(VSNode *node, const std::string &prefix, const VSAPI *vsapi);
@@ -201,6 +218,7 @@ public:
     void ExportFrameData(VSFrame *dst, const std::string &prefix) const noexcept; // Stores all levels as frame properties of the output frame, note that each used plane is stored as a separate property
     const FramePyramidLevel &GetLevel(int level) const noexcept;
     bool IsCompatible(const FramePyramid &other) const noexcept;
+    [[nodiscard]] SuperGeometry Geometry() const noexcept;
     bool IsCompatibleWithSource(const VSVideoInfo *vi) const noexcept;
     static int GetMaxLevelsForBlockSize(int width, int height, int xRatioUV, int yRatioUV, int blkSizeX, int blkSizeY, int overlapX, int overlapY, int padX, int padY) noexcept;
 };
