@@ -3,8 +3,8 @@
 
 Both sides make the masks, and SCDetection's properties, from the same vectors:
 
-  mvgpu   mvgpu.Analyse's, on a carrier clip for mvu (mvtest.mvu_vectors).
-  mvu     mvu.Analyse's, on the frames of mvgpu's super (mvtest.gpu_vectors).
+  mvgpu   mvgpu.Analyse's, mvu's side through mvgpu.ToMVU.
+  mvu     mvu.Analyse's, mvgpu's side through mvgpu.FromMVU.
   random  mvu.Analyse's description with every block given a vector and a SAD of its own, and on
           some frames just enough blocks or one block too many above thscd1 for a scene change
           (mvtest.random_vectors).
@@ -27,7 +27,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
+from mvtest import eight_bit, format_clip, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
 
 MASKS = {'length': 'VectorLengthMask', 'sad': 'SADMask', 'occlusion': 'OcclusionMask'}
 SCD_PROPS = ('_SceneChangePrev', '_SceneChangeNext')
@@ -80,13 +80,13 @@ def main():
     thscd2 = 51.0 if args.thscd2 is None else args.thscd2
     if args.vectors == 'mvgpu':
         gvec = core.mvgpu.Analyse(gasup, delta=args.delta)
-        cvec = mvu_vectors(core, gvec, aclip, args.frames)
+        cvec = core.mvgpu.ToMVU(gvec)
     else:
         cvec = core.mvu.Analyse(casup, delta=args.delta, blksize=args.blksize, overlap=args.overlap)
         if args.vectors == 'random':
             th1, scd = scene_limits(cvec.get_frame(0).props, thscd1, thscd2)
             cvec = random_vectors(core, cvec, (args.pad - 1) * args.pel, th1, scd, args.seed)
-        gvec = gpu_vectors(core, cvec, gasup)
+        gvec = core.mvgpu.FromMVU(cvec, gasup)
 
     sk2 = {k: getattr(args, k) for k in ('thscd1', 'thscd2') if getattr(args, k) is not None}
     mk = dict(sk2, **{k: getattr(args, k) for k in ('ml', 'gamma', 'time', 'scval') if getattr(args, k) is not None})

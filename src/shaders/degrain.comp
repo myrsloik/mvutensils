@@ -4,6 +4,13 @@
 
 layout(local_size_x = 64) in;
 
+// The same planes as words, for Main4's four bytes at a time
+layout(std430, set = 0, binding = 0) readonly buffer CurLuma32 { uint curY32[]; };
+layout(std430, set = 0, binding = 1) readonly buffer CurChroma32 { uint curC32[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Out32 { uint px[]; } outPlane32[3];
+layout(std430, set = 0, binding = 6) readonly buffer RefLuma32 { uint px[]; } refY32[kMaxRefs];
+layout(std430, set = 0, binding = 7) readonly buffer RefChroma32 { uint px[]; } refC32[kMaxRefs];
+
 // The rounded average mvu.Super's quarter planes take of two samples
 uint Avg(uint a, uint b) {
     return (a + b + 1u) >> 1u;
@@ -215,9 +222,148 @@ void MainFloat() {
     }
 }
 
+// Four bytes from byte a on, of words w0 (holding byte a) and w1 (the next): funnel shifted
+uint Bytes4At(uint w0, uint w1, uint a) {
+    uint s = (a & 3u) * 8u;
+    return s == 0u ? w0 : (w0 >> s) | (w1 << (32u - s));
+}
+uvec4 Unpack4(uint w) {
+    return uvec4(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu, w >> 24u);
+}
+// Four bytes of the centre's or reference r's luma or chroma from byte a; the planes' spare rows
+// (SuperLayout.h) keep the word after the last pixel inside the buffer
+uint CurLuma4(uint a) {
+    uint i = a >> 2u;
+    return Bytes4At(curY32[i], curY32[i + 1u], a);
+}
+uint CurChroma4(uint a) {
+    uint i = a >> 2u;
+    return Bytes4At(curC32[i], curC32[i + 1u], a);
+}
+uint RefLuma4(int r, uint a) {
+    uint i = a >> 2u;
+    return Bytes4At(refY32[r].px[i], refY32[r].px[i + 1u], a);
+}
+uint RefChroma4(int r, uint a) {
+    uint i = a >> 2u;
+    return Bytes4At(refC32[r].px[i], refC32[r].px[i + 1u], a);
+}
+
+// Rows a lane of Main4 holds at once
+const int kChunk4 = 8;
+
+// main's arithmetic for four adjacent pixels per lane, 8-bit samples at pel 1 or 2, where the
+// plane's step and overlap are multiples of 4 (Degrain.cpp sets pc.quad): the four then lie in
+// the same blocks, their reference pixels four bytes in a row of one plane, read as words.
+// Dispatched as ((width + 255) / 256, nby) workgroups.
+void Main4() {
+    bool luma = pc.plane == 0;
+    int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
+    int Bx = kBlk >> lx, By = kBlk >> ly;
+    int Sx = pc.step >> lx, Sy = pc.step >> ly;
+    int Ox = pc.overlap >> lx, Oy = pc.overlap >> ly;
+    int x = 4 * int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
+    int y0 = cy * Sy;
+    int rows = min(cy == pc.nby - 1 ? By : Sy, pc.height - y0);
+    if (x >= pc.width || rows <= 0)
+        return;
+    int inside = min(4, pc.width - x); // the group's pixels inside the plane
+    uint vOffset = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
+    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : uint((pc.padc + y0) * pc.wc + pc.padc + x) + vOffset;
+    uint curStride = uint(luma ? pc.wp : pc.wc);
+    uint out0 = uint(y0 * pc.outStride + x);
+    int bxA = min(x / Sx, pc.nbx - 1);
+    bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox;
+
+    for (int j0 = 0; j0 < rows; j0 += kChunk4) {
+        int n = min(kChunk4, rows - j0);
+        uint centre[kChunk4];
+        uvec4 acc[kChunk4];
+        [[unroll]] for (int j = 0; j < kChunk4; ++j) {
+            uint a = cur + uint(j0 + j) * curStride;
+            centre[j] = j < n ? (luma ? CurLuma4(a) : CurChroma4(a)) : 0u;
+            acc[j] = uvec4(0u);
+        }
+
+        for (int k = 0; k < 4; ++k) {
+            int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? cy - 1 : cy;
+            int jEnd = (k & 2) != 0 ? clamp(Oy - j0, 0, n) : n;
+            bool valid = ((k & 1) == 0 || hasLeft) && ((k & 2) == 0 || cy >= 1) && jEnd > 0;
+            int b = valid ? by * pc.nbx + bx : 0;
+            uint shift = luma ? 0u : 16u;
+            uvec4 sum[kChunk4];
+            uint wc = valid ? (meta[b] >> shift) & 0xFFFFu : 0u;
+            [[unroll]] for (int j = 0; j < kChunk4; ++j)
+                sum[j] = uvec4(128u) + Unpack4(centre[j]) * wc;
+            int dx = x - bx * Sx, dy = y0 + j0 - by * Sy;
+
+            for (int r = 0; r < pc.refs; ++r) {
+                uint w = valid ? (meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu : 0u;
+                if (w == 0u)
+                    continue;
+                ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
+                if (luma) {
+                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                    uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
+                    [[unroll]] for (int j = 0; j < kChunk4; ++j)
+                        if (j < jEnd)
+                            sum[j] += Unpack4(RefLuma4(r, a + uint(j * pc.wp))) * w;
+                } else {
+                    int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> kLogX);
+                    int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> kLogY);
+                    uint a = ChromaAddr(Xc, Yc) + vOffset;
+                    [[unroll]] for (int j = 0; j < kChunk4; ++j)
+                        if (j < jEnd)
+                            sum[j] += Unpack4(RefChroma4(r, a + uint(j * pc.wc))) * w;
+                }
+            }
+
+            if (valid) {
+                if (pc.overlap == 0) {
+                    [[unroll]] for (int j = 0; j < kChunk4; ++j)
+                        acc[j] = sum[j] >> 8u;
+                } else {
+                    int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
+                    int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
+                    int win = pc.winOff + ((wby + wbx) * By + dy) * Bx + dx;
+                    [[unroll]] for (int j = 0; j < kChunk4; ++j) {
+                        if (j < jEnd) {
+                            int t = win + j * Bx;
+                            uvec4 w4 = uvec4(uint(tables[t]), uint(tables[t + 1]), uint(tables[t + 2]), uint(tables[t + 3]));
+                            acc[j] += ((sum[j] >> 8u) * w4) >> 6u;
+                        }
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (int j = 0; j < kChunk4; ++j) {
+            if (j < n) {
+                uvec4 p = pc.overlap == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax)));
+                if (pc.limit >= 0) {
+                    ivec4 c = ivec4(Unpack4(centre[j]));
+                    p = uvec4(clamp(ivec4(p), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
+                }
+                uint o = out0 + uint((j0 + j) * pc.outStride);
+                if (inside == 4 && (o & 3u) == 0u) {
+                    outPlane32[pc.plane].px[o >> 2u] = p.x | (p.y << 8u) | (p.z << 16u) | (p.w << 24u);
+                } else {
+                    [[unroll]] for (int i = 0; i < 4; ++i)
+                        if (i < inside)
+                            outPlane[pc.plane].px[o + uint(i)] = uint8_t(p[i]);
+                }
+            }
+        }
+    }
+}
+
 void main() {
     if (kFloat) {
         MainFloat();
+        return;
+    }
+    if (pc.quad != 0) {
+        Main4();
         return;
     }
     bool luma = pc.plane == 0;

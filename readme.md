@@ -5,7 +5,8 @@ MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's
 `mvu`, the same functions with the same arguments; there are `Super`, `Analyse`, `AnalyseMany`,
 `Recalculate`, `Degrain` (with `Degrain1` … `Degrain25`), `Compensate`, `Flow`, `FlowBlur`,
 `FlowInter`, `FlowFPS`, `SCDetection`, `VectorLengthMask`, `SADMask` and `OcclusionMask` (not the
-`Depan` family). The rest of this file documents MVUtensils, which the GPU filters follow.
+`Depan` family), and `ToMVU` and `FromMVU`, which convert vector clips to and from mvu's form. The
+rest of this file documents MVUtensils, which the GPU filters follow.
 
 ```python
 clip = core.bs.VideoSource('video.mkv', gpu=True)
@@ -19,15 +20,26 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
 * `Super` takes everything mvu.Super does: GRAY and YUV 4:2:0, 4:2:2, 4:4:0 and 4:4:4 at 8 to 16
   bits or float, `pel` 1, 2 and 4, every `sharp` and `rfilter`, `pelclip`, `onelevel`, and every
   block size, overlap and padding, horizontal and vertical apart; but a `pelclip` only at `pel=2`
-  (below). Its level 0 is mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are
-  the GPU search's own, reduced with `rfilter`'s filter.
+  (below). As mvu.Super does, it refuses a padding the chroma subsampling doesn't divide (an odd
+  horizontal one at 4:2:0 and 4:2:2, an odd vertical one at 4:2:0 and 4:4:0). Its level 0 is
+  mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are the GPU search's own,
+  reduced with `rfilter`'s filter.
 * The other filters so far take Gray, 4:2:0 and 4:4:4 supers of 8 to 16-bit or float samples at
   any `pel` (1, 2 or 4) with square blocks of 8×8, 16×16 or 32×32, with the same overlap and padding
-  horizontally and vertically (an even padding at 4:2:0), MVUtensils' extended grids included.
+  horizontally and vertically, MVUtensils' extended grids included.
   Other supers, and the values not implemented yet (`satd`, `fields`, an `Analyse` or `Recalculate`
   grid other than the super's), are errors. As in mvu, vectors analysed on an 8-bit copy of a clip
   serve the filters that compensate motion on the 9 to 16-bit or float clip, their SAD thresholds
   scaled to the depth the vectors were analysed at, and a Gray clip's SADs are luma's.
+* The filters check the clips they're given as mvu's do, with mvu's messages: a super, centersuper
+  or vector clip shorter than the clip it goes with (for `Recalculate`, vectors shorter than the
+  super) is refused, since the frames past its end would be its last one again; every super frame
+  a filter loads must have been made with the same `Super` arguments as the clip's first frame, and
+  every vector frame with vectors with the same `Analyse` or `Recalculate` arguments as the first
+  frame of its clip (a spliced clip can mix them); and the vector clips one filter takes must all
+  come from one analysis but for their delta, bit depth included. `Recalculate` gives a frame whose
+  reference frame lies past the end of the super no vectors, also where a longer vector clip has
+  some for it. `test/check_robustness.py` runs each of these cases on both plugins.
 * `Analyse` searches float supers as the 16-bit samples they stand for: luma's 0 to 1 and
   chroma's −0.5 to 0.5 scaled to 0 to 65535, rounded and clamped, each sample as it is read, which
   puts the SADs on the 16-bit scale mvu gives float SADs. `Degrain`, `FlowInter` and `FlowFPS` take
@@ -50,9 +62,38 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   mvu's `badsad=10000` (which it would almost never reach) and `badrange=24`.
 * `AnalyseMany` also seeds each field from the fields refined before it (chained and inverted
   vectors), which separate `Analyse` calls can't.
-* The super and the vectors travel as GPU frames in frame properties, laid out for the GPU, under
-  the prefix `MVGPUtensils` by default. A vector frame holds a 32-bit record (x, y, SAD, 0) per
-  block, vectors in units of the super's `pel`.
+* The super and the vectors are GPU frames laid out for the GPU, described by frame properties
+  under the prefix `MVGPUtensils` by default. A super frame is one Gray frame of the clip's sample
+  type holding the whole super: the padded luma planes in its rows, chroma and the coarse levels
+  after them at offsets its properties give. A vector clip's frames are the vectors themselves, a
+  32-bit record (x, y, SAD, 0) per block and a row of records per row of blocks (Gray32,
+  4·blocks wide), vectors in units of the super's `pel`; a frame whose reference frame lies outside
+  the clip has `MVGPUtensilsAnalysisHasVectors` 0. Neither clip is the source's size or format, so
+  view them through the filters that take them.
+* `ToMVU` and `FromMVU` convert vector clips between mvgpu's form and mvu's, which keeps the vectors
+  in frame properties (`MVUtensilsAnalysisVectors` and `MVUtensilsAnalysisSAD`, none on a frame
+  without vectors). `mvgpu.ToMVU(vectors)` gives the vectors of mvgpu's `Analyse`, `AnalyseMany` or
+  `Recalculate` to mvu's filters; `mvgpu.FromMVU(vectors, super)` gives mvu's to mvgpu's, `super`
+  being mvgpu's super of the clip they were analysed on (or of the clip at another bit depth) with
+  their `blksize`, `overlap`, `pad` and `pel`. Both take a list of vector clips and return one for
+  each, and `prefix` and `mvuprefix` name the two sides' property prefixes. The vectors and SADs pass
+  unchanged, so either plugin's filters make the same frames from them: the checks run each plugin's
+  filters on the other's vectors this way, and `test/check_convert.py` checks the conversions both
+  ways. `ToMVU`'s frames are the records, downloaded, with mvu's properties added, and remain mvgpu
+  vector frames; `FromMVU` checks every vector as mvu checks the vectors it loads (none may read
+  outside the padded frame) and copies the records into GPU memory. mvu's filters also need mvu's
+  super of the clip, made with the same arguments (`onelevel=True` will do: they read only its
+  full-size level). mvgpu's filters refuse mvu's vectors with an error that names `FromMVU`; mvu's
+  filters given mvgpu's prefix would take mvgpu's unconverted vector frames for frames without
+  vectors, so convert them. The masks and `SCDetection` read only the vectors, so they take
+  `FromMVU`'s vectors of any grid and format mvu makes, not just those listed above: they matched
+  mvu's exactly on 4:2:2 16×16, 4:2:0 16×8, 32×16, 64×64 and 4×4, and 4:4:4 8×4 grids.
+
+  ```python
+  sup = core.mvgpu.Super(core.std.GPUUpload(clip), blksize=16, overlap=8)
+  vectors = core.mvgpu.ToMVU(core.mvgpu.AnalyseMany(sup, radius=2))
+  denoised = core.mvu.Degrain(clip, core.mvu.Super(clip, blksize=16, overlap=8, onelevel=True), vectors)
+  ```
 * A `pel=4` super stores luma's four half-pel planes only, as `pel=2` does: mvu's quarter-pel
   samples are rounded averages of the half-pel ones around them, whatever `sharp`, which the
   quarter-pel step computes as it goes; so does 4:4:4 chroma, which takes the luma vector itself.
@@ -92,14 +133,14 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   old vectors can be of any grid, from mvgpu.Analyse or Recalculate of the same bit depth and
   `pel`), and its vectors are mvu's bit for bit (`test/check_recalculate.py`), every search type
   replicated candidate for candidate: unlike `Analyse`'s, its blocks don't depend on one another.
-  As in mvu, a frame whose old vectors are missing (their reference frame outside the clip) is
-  recalculated from zero vectors against the reference frame clamped to the clip. Float supers
+  As in mvu, a frame whose old vectors are missing (their reference frame outside the clip) stays
+  without vectors, with the new grid's description. Float supers
   are searched as `Analyse` searches them, as the 16-bit samples they stand for (mvu sums float
   differences in the order its CPU kernels take), so at `pel=1`, where the samples are the clip's,
   the vectors are mvu's of the clip so quantized.
 * `test/matrix.py` runs the checks over their case matrices (`super`, `analyse`, `degrain`, `flow`,
-  `masks`, `motion`, `recalculate`) on a directory of raw test clips, and `smoke` a cross section of
-  all of them in a few minutes.
+  `masks`, `motion`, `recalculate`, `convert`, `robustness`) on a directory of raw test clips, and
+  `smoke` a cross section of all of them in a few minutes.
 * With the environment variable `MVGPU_PROFILE=1`, the filters time their stages on the GPU and
   print the averages to stderr when the filter is freed. They wait for every frame, so they run
   slower.
@@ -137,10 +178,15 @@ and adds full high-bit-depth and float support.
 * A vector clip stores block geometry and per-block SAD, never pixels, so it does **not** have to be
   analysed at the same bit depth as the clip it is later applied to. Analysing an 8-bit copy and
   using the result on the 16-bit or float original is a supported way to trade motion precision for
-  analysis speed. Resolution, subsampling, `pel` and the super's padding must still match.
+  analysis speed. Resolution, subsampling, `pel` and the super's padding must still match. Vectors analysed
+  with `chroma=False` are the exception to the subsampling rule (e.g. analysed on a GRAY copy and applied to
+  4:2:0), as long as their overlap is divisible by the clip's subsampling, even if only luma is processed.
   SAD-derived arguments (`thsad`, `thscd1`) are interpreted against the depth the vectors were
   analysed at, so they keep their documented 8-bit 8×8 meaning either way.
   [Recalculate](#recalculate) is the one exception and still requires equal bit depths.
+* Every frame of a super or vector clip must be made with the same arguments, and the vector clips passed
+  to one filter together must match each other, including the `chroma` setting they were analysed with.
+  Splicing clips made with different settings is not supported: filters stop with an error instead.
 * The attached frame properties use the prefix `MVUtensils` by default. Every function accepts a
   `prefix` argument to change it, which lets two independent MVUtensils graphs coexist on one clip.
 * Motion vectors are stored as frame properties: `<prefix>AnalysisVectors` (an int array where the
@@ -271,7 +317,7 @@ core.mvu.Super(vnode clip, int[] blksize, int[] overlap[, int[] pad=[16, 16], in
 | clip | 8–16 bit integer or 32 bit float, GRAY/YUV | | Clip to prepare. |
 | blksize | int[] | (required) | Block size `[h, v]` (a single value sets both). Used to pad the frame so the right/bottom edges are fully covered. Must match the block size you intend to use in `Analyse`. |
 | overlap | int[] | (required) | Block overlap `[h, v]`, must be ≤ blksize/2. Used together with `blksize` for edge padding. |
-| pad | int[] | ([16, 16]) | Border padding `[h, v]` in pixels. One value applies to both axes. |
+| pad | int[] | ([16, 16]) | Border padding `[h, v]` in pixels. One value applies to both axes. It must be divisible by the chroma subsampling: even horizontally for 4:2:0 and 4:2:2, even vertically for 4:2:0 and 4:4:0. |
 | pel | int | 1, 2, 4 (2) | Sub-pixel accuracy: 1 = full-pixel, 2 = half-pixel, 4 = quarter-pixel. Higher needs more memory and time. |
 | sharp | int | 0–2 (2) | Sub-pixel interpolation for `pel` > 1: 0 = bilinear, 1 = bicubic, 2 = Wiener (sharpest). |
 | rfilter | int | 0–2 (1) | Pyramid downscale filter: 0 = simple average, 1 = bilinear, 2 = cubic. |
@@ -402,8 +448,8 @@ out = core.mvu.Degrain(clip, super, vectors)
 
 | Parameter | Type | Options (Default) | Description |
 | --- | --- | --- | --- |
-| super | vnode | (required) | Super clip. Only one level is needed. Unlike the filters that merely consume vectors, its bit depth must equal the one the vectors were analysed at — see [below](#recalculate-and-bit-depth). |
-| vectors | vnode[] | (required) | Vector clip(s) to refine — a single clip or a whole list (e.g. an `AnalyseMany` set). The recalculated clips are returned as a list in the same order. |
+| super | vnode | (required) | Super clip. Only one level is needed. Unlike the filters that merely consume vectors, its bit depth must equal the one the vectors were analysed at — see [below](#recalculate-and-bit-depth). Its `pel` may differ from the vectors': they are rescaled, and the result has the super's `pel`. |
+| vectors | vnode[] | (required) | Vector clip(s) to refine — a single clip or a whole list (e.g. an `AnalyseMany` set). The recalculated clips are returned as a list in the same order, as long as `super`; as in `Analyse`, a frame whose reference lies outside `super` gets no vectors. |
 | thsad | int | (200) | Blocks whose SAD is below this keep their vector; worse blocks are re-searched. |
 | smooth | bint | (True) | Interpolate the new (finer) vector field from neighbours (True) or take the nearest old vector (False). `smooth=False` roughly matches the old `divide=1` behaviour, `smooth=True` ≈ `divide=2`. |
 | blksize | int[] | (super's value) | Finer block size `[h, v]`. Usually half of the original. |
@@ -473,7 +519,7 @@ core.mvu.Degrain(vnode clip, vnode super, vnode[] vectors[, int[] thsad=[400, 40
 | planes | int[] | ([0, 1, 2]) | Which planes to process; unprocessed planes are copied. |
 | limit | float[] | ([inf, inf]) | Maximum absolute change per pixel `[luma, chroma]`. Non-finite (`inf`/`nan`) or a value above the format maximum disables limiting. |
 | weights | int[] | (None) | Optional per-frame bias applied on top of the SAD-derived weights, in temporal order `[bw_radius, …, bw_1, centre, fw_1, …, fw_radius]` — exactly `2·radius + 1` non-negative values. Each reference's (and the source's) weight is multiplied by its entry before the weights are normalised, so only the ratios matter — the upper limit (≈2,800,000 at radius 1, falling to ≈164,000 at radius 25) exists purely to keep the internal weight sum inside a 32-bit int and is far beyond any real use. Omitted (or all-equal) leaves the default SAD weighting unchanged. |
-| centersuper | vnode | (None) | Optional super clip that supplies the centre frame, and the reference for `limit`, instead of `super`, which then only supplies the references. It must be created with the same `blksize`, `overlap`, `pel` and `pad` as `super`; only its first level is used, so `onelevel=True` is enough. See [the centre frame](#the-centre-frame). |
+| centersuper | vnode | (None) | Optional super clip that supplies the centre frame, and the reference for `limit`, instead of `super`, which then only supplies the references. It must be created with the same `blksize`, `overlap`, `pel` and `pad` as `super` and have at least as many frames as `clip`; only its first level is used, so `onelevel=True` is enough. See [the centre frame](#the-centre-frame). |
 
 > **Porting:** the per-direction `mvbw*/mvfw*` arguments are now the single `vectors` list, the
 > `thsad`/`thsadc` pair became `thsad=[luma, chroma]`, the `thsad2`/`thsadc2` pair became
@@ -758,7 +804,7 @@ core.mvu.DepanStabilise(vnode clip, vnode data[, float cutoff=1.0, float damping
 | subpixel | int | 0–2 (2) | Subpixel interpolation: 0=none, 1=bilinear, 2=bicubic. |
 | pixaspect | float | (1.0) | Pixel aspect ratio. |
 | fitlast | int | (0) | Number of trailing frames specially fitted for the clip end. |
-| tzoom | float | (3.0) | Time window (frames) over which zoom is smoothed. |
+| tzoom | float | (3.0) | Time in seconds over which the adaptive zoom (`addzoom`) is smoothed. With `addzoom` it must be at least 4/fps, i.e. at least one frame. |
 | info | bint | (False) | Overlay diagnostic info on the frame. |
 | method | int | (0) | Stabilisation method variant. |
 | fields | bint | (False) | Field-based handling. |

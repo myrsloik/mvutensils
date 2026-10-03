@@ -129,16 +129,16 @@ def main():
     dumped = open(args.dump, 'wb') if args.dump else None
     for an in fields:
         delta = an.get_frame(0).props['MVGPUtensilsAnalysisDeltaFrame']
-        # Frames whose reference frame is outside the clip carry no vectors, and PropToClip takes
-        # its format from its first frame
+        # The field's frames are its vectors' records; those whose reference frame is outside the
+        # clip have none
         start, end = max(0, -delta), min(args.frames, args.frames - delta)
-        vectors = core.std.GPUDownload(core.std.PropToClip(an[start:end], prop='MVGPUtensilsAnalysisVectors'))
+        vectors = core.std.GPUDownload(an)
         for n in range(start, end):
             if (n, delta) not in expected:
                 missing += 1
                 continue
             nbx, nby, exp = expected[(n, delta)]
-            rec = np.asarray(vectors.get_frame(n - start)[0]).view(np.int32)[:, :4 * nbx].reshape(nby * nbx, 4)
+            rec = np.asarray(vectors.get_frame(n)[0]).view(np.int32)[:, :4 * nbx].reshape(nby * nbx, 4)
             if dumped:
                 dumped.write(np.array([n, delta, nbx, nby, args.pel, 1], np.int32).tobytes())
                 dumped.write(np.ascontiguousarray(rec[:, :3].T).tobytes())

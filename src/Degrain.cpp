@@ -174,6 +174,7 @@ struct DegrainData {
     VSNode *centerSuper = nullptr; // optional
     std::vector<VSNode *> vectors; // mvu order: delta 1, -1, 2, -2, ...
     std::vector<int> deltas;
+    std::vector<VectorInfo> infos; // each vector clip's first frame's description, which its frames with vectors must have
     VSVideoInfo vi = {};
     SuperLayout layout;       // the super's: the planes the references come from
     SuperLayout centreLayout; // centerSuper's, which may lack the levels above 0
@@ -265,48 +266,41 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         };
 
         const VSFrame *src = hold(vsapi->getFrameFilter(n, d->node, frameCtx));
-        SuperFrames cur;
-        if (!GetSuperFrames(hold(vsapi->getFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx)), d->centreLayout, d->prefix, cur, vsapi))
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        for (const VSFrame *f : {cur.luma, cur.chroma, cur.pyramid})
-            hold(f);
+        const VSFrame *centre = hold(vsapi->getFrameFilter(n, d->centerSuper ? d->centerSuper : d->super, frameCtx));
+        SuperRegions cur;
+        if (const std::string e = CheckSuperFrame(centre, d->centreLayout, d->prefix, cur, vsapi); !e.empty())
+            return fail(e);
 
         // The references with vectors and in the clip; mvu.Degrain's isUsable, but for the scene
         // change test, which degrain_count.comp makes
-        std::vector<const VSFrame *> refLuma(refs, nullptr), refChroma(refs, nullptr), refVec(refs, nullptr);
+        std::vector<const VSFrame *> refSuper(refs, nullptr), refVec(refs, nullptr);
+        std::vector<SuperRegions> refRegions(refs);
         uint64_t usable = 0;
         for (int r = 0; r < refs; ++r) {
-            const VSFrame *analysis = hold(vsapi->getFrameFilter(n, d->vectors[r], frameCtx));
-            const VSFrame *vec = hold(GetAnalysisVectors(analysis, d->prefix, vsapi));
+            std::string error;
+            const VSFrame *vec = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors[r], frameCtx)), d->infos[r], d->prefix, error, vsapi));
+            if (!error.empty())
+                return fail(error);
             if (!vec)
                 continue;
-            int err = 0;
-            const int delta = vsapi->mapGetIntSaturated(vsapi->getFramePropertiesRO(analysis), (d->prefix + "AnalysisDeltaFrame").c_str(), 0, &err);
-            if (err || delta != d->deltas[r])
-                return fail("vector clip " + std::to_string(r) + " reports delta " + std::to_string(delta) + " at frame " + std::to_string(n) +
-                            " but was created with delta " + std::to_string(d->deltas[r]) + "; the delta must be constant for the whole clip");
             const int nref = n + d->deltas[r];
             if (nref < 0 || nref >= d->vi.numFrames)
                 continue;
-            SuperFrames rf;
-            if (!GetSuperFrames(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), L, d->prefix, rf, vsapi))
-                return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-            for (const VSFrame *f : {rf.luma, rf.chroma, rf.pyramid})
-                hold(f);
-            refLuma[r] = rf.luma;
-            refChroma[r] = rf.chroma;
+            refSuper[r] = hold(vsapi->getFrameFilter(nref, d->super, frameCtx));
+            if (const std::string e = CheckSuperFrame(refSuper[r], L, d->prefix, refRegions[r], vsapi); !e.empty())
+                return fail(e);
             refVec[r] = vec;
             usable |= uint64_t(1) << r;
         }
 
-        // A Gray super has no chroma frame
-        const bool chroma = cur.chroma != nullptr;
-        const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = chroma ? vsapi->getStride(cur.chroma, 0) : 0;
+        // A Gray super has no chroma
+        const bool chroma = L.format.chroma;
+        const ptrdiff_t lumaStride = cur.lumaStride, chromaStride = cur.chromaStride;
         ptrdiff_t recBytes = 0;
         for (int r = 0; r < refs; ++r) {
             if (!refVec[r])
                 continue;
-            if (vsapi->getStride(refLuma[r], 0) != lumaStride || (chroma && vsapi->getStride(refChroma[r], 0) != chromaStride))
+            if (refRegions[r].lumaStride != lumaStride || refRegions[r].chromaStride != chromaStride)
                 return fail("the super frames' storage strides differ");
             const ptrdiff_t stride = vsapi->getStride(refVec[r], 0);
             if (vsapi->getFrameWidth(refVec[r], 0) != 4 * d->nbx || vsapi->getFrameHeight(refVec[r], 0) != d->nby || stride % 16 || (recBytes && stride != recBytes))
@@ -328,17 +322,16 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         if (!dst)
             return fail("failed to allocate the output frame; the clip must be GPU resident");
 
-        VSVulkanPlaneInfo curLuma, curChroma = {}, outPlanes[3] = {};
-        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || (chroma && vkapi->getGPUPlane(cur.chroma, 0, &curChroma)))
-            return fail("the super's planes aren't GPU resident");
+        VSVulkanPlaneInfo curPlane, outPlanes[3] = {};
+        if (vkapi->getGPUPlane(centre, 0, &curPlane))
+            return fail("the super's frames aren't GPU resident");
         for (int p = 0; p < 3; ++p)
             if (d->process[p] && vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the output frame isn't GPU resident; the clip must be");
-        std::vector<VSVulkanPlaneInfo> rl(refs), rc(refs), rv(refs);
+        std::vector<VSVulkanPlaneInfo> rs(refs), rv(refs);
         for (int r = 0; r < refs; ++r)
-            if (refVec[r] && (vkapi->getGPUPlane(refLuma[r], 0, &rl[r]) || (chroma && vkapi->getGPUPlane(refChroma[r], 0, &rc[r])) ||
-                              vkapi->getGPUPlane(refVec[r], 0, &rv[r])))
-                return fail("a reference's planes or vectors aren't GPU resident");
+            if (refVec[r] && (vkapi->getGPUPlane(refSuper[r], 0, &rs[r]) || vkapi->getGPUPlane(refVec[r], 0, &rv[r])))
+                return fail("a reference's super frame or vectors aren't GPU resident");
 
         // Scratch: the counts, then the blocks' weights
         const int nb = d->nbx * d->nby;
@@ -355,14 +348,10 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         if (!ctx)
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
-        vkapi->gpuExecReadsFrame(ctx, cur.luma);
-        if (chroma)
-            vkapi->gpuExecReadsFrame(ctx, cur.chroma);
+        vkapi->gpuExecReadsFrame(ctx, centre);
         for (int r = 0; r < refs; ++r) {
             if (refVec[r]) {
-                vkapi->gpuExecReadsFrame(ctx, refLuma[r]);
-                if (chroma)
-                    vkapi->gpuExecReadsFrame(ctx, refChroma[r]);
+                vkapi->gpuExecReadsFrame(ctx, refSuper[r]);
                 vkapi->gpuExecReadsFrame(ctx, refVec[r]);
             }
         }
@@ -379,16 +368,28 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         // The bindings, in degrain_common.glsl's order; what a frame doesn't use is a dummy
         const VkBuffer dummy = d->constantsInfo.buffer;
         std::vector<VkDescriptorBufferInfo> infos;
-        infos.push_back({curLuma.buffer, 0, VK_WHOLE_SIZE});
-        infos.push_back({chroma ? curChroma.buffer : dummy, 0, VK_WHOLE_SIZE});
+        infos.push_back({curPlane.buffer, static_cast<VkDeviceSize>(cur.luma), static_cast<VkDeviceSize>(cur.lumaBytes)});
+        infos.push_back(chroma ? VkDescriptorBufferInfo{curPlane.buffer, static_cast<VkDeviceSize>(cur.chroma), static_cast<VkDeviceSize>(cur.chromaBytes)}
+                               : VkDescriptorBufferInfo{dummy, 0, VK_WHOLE_SIZE});
         infos.push_back({scratchInfo.buffer, countBytes, metaBytes});
         infos.push_back({d->constantsInfo.buffer, 0, VK_WHOLE_SIZE});
         infos.push_back({scratchInfo.buffer, 0, countBytes});
         for (int p = 0; p < 3; ++p)
             infos.push_back({d->process[p] ? outPlanes[p].buffer : dummy, 0, VK_WHOLE_SIZE});
-        for (const std::vector<VSVulkanPlaneInfo> *list : {&rl, &rc, &rv})
-            for (int r = 0; r < kMaxDegrainRefs; ++r)
-                infos.push_back({r < refs && refVec[r] && (list != &rc || chroma) ? (*list)[r].buffer : dummy, 0, VK_WHOLE_SIZE});
+        // Each reference's luma and chroma, regions of its super frame, then its vectors
+        for (int part = 0; part < 3; ++part) {
+            for (int r = 0; r < kMaxDegrainRefs; ++r) {
+                const bool has = r < refs && refVec[r] && (part != 1 || chroma);
+                if (!has)
+                    infos.push_back({dummy, 0, VK_WHOLE_SIZE});
+                else if (part == 0)
+                    infos.push_back({rs[r].buffer, static_cast<VkDeviceSize>(refRegions[r].luma), static_cast<VkDeviceSize>(refRegions[r].lumaBytes)});
+                else if (part == 1)
+                    infos.push_back({rs[r].buffer, static_cast<VkDeviceSize>(refRegions[r].chroma), static_cast<VkDeviceSize>(refRegions[r].chromaBytes)});
+                else
+                    infos.push_back({rv[r].buffer, 0, VK_WHOLE_SIZE});
+            }
+        }
         std::vector<VkWriteDescriptorSet> writes;
         size_t at = 0;
         for (const auto &[binding, count] : vc.LayoutBindings(Layout::Degrain)) {
@@ -484,7 +485,11 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             pc.limit = d->limit[p];
             pc.limitF = d->limitF[p];
             pc.winOff = d->winOff[p ? 1 : 0];
-            dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
+            // Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the
+            // plane's step and overlap multiples of 4
+            const int lx = p ? L.format.xr >> 1 : 0;
+            pc.quad = bytes == 1 && L.pel != 4 && ((pc.step >> lx) & 3) == 0 && ((pc.overlap >> lx) & 3) == 0;
+            dispatch(d->pixels, pc, static_cast<uint32_t>(pc.quad ? (pc.width + 255) / 256 : (pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
         }
         stamp(3);
 
@@ -588,12 +593,15 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
             const VectorInfo v = ReadVectorInfo(d->vectors[r], d->prefix, vsapi);
             if (r == 0)
                 first = v;
-            const SuperLayout analysed = ImportSuperLayout(d->vectors[r], d->prefix, vsapi);
+            d->infos.push_back(v);
+            const SuperLayout analysed = ImportAnalysedLayout(d->vectors[r], d->prefix, vsapi);
             if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
                 v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
                 throw std::runtime_error("The motion vectors passed are not compatible with the super clip");
-            if (v.blkX != first.blkX || v.blkY != first.blkY || v.overlapX != first.overlapX || v.overlapY != first.overlapY || v.nbx != first.nbx ||
-                v.nby != first.nby || v.chroma != first.chroma)
+            // One analysis but for the delta (mvu's IsCompatible)
+            VectorInfo same = v;
+            same.delta = first.delta;
+            if (!SameAnalysis(same, first))
                 throw std::runtime_error("The motion vectors passed are not compatible with each other");
             if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
                 v.nby != analysed.nby)
@@ -624,6 +632,12 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         d->centreLayout = d->centerSuper ? ImportSuperLayout(d->centerSuper, d->prefix, vsapi) : L;
         if (!SameLevel0(d->centreLayout, L))
             throw std::runtime_error("centersuper must be created with the same Super arguments as super");
+
+        CheckClipLength(d->super, "super", d->vi.numFrames, "clip", vsapi);
+        if (d->centerSuper)
+            CheckClipLength(d->centerSuper, "centersuper", d->vi.numFrames, "clip", vsapi);
+        for (int r = 0; r < refs; ++r)
+            CheckClipLength(d->vectors[r], "vectors", d->vi.numFrames, "clip", vsapi);
 
         int thsadRaw[2], thsad2Raw[2];
         GetPairArgument(thsadRaw[0], thsadRaw[1], "thsad", 400, 400, in, vsapi);

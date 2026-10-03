@@ -40,6 +40,7 @@ constexpr int kRangeFull = 1;
 
 struct MaskData {
     VSNode *node = nullptr; // the vectors
+    VectorInfo info;        // their first frame's description, which every frame with vectors must have
     VSVideoInfo vi = {};    // the mask's
     int kind = kLength;
     std::string name, prefix;
@@ -79,8 +80,13 @@ static const VSFrame *VS_CC maskGetFrame(int n, int activationReason, void *inst
         const VSVULKANAPI *vkapi = vc.vkapi;
 
         const VSFrame *frame = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSFrame *vectors = GetAnalysisVectors(frame, d->prefix, vsapi);
+        std::string error;
+        const VSFrame *vectors = GetAnalysisVectors(frame, d->info, d->prefix, error, vsapi);
         vsapi->freeFrame(frame);
+        if (!error.empty()) {
+            vsapi->setFilterError((d->name + ": " + error).c_str(), frameCtx);
+            return nullptr;
+        }
 
         VSFrame *dst = nullptr;
         VSGPUExecContext *ctx = nullptr;
@@ -214,8 +220,8 @@ static void VS_CC maskCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         d->prefix = prefix ? prefix : DEFAULT_MVGPUTENSILS_PREFIX;
 
         d->node = vsapi->mapGetNode(in, "vectors", 0, nullptr);
-        const VectorInfo v = ReadVectorInfo(d->node, d->prefix, vsapi);
-        const SuperLayout analysed = ImportSuperLayout(d->node, d->prefix, vsapi);
+        const VectorInfo v = d->info = ReadVectorInfo(d->node, d->prefix, vsapi);
+        const SuperLayout analysed = ImportAnalysedLayout(d->node, d->prefix, vsapi);
         if (v.blkX != analysed.blk || v.blkY != analysed.blkY || v.overlapX != analysed.overlap || v.overlapY != analysed.overlapY || v.nbx != analysed.nbx ||
             v.nby != analysed.nby)
             throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");

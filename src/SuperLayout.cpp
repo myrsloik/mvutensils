@@ -1,26 +1,167 @@
 #include "SuperLayout.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
+
+#include "Common.h"
 
 namespace {
 
 // SuperGPULayout: what the kernels expect of the frames. 2: any format, pel 1, separate
 // horizontal and vertical geometry. 3: chroma at pel 4 as one image of its quarter-pel grid. 4: only
 // subsampled chroma; 4:4:4 keeps four half-pel planes, as luma does. 5: the coarse levels' chroma
-// border covers chroma's reach in either direction (4:4:4's as far as luma's).
-constexpr int kLayoutVersion = 5;
+// border covers chroma's reach in either direction (4:4:4's as far as luma's). 6: the super frame is
+// the storage, its parts in its one plane (Regions); vector clips' frames are the records.
+constexpr int kLayoutVersion = 6;
 
 int AlignUp(int v, int a) {
     return (v + a - 1) / a * a;
 }
 
-int GetInt(const VSMap *props, const std::string &key, const VSAPI *vsapi) {
+int64_t AlignUp64(int64_t v, int64_t a) {
+    return (v + a - 1) / a * a;
+}
+
+// A property of a super's description, of the super clip's frame or of a vector clip's (vectors), which
+// carries the description of the super it was analysed on
+int GetInt(const VSMap *props, const std::string &key, const VSAPI *vsapi, bool vectors) {
     int err = 0;
     const int v = vsapi->mapGetIntSaturated(props, key.c_str(), 0, &err);
     if (err)
-        throw std::runtime_error("the super clip lacks the property " + key + "; it must come from mvgpu.Super with the same prefix");
+        throw std::runtime_error(vectors ? "a vector clip lacks the property " + key +
+                                               ", the description of the super it was analysed on; it must come from mvgpu.Analyse, mvgpu.Recalculate or mvgpu.FromMVU with the same prefix"
+                                         : "the super clip lacks the property " + key + "; it must come from mvgpu.Super with the same prefix");
     return v;
+}
+
+// What a frame holds that isn't a vector frame of this prefix, for the error saying so: mvgpu's
+// vectors under another prefix, or mvu's, whose frames have the analysis description but no
+// AnalysisHasVectors (their vectors are property arrays); empty when neither
+std::string VectorsHint(const VSMap *props, const std::string &prefix, const VSAPI *vsapi) {
+    static const std::string suffix = "AnalysisDeltaFrame";
+    std::string mvgpuPrefix, mvuPrefix;
+    bool mvgpu = false, mvu = false;
+    const int keys = vsapi->mapNumKeys(props);
+    for (int i = 0; i < keys; ++i) {
+        const std::string key = vsapi->mapGetKey(props, i);
+        if (key.size() < suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        const std::string p = key.substr(0, key.size() - suffix.size());
+        if (vsapi->mapNumElements(props, (p + "AnalysisHasVectors").c_str()) > 0) {
+            if (!mvgpu && p != prefix) {
+                mvgpuPrefix = p;
+                mvgpu = true;
+            }
+        } else if (!mvu) {
+            mvuPrefix = p;
+            mvu = true;
+        }
+    }
+    if (mvgpu)
+        return "its frames have mvgpu's vector properties under the prefix '" + mvgpuPrefix + "'; pass prefix='" + mvgpuPrefix + "'";
+    if (mvu)
+        return "it holds mvu's vectors (" + mvuPrefix + "Analysis* properties); convert them with mvgpu.FromMVU" +
+               (mvuPrefix != DEFAULT_MVUTENSILS_PREFIX ? " and mvuprefix='" + mvuPrefix + "'" : std::string());
+    return std::string();
+}
+
+// The part of a super's description (ExportSuper) that every frame of the clip shares: all of it but
+// where the parts are, which follows from the frame's stride
+struct SuperProperty {
+    const char *name;
+    int64_t value;
+};
+
+std::array<SuperProperty, 17> SuperDescription(const SuperLayout &layout) {
+    return {{
+        {"SuperWidth", layout.aw},
+        {"SuperHeight", layout.ah},
+        {"SuperRealWidth", layout.width},
+        {"SuperRealHeight", layout.height},
+        {"SuperHPad", layout.pad},
+        {"SuperVPad", layout.padY},
+        {"SuperPel", layout.pel},
+        {"SuperLevels", layout.topLevel + 1},
+        {"SuperChroma", layout.format.chroma},
+        {"SuperXRatioUV", layout.format.xr},
+        {"SuperYRatioUV", layout.format.yr},
+        {"SuperBitsPerSample", layout.format.bits},
+        {"SuperBlkSizeX", layout.blk},
+        {"SuperBlkSizeY", layout.blkY},
+        {"SuperOverlapX", layout.overlap},
+        {"SuperOverlapY", layout.overlapY},
+        {"SuperGPULayout", kLayoutVersion},
+    }};
+}
+
+// A vector frame's analysis description; returns the first property missing, empty when none is
+std::string ReadVectorDescription(const VSMap *props, const std::string &prefix, VectorInfo &v, const VSAPI *vsapi) {
+    struct Field {
+        const char *name;
+        int VectorInfo::*member;
+    };
+    static constexpr Field fields[] = {
+        {"AnalysisWidth", &VectorInfo::width},       {"AnalysisHeight", &VectorInfo::height},     {"AnalysisRealWidth", &VectorInfo::realWidth},
+        {"AnalysisRealHeight", &VectorInfo::realHeight}, {"AnalysisHPad", &VectorInfo::hpad},     {"AnalysisVPad", &VectorInfo::vpad},
+        {"AnalysisPel", &VectorInfo::pel},           {"AnalysisBlkSizeX", &VectorInfo::blkX},     {"AnalysisBlkSizeY", &VectorInfo::blkY},
+        {"AnalysisOverlapX", &VectorInfo::overlapX}, {"AnalysisOverlapY", &VectorInfo::overlapY}, {"AnalysisNBlkX", &VectorInfo::nbx},
+        {"AnalysisNBlkY", &VectorInfo::nby},         {"AnalysisDeltaFrame", &VectorInfo::delta},  {"AnalysisBitsPerSample", &VectorInfo::bits},
+        {"AnalysisChroma", &VectorInfo::chroma},     {"AnalysisXRatioUV", &VectorInfo::xRatio},   {"AnalysisYRatioUV", &VectorInfo::yRatio},
+    };
+    for (const Field &f : fields) {
+        int err = 0;
+        const int value = vsapi->mapGetIntSaturated(props, (prefix + f.name).c_str(), 0, &err);
+        if (err)
+            return prefix + f.name;
+        v.*f.member = value;
+    }
+    return std::string();
+}
+
+// The layout a super clip's frames were made with, or the one of the super a vector clip's vectors
+// were analysed on (vectors), read from its first frame
+SuperLayout ImportLayout(VSNode *node, const std::string &prefix, const VSAPI *vsapi, bool vectors) {
+    char err[1024] = {};
+    const VSFrame *frame = vsapi->getFrame(0, node, err, sizeof(err));
+    if (!frame)
+        throw std::runtime_error(std::string(vectors ? "failed to get a vector clip's first frame: " : "failed to get the super clip's first frame: ") + err);
+    const VSMap *props = vsapi->getFramePropertiesRO(frame);
+    const std::string subject = vectors ? "a vector clip's super" : "the super clip's";
+    auto get = [&](const char *name) { return GetInt(props, prefix + name, vsapi, vectors); };
+    try {
+        if (get("SuperGPULayout") != kLayoutVersion)
+            throw std::runtime_error(vectors ? "a vector clip was analysed on a super from another version of mvgpu.Super" : "the super clip comes from another version of mvgpu.Super");
+        SuperFormat format;
+        format.bits = get("SuperBitsPerSample");
+        format.chroma = get("SuperChroma") != 0;
+        format.xr = get("SuperXRatioUV");
+        format.yr = get("SuperYRatioUV");
+        const int pel = get("SuperPel"), levels = get("SuperLevels");
+        const int blkX = get("SuperBlkSizeX"), blkY = get("SuperBlkSizeY");
+        const int overlapX = get("SuperOverlapX"), overlapY = get("SuperOverlapY");
+        const int padX = get("SuperHPad"), padY = get("SuperVPad");
+        const int width = get("SuperRealWidth"), height = get("SuperRealHeight");
+        if ((format.bits < 8 || format.bits > 16) && format.bits != 32)
+            throw std::runtime_error(subject + " bit depth is invalid");
+        if (format.xr < 1 || format.xr > 2 || format.yr < 1 || format.yr > 2 || (!format.chroma && (format.xr != 1 || format.yr != 1)))
+            throw std::runtime_error(subject + " subsampling is invalid");
+        if (pel != 1 && pel != 2 && pel != 4)
+            throw std::runtime_error(subject + " pel isn't 1, 2 or 4");
+        if (width < 1 || height < 1 || padX < 1 || padY < 1 || blkX < 2 || blkY < 2 || overlapX < 0 || overlapY < 0 || overlapX > blkX / 2 || overlapY > blkY / 2)
+            throw std::runtime_error(subject + " geometry is invalid");
+        // Super refuses a padding the chroma subsampling doesn't divide, as mvu.Super does
+        if (format.chroma && (padX % format.xr || padY % format.yr))
+            throw std::runtime_error(subject + " padding isn't divisible by the chroma subsampling");
+        SuperLayout layout = SuperLayout::Make(format, width, height, blkX, blkY, overlapX, overlapY, padX, padY, pel, levels > 1);
+        if (layout.aw != get("SuperWidth") || layout.ah != get("SuperHeight") || layout.topLevel + 1 != levels)
+            throw std::runtime_error(subject + " layout doesn't match this version of mvgpu");
+        vsapi->freeFrame(frame);
+        return layout;
+    } catch (...) {
+        vsapi->freeFrame(frame);
+        throw;
+    }
 }
 
 } // namespace
@@ -142,10 +283,6 @@ std::string SuperLayout::Unsupported([[maybe_unused]] Use use) const {
         return "only supers with the same overlap horizontally and vertically are implemented so far";
     if (pad != padY)
         return "only supers with the same padding horizontally and vertically are implemented so far";
-    // Chroma's padding is luma's divided by the subsampling: an odd one leaves the reach of luma's
-    // vectors half a pixel short, where mvu reads outside the planes
-    if (pad % format.xr || padY % format.yr)
-        return "with subsampled chroma the padding must be even, or chroma would be read outside its padding";
     if (nbx < 1 || nby < 1)
         return "the frame is too small to hold a single block at this block size and overlap";
     return {};
@@ -156,92 +293,73 @@ bool SuperLayout::operator==(const SuperLayout &o) const {
            pad == o.pad && padY == o.padY && pel == o.pel && topLevel == o.topLevel;
 }
 
-void SuperFrames::Free(const VSAPI *vsapi) {
-    vsapi->freeFrame(luma);
-    vsapi->freeFrame(chroma);
-    vsapi->freeFrame(pyramid);
-    luma = chroma = pyramid = nullptr;
+SuperRegions SuperLayout::Regions(int64_t stride) const {
+    const int64_t bytes = format.Bytes();
+    SuperRegions r;
+    r.lumaStride = stride;
+    r.lumaBytes = stride * LumaRows();
+    int64_t end = r.lumaBytes;
+    if (format.chroma) {
+        r.chromaStride = AlignUp64(wc * bytes, 64);
+        r.chroma = AlignUp64(end, 256);
+        r.chromaBytes = r.chromaStride * ChromaRows();
+        end = r.chroma + r.chromaBytes;
+    }
+    if (topLevel > 0) {
+        r.pyramid = AlignUp64(end, 256);
+        r.pyramidBytes = static_cast<int64_t>(PyramidWidth()) * PyramidRows() * bytes;
+    }
+    return r;
 }
 
-void ExportSuper(VSFrame *dst, const SuperLayout &layout, const SuperFrames &frames, const std::string &prefix, const VSAPI *vsapi) {
+int SuperLayout::FrameRows() const {
+    // The rows past luma's hold the other parts and their alignment at the least stride, so at any
+    // greater one too
+    const int64_t rowBytes = static_cast<int64_t>(wp) * format.Bytes();
+    const SuperRegions r = Regions(rowBytes);
+    const int64_t rest = (format.chroma ? r.chromaBytes + 255 : 0) + (topLevel > 0 ? r.pyramidBytes + 255 : 0);
+    return LumaRows() + static_cast<int>((rest + rowBytes - 1) / rowBytes);
+}
+
+void ExportSuper(VSFrame *dst, const SuperLayout &layout, const SuperRegions &regions, const std::string &prefix, const VSAPI *vsapi) {
     VSMap *props = vsapi->getFramePropertiesRW(dst);
-    vsapi->mapSetFrame(props, (prefix + "SuperLevel0").c_str(), frames.luma, maReplace);
-    if (frames.chroma)
-        vsapi->mapSetFrame(props, (prefix + "SuperLevel0").c_str(), frames.chroma, maAppend);
-    if (frames.pyramid)
-        vsapi->mapSetFrame(props, (prefix + "SuperPyramid").c_str(), frames.pyramid, maReplace);
     auto set = [&](const char *name, int64_t v) { vsapi->mapSetInt(props, (prefix + name).c_str(), v, maReplace); };
-    set("SuperWidth", layout.aw);
-    set("SuperHeight", layout.ah);
-    set("SuperRealWidth", layout.width);
-    set("SuperRealHeight", layout.height);
-    set("SuperHPad", layout.pad);
-    set("SuperVPad", layout.padY);
-    set("SuperPel", layout.pel);
-    set("SuperLevels", layout.topLevel + 1);
-    set("SuperChroma", layout.format.chroma);
-    set("SuperXRatioUV", layout.format.xr);
-    set("SuperYRatioUV", layout.format.yr);
-    set("SuperBitsPerSample", layout.format.bits);
-    set("SuperBlkSizeX", layout.blk);
-    set("SuperBlkSizeY", layout.blkY);
-    set("SuperOverlapX", layout.overlap);
-    set("SuperOverlapY", layout.overlapY);
-    set("SuperGPULayout", kLayoutVersion);
+    for (const SuperProperty &p : SuperDescription(layout))
+        set(p.name, p.value);
+    set("SuperChromaOffset", regions.chroma);
+    set("SuperChromaStride", regions.chromaStride);
+    set("SuperPyramidOffset", regions.pyramid);
+}
+
+std::string CheckSuperFrame(const VSFrame *frame, const SuperLayout &layout, const std::string &prefix, SuperRegions &out, const VSAPI *vsapi) {
+    const VSMap *props = vsapi->getFramePropertiesRO(frame);
+    for (const SuperProperty &p : SuperDescription(layout)) {
+        int err = 0;
+        if (vsapi->mapGetInt(props, (prefix + p.name).c_str(), 0, &err) != p.value || err)
+            return "a super clip frame was made with different Super arguments than its first frame";
+    }
+    if (!GetSuperRegions(frame, layout, out, vsapi))
+        return "the super clip's frames aren't its storage; it must come from mvgpu.Super with the same prefix";
+    return std::string();
 }
 
 SuperLayout ImportSuperLayout(VSNode *node, const std::string &prefix, const VSAPI *vsapi) {
-    char err[1024] = {};
-    const VSFrame *frame = vsapi->getFrame(0, node, err, sizeof(err));
-    if (!frame)
-        throw std::runtime_error(std::string("failed to get the super clip's first frame: ") + err);
-    const VSMap *props = vsapi->getFramePropertiesRO(frame);
-    try {
-        if (GetInt(props, prefix + "SuperGPULayout", vsapi) != kLayoutVersion)
-            throw std::runtime_error("the super clip comes from another version of mvgpu.Super");
-        SuperFormat format;
-        format.bits = GetInt(props, prefix + "SuperBitsPerSample", vsapi);
-        format.chroma = GetInt(props, prefix + "SuperChroma", vsapi) != 0;
-        format.xr = GetInt(props, prefix + "SuperXRatioUV", vsapi);
-        format.yr = GetInt(props, prefix + "SuperYRatioUV", vsapi);
-        const int pel = GetInt(props, prefix + "SuperPel", vsapi), levels = GetInt(props, prefix + "SuperLevels", vsapi);
-        const int blkX = GetInt(props, prefix + "SuperBlkSizeX", vsapi), blkY = GetInt(props, prefix + "SuperBlkSizeY", vsapi);
-        const int overlapX = GetInt(props, prefix + "SuperOverlapX", vsapi), overlapY = GetInt(props, prefix + "SuperOverlapY", vsapi);
-        const int padX = GetInt(props, prefix + "SuperHPad", vsapi), padY = GetInt(props, prefix + "SuperVPad", vsapi);
-        const int width = GetInt(props, prefix + "SuperRealWidth", vsapi), height = GetInt(props, prefix + "SuperRealHeight", vsapi);
-        if ((format.bits < 8 || format.bits > 16) && format.bits != 32)
-            throw std::runtime_error("the super clip's bit depth is invalid");
-        if (format.xr < 1 || format.xr > 2 || format.yr < 1 || format.yr > 2 || (!format.chroma && (format.xr != 1 || format.yr != 1)))
-            throw std::runtime_error("the super clip's subsampling is invalid");
-        if (pel != 1 && pel != 2 && pel != 4)
-            throw std::runtime_error("the super clip's pel isn't 1, 2 or 4");
-        if (width < 1 || height < 1 || padX < 1 || padY < 1 || blkX < 2 || blkY < 2 || overlapX < 0 || overlapY < 0 || overlapX > blkX / 2 || overlapY > blkY / 2)
-            throw std::runtime_error("the super clip's geometry is invalid");
-        SuperLayout layout = SuperLayout::Make(format, width, height, blkX, blkY, overlapX, overlapY, padX, padY, pel, levels > 1);
-        if (layout.aw != GetInt(props, prefix + "SuperWidth", vsapi) || layout.ah != GetInt(props, prefix + "SuperHeight", vsapi) ||
-            layout.topLevel + 1 != levels)
-            throw std::runtime_error("the super clip's layout doesn't match this version of mvgpu");
-        vsapi->freeFrame(frame);
-        return layout;
-    } catch (...) {
-        vsapi->freeFrame(frame);
-        throw;
-    }
+    return ImportLayout(node, prefix, vsapi, false);
 }
 
-bool GetSuperFrames(const VSFrame *frame, const SuperLayout &layout, const std::string &prefix, SuperFrames &out, const VSAPI *vsapi) {
-    const VSMap *props = vsapi->getFramePropertiesRO(frame);
-    int err = 0;
-    out.luma = vsapi->mapGetFrame(props, (prefix + "SuperLevel0").c_str(), 0, &err);
-    if (layout.format.chroma)
-        out.chroma = vsapi->mapGetFrame(props, (prefix + "SuperLevel0").c_str(), 1, &err);
-    if (layout.topLevel > 0)
-        out.pyramid = vsapi->mapGetFrame(props, (prefix + "SuperPyramid").c_str(), 0, &err);
-    if (!out.luma || (layout.format.chroma && !out.chroma) || (layout.topLevel > 0 && !out.pyramid)) {
-        out.Free(vsapi);
+SuperLayout ImportAnalysedLayout(VSNode *vectors, const std::string &prefix, const VSAPI *vsapi) {
+    return ImportLayout(vectors, prefix, vsapi, true);
+}
+
+bool GetSuperRegions(const VSFrame *frame, const SuperLayout &layout, SuperRegions &out, const VSAPI *vsapi) {
+    const VSVideoFormat *f = vsapi->getVideoFrameFormat(frame);
+    if (!f || f->colorFamily != cfGray || f->bytesPerSample != layout.format.Bytes() || vsapi->getFrameWidth(frame, 0) != layout.FrameWidth() ||
+        vsapi->getFrameHeight(frame, 0) != layout.FrameRows())
         return false;
-    }
-    return true;
+    const int64_t stride = vsapi->getStride(frame, 0);
+    out = layout.Regions(stride);
+    const int64_t end = layout.topLevel > 0 ? out.pyramid + out.pyramidBytes : layout.format.chroma ? out.chroma + out.chromaBytes : out.lumaBytes;
+    return end <= stride * layout.FrameRows();
 }
 
 VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *vsapi) {
@@ -250,36 +368,27 @@ VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *
     if (!frame)
         throw std::runtime_error(std::string("failed to get a vector clip's first frame: ") + err);
     const VSMap *props = vsapi->getFramePropertiesRO(frame);
-    auto get = [&](const char *name) {
-        int e = 0;
-        const int v = vsapi->mapGetIntSaturated(props, (prefix + name).c_str(), 0, &e);
-        if (e) {
-            vsapi->freeFrame(frame);
-            throw std::runtime_error(std::string("a vector clip lacks the property ") + prefix + name + "; it must come from mvgpu.Analyse with the same prefix");
-        }
-        return v;
-    };
     VectorInfo v;
-    v.width = get("AnalysisWidth");
-    v.height = get("AnalysisHeight");
-    v.realWidth = get("AnalysisRealWidth");
-    v.realHeight = get("AnalysisRealHeight");
-    v.hpad = get("AnalysisHPad");
-    v.vpad = get("AnalysisVPad");
-    v.pel = get("AnalysisPel");
-    v.blkX = get("AnalysisBlkSizeX");
-    v.blkY = get("AnalysisBlkSizeY");
-    v.overlapX = get("AnalysisOverlapX");
-    v.overlapY = get("AnalysisOverlapY");
-    v.nbx = get("AnalysisNBlkX");
-    v.nby = get("AnalysisNBlkY");
-    v.delta = get("AnalysisDeltaFrame");
-    v.bits = get("AnalysisBitsPerSample");
-    v.chroma = get("AnalysisChroma");
-    v.xRatio = get("AnalysisXRatioUV");
-    v.yRatio = get("AnalysisYRatioUV");
+    std::string missing = ReadVectorDescription(props, prefix, v, vsapi);
+    // Every frame of mvgpu's vector clips says whether it has vectors; mvu's frames, whose vectors are
+    // property arrays, don't, and would otherwise pass for frames without vectors
+    if (missing.empty() && vsapi->mapNumElements(props, (prefix + "AnalysisHasVectors").c_str()) < 1)
+        missing = prefix + "AnalysisHasVectors";
+    if (!missing.empty()) {
+        const std::string hint = VectorsHint(props, prefix, vsapi);
+        vsapi->freeFrame(frame);
+        throw std::runtime_error("a vector clip lacks the property " + missing + "; " +
+                                 (hint.empty() ? "it must come from mvgpu.Analyse, mvgpu.Recalculate or mvgpu.FromMVU with the same prefix" : hint));
+    }
     vsapi->freeFrame(frame);
     return v;
+}
+
+bool SameAnalysis(const VectorInfo &a, const VectorInfo &b) {
+    return a.width == b.width && a.height == b.height && a.realWidth == b.realWidth && a.realHeight == b.realHeight && a.hpad == b.hpad &&
+           a.vpad == b.vpad && a.pel == b.pel && a.bits == b.bits && a.blkX == b.blkX && a.blkY == b.blkY && a.overlapX == b.overlapX &&
+           a.overlapY == b.overlapY && a.nbx == b.nbx && a.nby == b.nby && a.delta == b.delta && (a.chroma != 0) == (b.chroma != 0) &&
+           (!a.chroma || (a.xRatio == b.xRatio && a.yRatio == b.yRatio));
 }
 
 bool SameStorage(const SuperLayout &a, const SuperLayout &b) {
@@ -291,7 +400,7 @@ bool SameGeometry(const SuperLayout &a, const SuperLayout &b) {
            a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY && a.pel == b.pel;
 }
 
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi) {
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi) {
     VSMap *props = vsapi->getFramePropertiesRW(dst);
     auto set = [&](const char *name, int64_t v) { vsapi->mapSetInt(props, (prefix + name).c_str(), v, maReplace); };
     set("AnalysisWidth", layout.aw);
@@ -313,15 +422,26 @@ void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chr
     set("AnalysisNBlkY", layout.nby);
     set("AnalysisDeltaFrame", delta);
     set("AnalysisBitsPerSample", layout.format.bits);
-    if (vectors)
-        vsapi->mapSetFrame(props, (prefix + "AnalysisVectors").c_str(), vectors, maReplace);
-    else
-        vsapi->mapDeleteKey(props, (prefix + "AnalysisVectors").c_str());
+    set("AnalysisHasVectors", hasVectors);
 }
 
 const VSFrame *GetAnalysisVectors(const VSFrame *frame, const std::string &prefix, const VSAPI *vsapi) {
     int err = 0;
-    return vsapi->mapGetFrame(vsapi->getFramePropertiesRO(frame), (prefix + "AnalysisVectors").c_str(), 0, &err);
+    const bool has = vsapi->mapGetInt(vsapi->getFramePropertiesRO(frame), (prefix + "AnalysisHasVectors").c_str(), 0, &err) != 0;
+    return has && !err ? vsapi->addFrameRef(frame) : nullptr;
+}
+
+const VSFrame *GetAnalysisVectors(const VSFrame *frame, const VectorInfo &expected, const std::string &prefix, std::string &error, const VSAPI *vsapi) {
+    const VSFrame *vectors = GetAnalysisVectors(frame, prefix, vsapi);
+    if (vectors) {
+        VectorInfo v;
+        if (!ReadVectorDescription(vsapi->getFramePropertiesRO(frame), prefix, v, vsapi).empty() || !SameAnalysis(v, expected)) {
+            vsapi->freeFrame(vectors);
+            error = "a vector clip frame was made with different Analyse/Recalculate arguments than its first frame";
+            return nullptr;
+        }
+    }
+    return vectors;
 }
 
 void GetPairArgument(int &h, int &v, const char *name, int defaultH, int defaultV, const VSMap *in, const VSAPI *vsapi) {

@@ -33,6 +33,7 @@ struct CompensateData {
     VSNode *vectors = nullptr;
     const VSVideoInfo *vi = nullptr;
     SuperLayout layout;
+    VectorInfo info; // the vectors' first frame's description, which every frame with vectors must have
     std::string prefix;
 
     int delta = 0; // the vectors' reference frame is n + delta
@@ -109,7 +110,10 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return f;
         };
 
-        const VSFrame *vec = load ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->prefix, vsapi)) : nullptr;
+        std::string error;
+        const VSFrame *vec = load ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->info, d->prefix, error, vsapi)) : nullptr;
+        if (!error.empty())
+            return fail(error);
         const VSFrame *src = hold(vsapi->getFrameFilter(n, d->node, frameCtx));
         if (!vec) {
             // The clip's frame, as mvu returns it where the vectors don't serve
@@ -118,11 +122,10 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return f;
         }
 
-        SuperFrames ref;
-        if (!GetSuperFrames(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), L, d->prefix, ref, vsapi))
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        for (const VSFrame *f : {ref.luma, ref.chroma, ref.pyramid})
-            hold(f);
+        const VSFrame *ref = hold(vsapi->getFrameFilter(nref, d->super, frameCtx));
+        SuperRegions regions;
+        if (const std::string e = CheckSuperFrame(ref, L, d->prefix, regions, vsapi); !e.empty())
+            return fail(e);
 
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
@@ -130,12 +133,12 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
 
         const int numPlanes = d->vi->format.numPlanes;
         const bool chroma = L.format.chroma;
-        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlanes[2] = {}, vecPlane = {};
+        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlane = {}, vecPlane = {};
         for (int p = 0; p < numPlanes; ++p)
             if (vkapi->getGPUPlane(src, p, &clipPlanes[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the clip's frames aren't GPU resident");
-        if (vkapi->getGPUPlane(ref.luma, 0, &superPlanes[0]) || (chroma && vkapi->getGPUPlane(ref.chroma, 0, &superPlanes[1])))
-            return fail("the super's planes aren't GPU resident");
+        if (vkapi->getGPUPlane(ref, 0, &superPlane))
+            return fail("the super's frames aren't GPU resident");
         if (vkapi->getGPUPlane(vec, 0, &vecPlane))
             return fail("the vectors aren't GPU resident");
         const ptrdiff_t recBytes = vsapi->getStride(vec, 0);
@@ -154,9 +157,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
         vkapi->gpuExecReadsFrame(ctx, src);
-        for (const VSFrame *f : {ref.luma, ref.chroma})
-            if (f)
-                vkapi->gpuExecReadsFrame(ctx, f);
+        vkapi->gpuExecReadsFrame(ctx, ref);
         vkapi->gpuExecReadsFrame(ctx, vec);
         for (int p = 0; p < numPlanes; ++p)
             vkapi->gpuExecWritesPlane(ctx, dst, p);
@@ -184,9 +185,9 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.padY = L.padY;
         pc.padc = L.padc;
         pc.padcY = L.padcY;
-        pc.wp = static_cast<int32_t>(vsapi->getStride(ref.luma, 0) / bytes);
+        pc.wp = static_cast<int32_t>(regions.lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = chroma ? static_cast<int32_t>(vsapi->getStride(ref.chroma, 0) / bytes) : 0;
+        pc.wc = static_cast<int32_t>(regions.chromaStride / bytes);
         pc.hc = L.hc;
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
@@ -197,8 +198,9 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.time4096BX = L.format.Float() ? 0 : (1 << L.format.bits) - 1;
 
         rec.Bind(kFlTaps, d->windowsInfo.buffer);
-        rec.Bind(kFlRefLuma, superPlanes[0].buffer);
-        rec.Bind(kFlRefChroma, chroma ? superPlanes[1].buffer : d->windowsInfo.buffer);
+        rec.Bind(kFlRefLuma, superPlane.buffer, regions.luma, regions.lumaBytes);
+        if (chroma)
+            rec.Bind(kFlRefChroma, superPlane.buffer, regions.chroma, regions.chromaBytes);
         rec.Bind(kFlVecF, vecPlane.buffer);
         rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
         for (int p = 0; p < numPlanes; ++p) {
@@ -210,7 +212,11 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             pc.colOff = d->winOff[p ? 1 : 0]; // compensate.comp's windows
             rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
-            rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
+            // Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the
+            // plane's step and overlap multiples of 4 (compensate.comp's kQuad)
+            const int lx = p ? L.format.xr >> 1 : 0;
+            pc.time4096BY = bytes == 1 && L.pel != 4 && ((d->step >> lx) & 3) == 0 && ((d->overlap >> lx) & 3) == 0;
+            rec.Dispatch(d->pixels, pc, static_cast<uint32_t>(pc.time4096BY ? (pc.width + 255) / 256 : (pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
         }
         stamp(2);
 
@@ -268,17 +274,21 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
             d->vi->height != L.height)
             throw std::runtime_error("source clip isn't compatible with super clip");
 
+        CheckClipLength(d->super, "super", d->vi->numFrames, "clip", vsapi);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
+
         // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
         // depth (mvu's IsCompatibleWithAnalysis). The grid is theirs, as in mvu; the super only
         // supplies the planes.
         const VectorInfo v = ReadVectorInfo(d->vectors, d->prefix, vsapi);
-        const SuperLayout analysed = ImportSuperLayout(d->vectors, d->prefix, vsapi);
+        const SuperLayout analysed = ImportAnalysedLayout(d->vectors, d->prefix, vsapi);
         if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
             v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
             throw std::runtime_error("wrong source or super clip frame size");
         if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
             v.nby != analysed.nby)
             throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        d->info = v;
         d->delta = v.delta;
         d->nbx = v.nbx;
         d->nby = v.nby;

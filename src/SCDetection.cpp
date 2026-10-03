@@ -24,6 +24,7 @@
 struct SCDetectionData {
     VSNode *node = nullptr;    // the clip
     VSNode *vectors = nullptr;
+    VectorInfo info;            // their first frame's description, which every frame with vectors must have
     const VSVideoInfo *vi = nullptr;
     std::string prefix;
     const char *prop = nullptr; // the property set
@@ -110,8 +111,14 @@ static const VSFrame *VS_CC scdetectionGetFrame(int n, int activationReason, voi
         vsapi->freeFrame(src);
 
         const VSFrame *frame = vsapi->getFrameFilter(n, d->vectors, frameCtx);
-        const VSFrame *vectors = GetAnalysisVectors(frame, d->prefix, vsapi);
+        std::string error;
+        const VSFrame *vectors = GetAnalysisVectors(frame, d->info, d->prefix, error, vsapi);
         vsapi->freeFrame(frame);
+        if (!error.empty()) {
+            vsapi->freeFrame(dst);
+            vsapi->setFilterError(("SCDetection: " + error).c_str(), frameCtx);
+            return nullptr;
+        }
         try {
             // mvu's !IsUsable: no vectors, or more blocks above thscd1 than the limit (never with as
             // many blocks as the limit)
@@ -150,8 +157,9 @@ static void VS_CC scdetectionCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         d->vi = vsapi->getVideoInfo(d->node);
 
-        const VectorInfo v = ReadVectorInfo(d->vectors, d->prefix, vsapi);
-        const SuperLayout analysed = ImportSuperLayout(d->vectors, d->prefix, vsapi);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
+        const VectorInfo v = d->info = ReadVectorInfo(d->vectors, d->prefix, vsapi);
+        const SuperLayout analysed = ImportAnalysedLayout(d->vectors, d->prefix, vsapi);
         if (v.nbx != analysed.nbx || v.nby != analysed.nby)
             throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
         d->nbx = v.nbx;

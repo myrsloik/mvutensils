@@ -35,7 +35,7 @@ layout(push_constant) uniform Params {
     int level;                    // pyr_reduce.comp: the level it makes
     int rfilter;                  // pyr_reduce.comp: 0 simple, 1 bilinear, 2 cubic
     int pel;                      // the super's pel
-    int reserved0;
+    int quad;                     // pyr_reduce.comp: four pixels per lane, else one
 } pc;
 
 // The buffers, numbered for Get and Put: the storage frames (SuperLayout.h), luma's sub-pel

@@ -1,23 +1,29 @@
 #pragma once
 
-// How mvgpu.Super lays out a frame on the GPU, and the frame properties that carry it to Analyse
-// and Degrain.
+// How mvgpu.Super lays out a frame on the GPU, and the frame properties that describe it to the
+// filters that read it.
 //
 // mvu.Super stores one pyramid level per plane, laid out for the CPU. mvgpu.Super keeps what the
-// kernels read, laid out for them, in up to three GPU frames attached to each output frame, their
-// samples the clip's (8-bit, 9 to 16-bit or float):
+// kernels read, laid out for them: each frame of the super clip is one GPU frame of Gray samples,
+// the clip's (8-bit, 9 to 16-bit or float), whose plane holds three parts one after another
+// (Regions gives where):
 //
 // - luma: the padded sub-pel planes one after another, hp rows each, then a spare row, wp samples
-//   wide, its rows whole words apart: the full-pel plane alone at pel 1; at pel 2 and 4 it and the
-//   three half-pel planes (x + 1/2, y + 1/2, both).
-// - chroma (not for Gray): U's samples, then V's, then a spare row, wc wide: the full-pel plane of
-//   hc rows at pel 1, and the three half-pel planes after it at pel 2, and at pel 4 when chroma
-//   isn't subsampled (4:4:4, kept as luma is); at pel 4 when it is, one image of the plane's
-//   quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at (4x + fx, 4y + fy), 4 hc
-//   rows of 4 wc samples, each four of the frame's rows (as much as sixteen planes would take).
+//   wide, in the frame's own rows (which start whole words apart): the full-pel plane alone at pel
+//   1; at pel 2 and 4 it and the three half-pel planes (x + 1/2, y + 1/2, both).
+// - chroma (not for Gray): U's samples, then V's, then a spare row, wc wide in rows of their own
+//   stride: the full-pel plane of hc rows at pel 1, and the three half-pel planes after it at pel
+//   2, and at pel 4 when chroma isn't subsampled (4:4:4, kept as luma is); at pel 4 when it is, one
+//   image of the plane's quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at
+//   (4x + fx, 4y + fy), 4 hc rows of 4 wc samples, each four of the frame's rows (as much as
+//   sixteen planes would take).
 // - pyramid (not with onelevel): the coarse levels 1 .. topLevel the search starts from, every
 //   plane of every level inside a border of repeated edge pixels, at the offsets the level table
-//   gives; one flat buffer.
+//   gives; flat.
+//
+// The frame is the storage and nothing else: it shares no planes with the clip's frames and holds
+// no frames in its properties, so the core's frame cache sees all of it and keeps nothing else
+// alive. (The frames of a vector clip, likewise, are the vectors' records alone: ExportAnalysis.)
 //
 // The planes cover the block-aligned frame the analysis grid covers, as mvu.Super's do, so the
 // grid is a property of the super clip: blksize and overlap go to Super. The spare rows let the
@@ -55,6 +61,15 @@ struct LevelEntry {
     int32_t borderY, borderC, reserved[2];
 };
 static_assert(sizeof(LevelEntry) == 80, "pyr_common.glsl's Level is 20 ints");
+
+// Where a super frame keeps the parts of its storage: byte offsets into its plane's buffer and sizes
+// of luma's storage, chroma's (none for Gray) and the coarse levels' (none without them), and the
+// strides of luma's and chroma's rows. Offsets are multiples of 256 bytes, which every device takes
+// as a storage buffer descriptor's offset.
+struct SuperRegions {
+    int64_t luma = 0, lumaBytes = 0, chroma = 0, chromaBytes = 0, pyramid = 0, pyramidBytes = 0;
+    int64_t lumaStride = 0, chromaStride = 0;
+};
 
 // The samples of a super: the clip's
 struct SuperFormat {
@@ -110,36 +125,42 @@ struct SuperLayout {
     int ChromaRows() const { return 2 * ChromaPlanes() * hc + 1; }
     int PyramidWidth() const { return wp; }
     int PyramidRows() const { return (pyramidSamples + wp - 1) / wp + 1; }
+    // The super clip's frames: Gray of the format's samples, FrameWidth() x FrameRows(), the storage's
+    // parts where Regions puts them for the frame's stride (the rows past luma's hold the others at
+    // any stride the core gives the frame, the least being FrameWidth() samples)
+    int FrameWidth() const { return wp; }
+    int FrameRows() const;
+    SuperRegions Regions(int64_t stride) const;
 
     // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
     // compensate motion with its vectors (Degrain, FlowInter, FlowFPS)
     enum class Use { Search, Compensation };
     // What they implement so far, either of them: Gray, 4:2:0 or 4:4:4 of 8 to 16-bit or float samples
-    // at any pel, square blocks of 8, 16 or 32 with the same overlap and padding either way, the
-    // padding even with subsampled chroma. Empty when the layout is one of those, else what it lacks.
+    // at any pel, square blocks of 8, 16 or 32 with the same overlap and padding either way. Empty when
+    // the layout is one of those, else what it lacks.
     std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;
 };
 
-// The GPU frames mvgpu.Super attaches to a frame, each holding its own reference
-struct SuperFrames {
-    const VSFrame *luma = nullptr;
-    const VSFrame *chroma = nullptr;  // null for Gray
-    const VSFrame *pyramid = nullptr; // null without coarse levels
 
-    void Free(const VSAPI *vsapi);
-};
-
-// Attaches the frames and the layout's description; the properties take their own references
-void ExportSuper(VSFrame *dst, const SuperLayout &layout, const SuperFrames &frames, const std::string &prefix, const VSAPI *vsapi);
+// Sets the layout's description on a super frame, and for the tools where its parts are in it
+// (SuperChromaOffset, SuperChromaStride, SuperPyramidOffset, in bytes)
+void ExportSuper(VSFrame *dst, const SuperLayout &layout, const SuperRegions &regions, const std::string &prefix, const VSAPI *vsapi);
 
 // The layout a super clip's frames were made with, read from its first frame; throws when the
 // clip doesn't come from mvgpu.Super with this prefix
 SuperLayout ImportSuperLayout(VSNode *node, const std::string &prefix, const VSAPI *vsapi);
+// The same of the super a vector clip's vectors were analysed on, from the description its frames
+// carry (ExportAnalysis)
+SuperLayout ImportAnalysedLayout(VSNode *vectors, const std::string &prefix, const VSAPI *vsapi);
 
-// The frames attached to a frame of such a clip, new references; false when they're missing
-bool GetSuperFrames(const VSFrame *frame, const SuperLayout &layout, const std::string &prefix, SuperFrames &out, const VSAPI *vsapi);
+// Where a frame of such a clip keeps its parts; false when it isn't a frame of this layout
+bool GetSuperRegions(const VSFrame *frame, const SuperLayout &layout, SuperRegions &out, const VSAPI *vsapi);
+// The same for a frame a filter loads, checked as mvu checks every super frame it loads: made with the
+// same Super arguments as the clip's first frame, whose layout this is (a spliced clip can mix
+// supers), and this layout's storage. Empty, or what is wrong.
+std::string CheckSuperFrame(const VSFrame *frame, const SuperLayout &layout, const std::string &prefix, SuperRegions &out, const VSAPI *vsapi);
 
 // The same level-0 storage, whatever the levels above it and the grid: the planes the kernels read
 bool SameStorage(const SuperLayout &a, const SuperLayout &b);
@@ -154,16 +175,29 @@ struct VectorInfo {
     int delta = 0, bits = 0, chroma = 0, xRatio = 0, yRatio = 0;
 };
 
-// Read from the clip's first frame; throws when a property is missing
+// Read from the clip's first frame; throws when a property is missing, AnalysisHasVectors included,
+// saying so when the clip holds mvu's vectors instead (mvgpu.FromMVU converts them)
 VectorInfo ReadVectorInfo(VSNode *node, const std::string &prefix, const VSAPI *vsapi);
 
-// The analysis description mvu.Analyse attaches, under the same names, plus the vector frame when
-// there is one: a 32-bit record (x, y, SAD, 0) per block, vectors in 1 / pel pixels, a row of records
-// per row of blocks. chroma: whether the SADs count chroma.
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, const VSFrame *vectors, const std::string &prefix, const VSAPI *vsapi);
+// mvu's test of a vector frame that carries vectors against its clip's first frame
+// (MotionBlockPyramid::Geometry): the whole description, the subsampling only where the SADs count
+// chroma
+bool SameAnalysis(const VectorInfo &a, const VectorInfo &b);
 
-// The vector frame attached to an analysis frame, a new reference, or null
+// The analysis description mvu.Analyse attaches, under the same names, on a frame of a vector clip:
+// the vectors' records themselves, Gray32, a record (x, y, SAD, 0) per block, vectors in 1 / pel
+// pixels, a row of records per row of blocks, 4 * nbx x nby. The frame also carries the description
+// of the super it was analysed on (allocate it with the super frame as its property source).
+// chroma: whether the SADs count chroma; hasVectors: whether the records hold vectors (they don't
+// where the reference frame is outside the clip, as mvu's frames have none there): HasVectors.
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi);
+
+// A frame of a vector clip as the vectors' records, a new reference, or null when it has none
 const VSFrame *GetAnalysisVectors(const VSFrame *frame, const std::string &prefix, const VSAPI *vsapi);
+// The same for a frame a filter loads, checked as mvu checks every vector frame it loads: one with
+// vectors must carry the description of its clip's first frame (expected, SameAnalysis), as a spliced
+// clip can mix analyses; when it doesn't, error says so and the result is null
+const VSFrame *GetAnalysisVectors(const VSFrame *frame, const VectorInfo &expected, const std::string &prefix, std::string &error, const VSAPI *vsapi);
 
 // mvu's argument helpers: an "h" or "h,v" list argument (absent -> the defaults, one value -> v = h),
 // and the block size and overlap rules

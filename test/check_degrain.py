@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """mvgpu.Degrain against mvu.Degrain, byte for byte.
 
-Both denoise the same clip with the same vectors. By default they are mvgpu.AnalyseMany's:
-mvu.Degrain gets them on a carrier clip that holds mvgpu's analysis description under mvu's property
-names, so mvu never searches. With --vectors mvu they are mvu.Analyse's, and mvgpu.Degrain gets them
-on the frames of its super, as mvgpu.Analyse would attach them: vectors mvgpu's search wouldn't
-find, and frames narrower than the 192 pixels mvgpu.Analyse needs. Each side builds its super with
+Both denoise the same clip with the same vectors. By default they are mvgpu.AnalyseMany's, which
+mvu.Degrain gets through mvgpu.ToMVU, so mvu never searches. With --vectors mvu they are
+mvu.Analyse's, which mvgpu.Degrain gets through mvgpu.FromMVU: vectors mvgpu's search wouldn't find,
+and frames narrower than the 192 pixels mvgpu.Analyse needs. Each side builds its super with
 the same settings (mvgpu.Super's planes are mvu.Super's). With --analyse8 the vectors come from an
 8-bit copy of a high bit depth clip, as mvu lets vectors analysed on 8 bits serve the clip. Every
 pixel of every frame and plane is compared.
@@ -27,7 +26,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip, plane_pair  # noqa: E402
+from mvtest import eight_bit, format_clip, nv12_clip, plane_pair  # noqa: E402
 
 
 def main():
@@ -80,11 +79,11 @@ def main():
     casup = core.mvu.Super(aclip, **sk) if args.analyse8 else csup
     if args.vectors == 'mvgpu':
         fields = core.mvgpu.AnalyseMany(gasup, radius=args.radius)
-        cvec = [mvu_vectors(core, an, clip, args.frames) for an in fields]
+        cvec = [core.mvgpu.ToMVU(an) for an in fields]
     else:
         deltas = [d for r in range(1, args.radius + 1) for d in (r, -r)]
         cvec = [core.mvu.Analyse(casup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
-        fields = [gpu_vectors(core, an, gasup) for an in cvec]
+        fields = [core.mvgpu.FromMVU(an, gasup) for an in cvec]
     # Degrain's supers: the analysis one, or one with the render block size and overlap
     rk = dict(sk, blksize=args.render[0], overlap=args.render[1]) if args.render else sk
     if args.render:

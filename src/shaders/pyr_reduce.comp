@@ -14,6 +14,9 @@ struct Level {
 };
 layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
 
+// The pyramid as words, for the 8-bit sources' four samples at a time
+layout(std430, set = 0, binding = 16) buffer PyramidW { uint pyrW[]; };
+
 // One level of a frame's pyramid from the level below it, halving it rounding up, by mvu.Super's
 // rfilter (SuperPyramid.cpp's reductions, which the CPU reference's Reduce follows for the default):
 // 0 RB2F, the average of each 2 x 2; 1 RB2BilinearFiltered, 1/8, 3/8, 3/8, 1/8 vertically, then
@@ -23,9 +26,14 @@ layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; }
 // padding; at pel 4 chroma's full-pel samples in its quarter-pel image, every fourth of every fourth
 // row), later levels the pyramid itself, reads clamped to the source plane. The border is part
 // of the output: a border pixel gets the value of the nearest edge pixel, computed again at that
-// position, which is what SmallPlane::At's clamping reads there. One lane per pixel, border
-// included, 64 pixels of a row per workgroup, the plane (Y, U, V) in z; dispatched as
-// ((W + 63) / 64, H, planes) with W x H the larger of the level's planes, border included.
+// position, which is what SmallPlane::At's clamping reads there. pc.quad pixels of a row per lane:
+// four on levels wide enough to keep the GPU busy, one on the narrower ones, whose dispatches take
+// as long as their slowest lane (Super.cpp); border included, the plane (Y, U, V) in z; dispatched
+// as ((W + 64 n - 1) / (64 n), H, planes) with n the pixels per lane and W x H the larger of the
+// level's planes, border included. Integer samples whose four pixels lie between the plane's first
+// and last columns (Interior4) filter each source column once for the four, whose columns overlap,
+// 8-bit rows inside the plane read as words; the rest, and float samples, take each pixel on its
+// own (Pixel).
 
 int gBuf, gW, gH, gStride, gStep; // the source plane: rows gStride samples apart, pixels gStep
 uint gBase;
@@ -61,40 +69,8 @@ float ColumnF(int x, int y, int dh) {
     return s * (1.0 / 32.0);
 }
 
-void main() {
-    int z = int(gl_WorkGroupID.z);
-    gStep = 1;
-    if (pc.level == 1) {
-        gBuf = z == 0 ? kLuma : kChroma;
-        if (z == 0) {
-            gW = pc.w;
-            gH = pc.h;
-            gStride = pc.wp;
-            gBase = uint(pc.padY * pc.wp + pc.padX);
-        } else {
-            gW = pc.w / pc.xr;
-            gH = pc.h / pc.yr;
-            int image = pc.chromaPlanes == 16 ? 4 : 1; // subsampled at pel 4: the image's pixels 4 apart, rows 4 * 4 wc
-            gStride = image * image * pc.wc;
-            gStep = image;
-            gBase = uint(z - 1) * uint(pc.chromaPlanes) * uint(pc.wc * pc.hc) + uint(pc.padcY * gStride + pc.padcX * gStep);
-        }
-    } else {
-        Level s = levels[pc.level - 1];
-        gBuf = kPyramid;
-        gW = z == 0 ? s.w : s.wc;
-        gH = z == 0 ? s.h : s.hc;
-        gStride = z == 0 ? s.strideY : s.strideC;
-        gBase = uint(z == 0 ? s.offY : z == 1 ? s.offU : s.offV);
-    }
-    Level d = levels[pc.level];
-    int dw = z == 0 ? d.w : d.wc, dh = z == 0 ? d.h : d.hc;
-    int border = z == 0 ? d.borderY : d.borderC, stride = z == 0 ? d.strideY : d.strideC;
-    int xp = int(gl_GlobalInvocationID.x) - border, yp = int(gl_WorkGroupID.y) - border;
-    if (xp >= dw + border || yp >= dh + border)
-        return;
-    int x = clamp(xp, 0, dw - 1), y = clamp(yp, 0, dh - 1);
-    uint out0 = uint((z == 0 ? d.offY : z == 1 ? d.offU : d.offV) + yp * stride + xp);
+// Destination pixel x (inside the plane) of row y, dw x dh, into out
+void Pixel(int x, int y, int dw, int dh, uint out0) {
     int c = 2 * x;
     if (kFloat) {
         float v;
@@ -128,5 +104,148 @@ void main() {
             v = (ColumnI(c - 2, y, dh) + ColumnI(c + 3, y, dh) + m2 + m1 + 16) >> 5;
         }
         PutI(kPyramid, out0, v);
+    }
+}
+
+// Word g of the source plane's buffer, 8-bit
+uint SourceWord(uint g) {
+    if (gBuf == kLuma)
+        return lumaW[g];
+    if (gBuf == kChroma)
+        return chromaW[g];
+    return pyrW[g];
+}
+
+// The four bytes from byte a on, of words w0 (holding byte a) and w1
+uint Funnel(uint w0, uint w1, uint a) {
+    uint s = (a & 3u) * 8u;
+    return s == 0u ? w0 : (w0 >> s) | (w1 << (32u - s));
+}
+
+// Source row r's samples at columns c0 .. c0 + 11 (r and the columns clamped to the plane, as Src
+// clamps them): 8-bit rows inside the plane as four words, which the super's spare rows, or for the
+// pyramid the level table's sample count, keep inside the buffer; else one sample at a time
+void SourceRow(int c0, int r, inout int s[12]) {
+    uint row = gBase + uint(clamp(r, 0, gH - 1) * gStride);
+    bool words = kKind == 0 && gStep == 1 && c0 >= 0 && c0 + 12 <= gW;
+    uint a = row + uint(max(c0, 0));
+    if (words && gBuf == kPyramid)
+        words = int((a & ~3u) + 15u) < levels[0].frameSamples;
+    if (words) {
+        uint g = a >> 2u;
+        uint w0 = SourceWord(g), w1 = SourceWord(g + 1u), w2 = SourceWord(g + 2u), w3 = SourceWord(g + 3u);
+        uint q[3] = uint[3](Funnel(w0, w1, a), Funnel(w1, w2, a), Funnel(w2, w3, a));
+        [[unroll]] for (int i = 0; i < 12; ++i)
+            s[i] = int((q[i >> 2] >> uint(8 * (i & 3))) & 0xFFu);
+    } else {
+        [[unroll]] for (int i = 0; i < 12; ++i)
+            s[i] = GetI(gBuf, Src(c0 + i, r));
+    }
+}
+
+// Destination pixels x .. x + 3 of row y, all between the plane's first and last columns (so none
+// takes the edges' average of two), integer samples: the columns they read, 2x - 2 .. 2x + 9 at
+// most, each filtered vertically once, then each pixel's horizontal pass as Pixel's, in integers,
+// whose sums don't depend on the order of their terms
+void Interior4(int x, int y, int dh, uint out0) {
+    int c0 = 2 * x - 2; // column k of col is source column c0 + k
+    int col[12];
+    int s[12];
+    if (pc.rfilter == 0) {
+        // two rows' sums, the 2 x 2 average's
+        int t[12];
+        SourceRow(c0, 2 * y, s);
+        SourceRow(c0, 2 * y + 1, t);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] = s[k] + t[k];
+    } else if (y == 0 || y == dh - 1) {
+        int t[12];
+        SourceRow(c0, 2 * y, s);
+        SourceRow(c0, 2 * y + 1, t);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] = (s[k] + t[k] + 1) >> 1;
+    } else if (pc.rfilter == 1) {
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] = 4;
+        SourceRow(c0, 2 * y - 1, s);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] += s[k];
+        SourceRow(c0, 2 * y, s);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] += 3 * s[k];
+        SourceRow(c0, 2 * y + 1, s);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] += 3 * s[k];
+        SourceRow(c0, 2 * y + 2, s);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] = (col[k] + s[k]) >> 3;
+    } else {
+        const int weights[6] = int[6](1, 5, 10, 10, 5, 1);
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] = 16;
+        [[unroll]] for (int j = 0; j < 6; ++j) {
+            SourceRow(c0, 2 * y - 2 + j, s);
+            [[unroll]] for (int k = 0; k < 12; ++k)
+                col[k] += weights[j] * s[k];
+        }
+        [[unroll]] for (int k = 0; k < 12; ++k)
+            col[k] >>= 5;
+    }
+    [[unroll]] for (int i = 0; i < 4; ++i) {
+        int k = 2 * i + 2; // source column 2 (x + i)
+        int v;
+        if (pc.rfilter == 0)
+            v = (col[k] + col[k + 1] + 2) >> 2;
+        else if (pc.rfilter == 1)
+            v = (col[k - 1] + (col[k] + col[k + 1]) * 3 + col[k + 2] + 4) >> 3;
+        else
+            v = (col[k - 2] + col[k + 3] + (col[k] + col[k + 1]) * 10 + (col[k - 1] + col[k + 2]) * 5 + 16) >> 5;
+        PutI(kPyramid, out0 + uint(i), v);
+    }
+}
+
+void main() {
+    int z = int(gl_WorkGroupID.z);
+    gStep = 1;
+    if (pc.level == 1) {
+        gBuf = z == 0 ? kLuma : kChroma;
+        if (z == 0) {
+            gW = pc.w;
+            gH = pc.h;
+            gStride = pc.wp;
+            gBase = uint(pc.padY * pc.wp + pc.padX);
+        } else {
+            gW = pc.w / pc.xr;
+            gH = pc.h / pc.yr;
+            int image = pc.chromaPlanes == 16 ? 4 : 1; // subsampled at pel 4: the image's pixels 4 apart, rows 4 * 4 wc
+            gStride = image * image * pc.wc;
+            gStep = image;
+            gBase = uint(z - 1) * uint(pc.chromaPlanes) * uint(pc.wc * pc.hc) + uint(pc.padcY * gStride + pc.padcX * gStep);
+        }
+    } else {
+        Level s = levels[pc.level - 1];
+        gBuf = kPyramid;
+        gW = z == 0 ? s.w : s.wc;
+        gH = z == 0 ? s.h : s.hc;
+        gStride = z == 0 ? s.strideY : s.strideC;
+        gBase = uint(z == 0 ? s.offY : z == 1 ? s.offU : s.offV);
+    }
+    Level d = levels[pc.level];
+    int dw = z == 0 ? d.w : d.wc, dh = z == 0 ? d.h : d.hc;
+    int border = z == 0 ? d.borderY : d.borderC, stride = z == 0 ? d.strideY : d.strideC;
+    int per = pc.quad != 0 ? 4 : 1;
+    int xp0 = per * int(gl_GlobalInvocationID.x) - border, yp = int(gl_WorkGroupID.y) - border;
+    if (xp0 >= dw + border || yp >= dh + border)
+        return;
+    int y = clamp(yp, 0, dh - 1);
+    uint row = uint((z == 0 ? d.offY : z == 1 ? d.offU : d.offV) + yp * stride);
+    if (per == 4 && !kFloat && xp0 >= 1 && xp0 + 3 <= dw - 2) {
+        Interior4(xp0, y, dh, row + uint(xp0));
+        return;
+    }
+    for (int i = 0; i < per; ++i) {
+        int xp = xp0 + i;
+        if (xp < dw + border)
+            Pixel(clamp(xp, 0, dw - 1), y, dw, dh, row + uint(xp));
     }
 }

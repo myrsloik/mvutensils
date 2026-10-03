@@ -121,6 +121,7 @@
     <ClCompile Include="..\src\SCDetection.cpp" />
     <ClCompile Include="..\src\Super.cpp" />
     <ClCompile Include="..\src\SuperLayout.cpp" />
+    <ClCompile Include="..\src\VectorConvert.cpp" />
     <ClCompile Include="..\src\VulkanContext.cpp" />
   </ItemGroup>
   <ItemGroup>

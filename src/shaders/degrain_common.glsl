@@ -75,7 +75,7 @@ layout(push_constant) uniform Params {
     int nb;                      // blocks, nbx * nby
     int pixelMax;                // the clip's largest sample value
     float limitF;                // floats: the largest change of a pixel, where limit isn't -1
-    int reserved2;
+    int quad;                    // degrain.comp: four pixels per lane (Main4)
 } pc;
 
 // The grid's luma block size, 8, 16 or 32 (specialization constant 3), the vectors' units per pixel,

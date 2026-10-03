@@ -4,9 +4,9 @@
 Both run the filter on the same clip with the same vectors, each side with its own super made with
 the same settings (mvgpu.Super's planes are mvu.Super's). The vectors:
 
-  mvgpu  mvgpu.Analyse's, on a carrier clip for mvu (mvtest.mvu_vectors).
-  mvu    mvu.Analyse's, on the frames of mvgpu's super (mvtest.gpu_vectors): vectors mvgpu's
-         search wouldn't find, and frames narrower than the 192 pixels mvgpu.Analyse needs.
+  mvgpu  mvgpu.Analyse's, mvu's side through mvgpu.ToMVU.
+  mvu    mvu.Analyse's, mvgpu's side through mvgpu.FromMVU: vectors mvgpu's search wouldn't find,
+         and frames narrower than the 192 pixels mvgpu.Analyse needs.
   const  mvu.Analyse's description with every block of a frame given one vector, a different one for
          each frame and direction, and the SADs of some frames' blocks at and just past the scene
          change limits, so that the scene change fallback runs on some frames and not on frames
@@ -34,7 +34,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import const_vectors, eight_bit, format_clip, gpu_vectors, mvu_vectors, nv12_clip, plane_pair, scene_limits  # noqa: E402
+from mvtest import const_vectors, eight_bit, format_clip, nv12_clip, plane_pair, scene_limits  # noqa: E402
 
 
 def main():
@@ -96,13 +96,13 @@ def main():
     deltas = (args.delta,) if args.filter in ('flow', 'compensate') else (args.delta, -args.delta)  # mvbw, mvfw
     if args.vectors == 'mvgpu':
         gvec = [core.mvgpu.Analyse(gasup, delta=d) for d in deltas]
-        cvec = [mvu_vectors(core, an, clip, args.frames) for an in gvec]
+        cvec = [core.mvgpu.ToMVU(an) for an in gvec]
     else:
         cvec = [core.mvu.Analyse(casup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
         if args.vectors == 'const':
             th1, scd = scene_limits(cvec[0].get_frame(0).props, thscd1, thscd2)
             cvec = [const_vectors(core, an, (args.pad - 1) * args.pel, th1, scd, args.seed * 2 + i) for i, an in enumerate(cvec)]
-        gvec = [gpu_vectors(core, an, gasup) for an in cvec]
+        gvec = [core.mvgpu.FromMVU(an, gasup) for an in cvec]
 
     fk = {k: getattr(args, k) for k in ('thscd1', 'thscd2') if getattr(args, k) is not None}
     if args.filter in ('inter', 'fps'):

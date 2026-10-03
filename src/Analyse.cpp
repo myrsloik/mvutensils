@@ -265,35 +265,41 @@ static const VSFrame *VS_CC coarseGetFrame(int n, int activationReason, void *in
         if (slots.empty())
             return out; // no field of this frame has a reference frame, so nothing reads it
 
-        std::vector<SuperFrames> held;
+        std::vector<const VSFrame *> held;
         VSGPUExecContext *ctx = nullptr;
         VSGPUBuffer *scratch = nullptr;
+        auto release = [&]() {
+            for (const VSFrame *f : held)
+                vsapi->freeFrame(f);
+            held.clear();
+        };
         auto fail = [&](const std::string &message) -> const VSFrame * {
             if (ctx)
                 vkapi->gpuExecAbandon(ctx);
             else if (scratch)
                 vkapi->destroyGPUBuffer(scratch);
-            for (SuperFrames &f : held)
-                f.Free(vsapi);
+            release();
             vsapi->freeFrame(out);
             vsapi->setFilterError(("Analyse: " + message).c_str(), frameCtx);
             return nullptr;
         };
 
-        // The current frame's pyramid, then the references'
-        std::vector<VSVulkanPlaneInfo> pyramids;
+        // The current frame's pyramid, then the references': each its super frame's region
+        struct Pyramid {
+            VkBuffer buffer;
+            VkDeviceSize offset, size;
+        };
+        std::vector<Pyramid> pyramids;
         for (int f = -1; f < static_cast<int>(refs.size()); ++f) {
             const VSFrame *frame = vsapi->getFrameFilter(f < 0 ? n : refs[f], d->node, frameCtx);
-            SuperFrames sf;
-            const bool found = GetSuperFrames(frame, L, d->prefix, sf, vsapi);
-            vsapi->freeFrame(frame);
-            if (!found)
-                return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-            held.push_back(sf);
+            held.push_back(frame);
+            SuperRegions regions;
             VSVulkanPlaneInfo info;
-            if (vkapi->getGPUPlane(sf.pyramid, 0, &info))
-                return fail("the super clip's pyramid isn't GPU resident");
-            pyramids.push_back(info);
+            if (const std::string e = CheckSuperFrame(frame, L, d->prefix, regions, vsapi); !e.empty())
+                return fail(e);
+            if (vkapi->getGPUPlane(frame, 0, &info))
+                return fail("the super clip's frames aren't GPU resident");
+            pyramids.push_back({info.buffer, static_cast<VkDeviceSize>(regions.pyramid), static_cast<VkDeviceSize>(regions.pyramidBytes)});
         }
         VSVulkanPlaneInfo outPlane;
         if (vkapi->getGPUPlane(out, 0, &outPlane))
@@ -310,15 +316,15 @@ static const VSFrame *VS_CC coarseGetFrame(int n, int activationReason, void *in
         if (!ctx)
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
-        for (const SuperFrames &f : held)
-            vkapi->gpuExecReadsFrame(ctx, f.pyramid);
+        for (const VSFrame *f : held)
+            vkapi->gpuExecReadsFrame(ctx, f);
         vkapi->gpuExecWritesPlane(ctx, out, 0);
 
         const VkBuffer constants = d->constantsInfo.buffer, work = scratchInfo.buffer;
         const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
         Recorder rec(*d->vc, cmd, constants, Layout::Coarse);
         const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
-        rec.Bind(kCurPyramid, pyramids[0].buffer);
+        rec.Bind(kCurPyramid, pyramids[0].buffer, pyramids[0].offset, pyramids[0].size);
         rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
         rec.Bind(kLevelLambda, constants, d->levelLambda.offset, d->levelLambda.size);
         rec.Bind(kLevelVec, work, d->levelVec.offset, d->levelVec.size);
@@ -332,7 +338,7 @@ static const VSFrame *VS_CC coarseGetFrame(int n, int activationReason, void *in
             for (uint32_t z = 0; z < count; ++z) {
                 const int nref = n + d->deltas[slots[start + z]];
                 const size_t r = std::find(refs.begin(), refs.end(), nref) - refs.begin();
-                rec.Bind(kRefPyramid, pyramids[1 + r].buffer, 0, VK_WHOLE_SIZE, static_cast<int>(z));
+                rec.Bind(kRefPyramid, pyramids[1 + r].buffer, pyramids[1 + r].offset, pyramids[1 + r].size, static_cast<int>(z));
             }
             // The batch before has copied out what this one overwrites
             if (start > 0)
@@ -357,8 +363,7 @@ static const VSFrame *VS_CC coarseGetFrame(int n, int activationReason, void *in
             return fail(err);
         if (d->profile)
             d->profile->Finish(*d->vc, d->pool, signaled, queries);
-        for (SuperFrames &f : held)
-            f.Free(vsapi);
+        release();
         return out;
     }
 
@@ -573,9 +578,21 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
 
         if (!hasRef) {
-            VSFrame *dst = vsapi->copyFrame(src, core);
-            ExportAnalysis(dst, L, d->deltaFrame, d->chroma, nullptr, d->prefix, vsapi);
+            // No vectors: a frame of records that don't count, with the description. The super frame
+            // is checked all the same, as mvu checks it.
+            SuperRegions regions;
+            if (const std::string e = CheckSuperFrame(src, L, d->prefix, regions, vsapi); !e.empty()) {
+                vsapi->freeFrame(src);
+                vsapi->setFilterError(("Analyse: " + e).c_str(), frameCtx);
+                return nullptr;
+            }
+            VSFrame *dst = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
             vsapi->freeFrame(src);
+            if (!dst) {
+                vsapi->setFilterError("Analyse: failed to allocate the vector frame", frameCtx);
+                return nullptr;
+            }
+            ExportAnalysis(dst, L, d->deltaFrame, d->chroma, false, d->prefix, vsapi);
             return dst;
         }
 
@@ -606,13 +623,11 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
 
         const VSFrame *ref = hold(vsapi->getFrameFilter(nref, d->node, frameCtx));
         const VSFrame *coarse = hold(vsapi->getFrameFilter(n, d->coarseNode, frameCtx));
-        SuperFrames cur, rf;
-        if (!GetSuperFrames(src, L, d->prefix, cur, vsapi) || !GetSuperFrames(ref, L, d->prefix, rf, vsapi)) {
-            cur.Free(vsapi);
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        }
-        for (const VSFrame *f : {cur.luma, cur.chroma, cur.pyramid, rf.luma, rf.chroma, rf.pyramid})
-            hold(f);
+        SuperRegions cur, rf;
+        if (const std::string e = CheckSuperFrame(src, L, d->prefix, cur, vsapi); !e.empty())
+            return fail(e);
+        if (const std::string e = CheckSuperFrame(ref, L, d->prefix, rf, vsapi); !e.empty())
+            return fail(e);
 
         // The fields the seeds chain and invert, refined by the other nodes AnalyseMany made
         const VSFrame *stepVec = nullptr, *restVec = nullptr, *invVec = nullptr;
@@ -623,7 +638,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (d->invNode)
             invVec = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(nref, d->invNode, frameCtx)), d->prefix, vsapi));
 
-        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, nullptr, core);
+        // The output: the records, with the super frame's properties
+        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
         if (!vectors)
             return fail("failed to allocate the vector frame");
         const ptrdiff_t recBytes = vsapi->getStride(vectors, 0);
@@ -634,21 +650,20 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         };
         const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0);
 
-        // A Gray super has no chroma frame
+        // A Gray super has no chroma
         const bool chroma = L.format.chroma;
-        const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = chroma ? vsapi->getStride(cur.chroma, 0) : 0;
+        const ptrdiff_t lumaStride = cur.lumaStride, chromaStride = cur.chromaStride;
         const ptrdiff_t bytes = L.format.Bytes();
-        if (lumaStride != vsapi->getStride(rf.luma, 0) || (chroma && chromaStride != vsapi->getStride(rf.chroma, 0)) || lumaStride % (4 * bytes) ||
-            chromaStride % (4 * bytes))
+        if (lumaStride != rf.lumaStride || chromaStride != rf.chromaStride || lumaStride % (4 * bytes) || chromaStride % (4 * bytes))
             return fail("the super frames' storage strides differ");
         const ptrdiff_t coarseRowBytes = vsapi->getStride(coarse, 0);
         if (coarseRowBytes % 8)
             return fail("the coarse search's rows don't start on whole vectors");
 
         // The buffers every binding names
-        VSVulkanPlaneInfo curLuma, curChroma = {}, refLuma, refChroma = {}, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
-        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || (chroma && vkapi->getGPUPlane(cur.chroma, 0, &curChroma)) || vkapi->getGPUPlane(rf.luma, 0, &refLuma) ||
-            (chroma && vkapi->getGPUPlane(rf.chroma, 0, &refChroma)) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) || vkapi->getGPUPlane(vectors, 0, &outRec) ||
+        VSVulkanPlaneInfo curPlane, refPlane, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
+        if (vkapi->getGPUPlane(src, 0, &curPlane) || vkapi->getGPUPlane(ref, 0, &refPlane) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) ||
+            vkapi->getGPUPlane(vectors, 0, &outRec) ||
             ((flags & 1) && (vkapi->getGPUPlane(stepVec, 0, &stepRec) || vkapi->getGPUPlane(restVec, 0, &restRec))) ||
             ((flags & 2) && vkapi->getGPUPlane(invVec, 0, &invRec)))
             return fail("a frame the analysis reads isn't GPU resident");
@@ -665,9 +680,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (!ctx)
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
-        for (const VSFrame *f : {cur.luma, cur.chroma, rf.luma, rf.chroma, coarse})
-            if (f)
-                vkapi->gpuExecReadsFrame(ctx, f);
+        for (const VSFrame *f : {src, ref, coarse})
+            vkapi->gpuExecReadsFrame(ctx, f);
         if (flags & 1) {
             vkapi->gpuExecReadsFrame(ctx, stepVec);
             vkapi->gpuExecReadsFrame(ctx, restVec);
@@ -680,10 +694,12 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
         Recorder rec(*d->vc, cmd, constants);
         const VkQueryPool queries = d->profile ? d->profile->Begin(*d->vc, cmd) : VK_NULL_HANDLE;
-        rec.Bind(kCurLuma, curLuma.buffer);
-        rec.Bind(kRefLuma, refLuma.buffer);
-        rec.Bind(kCurChroma, chroma ? curChroma.buffer : constants); // never read without chroma
-        rec.Bind(kRefChroma, chroma ? refChroma.buffer : constants);
+        rec.Bind(kCurLuma, curPlane.buffer, cur.luma, cur.lumaBytes);
+        rec.Bind(kRefLuma, refPlane.buffer, rf.luma, rf.lumaBytes);
+        if (chroma) { // never read without
+            rec.Bind(kCurChroma, curPlane.buffer, cur.chroma, cur.chromaBytes);
+            rec.Bind(kRefChroma, refPlane.buffer, rf.chroma, rf.chromaBytes);
+        }
         rec.Bind(kCoarse, coarsePlane.buffer);
         rec.Bind(kLambda, constants, d->lambda.offset, d->lambda.size);
         rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
@@ -722,8 +738,9 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (d->profile)
             d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
-        VSFrame *dst = vsapi->copyFrame(src, core);
-        ExportAnalysis(dst, L, d->deltaFrame, d->chroma, vectors, d->prefix, vsapi);
+        ExportAnalysis(vectors, L, d->deltaFrame, d->chroma, true, d->prefix, vsapi);
+        VSFrame *dst = vectors;
+        vectors = nullptr; // returned, not released
         release();
         return dst;
     }
@@ -1044,6 +1061,10 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
 
     if (!vsapi->queryVideoFormat(&d->gray32, cfGray, stInteger, 32, 0, 0, core))
         throw std::runtime_error("failed to query the Gray32 format");
+    // The field's clip: its vectors' records
+    d->vi.format = d->gray32;
+    d->vi.width = 4 * L.nbx;
+    d->vi.height = L.nby;
 
     if (StageProfiler::Requested())
         d->profile = std::make_unique<StageProfiler>("field " + std::to_string(delta) + " (pel " + std::to_string(pel) + ")",

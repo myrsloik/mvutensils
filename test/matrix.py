@@ -25,6 +25,13 @@
            check_recalculate.py: mvgpu.Recalculate against mvu.Recalculate over every search type,
            old vectors of other grids, mvu's and random old vectors, formats and bit depths, pels
            and the arguments; float clips at pel 1 against mvu's of the clip quantized to 16 bits
+  convert  check_convert.py: mvgpu.ToMVU and mvgpu.FromMVU both ways, round trips included, over
+           formats and bit depths, grids, pels, radii, both Recalculates' vectors and mvu's prefix,
+           and their errors
+  robustness
+           check_robustness.py: the clips both plugins refuse, or treat alike: paddings the
+           subsampling doesn't divide, inputs shorter than the clip, spliced supers and vector clips,
+           vector clips of different bit depths together, Recalculate with a short super
   smoke    a quick cross section of all of them (a few minutes, where all of them take hours)
 
 --clips is the directory of test clips, NAME/noisy.nv12 for the clips in CLIPS below (raw 8-bit
@@ -65,10 +72,13 @@ def super_cases():
         ['--blksize', '32', '16', '--overlap', '8', '4', '--pad', '8', '12', '--format', 'YUV444P8'],
         ['--blksize', '16', '2', '--overlap', '4', '0', '--crop', '1918x1076', '--pel', '4'],
         ['--blksize', '128', '64', '--overlap', '32', '16', '--format', 'YUV420P10'],
-        ['--blksize', '64', '32', '--overlap', '0', '--pad', '7', '9', '--format', 'YUV422P8'],
+        ['--blksize', '64', '32', '--overlap', '0', '--pad', '7', '9', '--format', 'YUV422P8'],  # refused: odd horizontal padding at 4:2:2
+        ['--blksize', '64', '32', '--overlap', '0', '--pad', '8', '9', '--format', 'YUV422P8'],
+        ['--blksize', '32', '16', '--overlap', '0', '--pad', '7', '8', '--format', 'YUV440P8'],
         ['--blksize', '16', '--overlap', '8', '5', '--format', 'YUV422P8', '--crop', '1906x1070'],
         ['--blksize', '8', '--overlap', '2', '4', '--format', 'YUV440P8', '--pel', '4', '--crop', '1910x1074'],
-        ['--pel', '4', '--blksize', '4', '--overlap', '2', '--crop', '1914x1074'], ['--pel', '4', '--format', 'YUV420P16', '--pad', '7', '9'],
+        ['--pel', '4', '--blksize', '4', '--overlap', '2', '--crop', '1914x1074'], ['--pel', '4', '--format', 'YUV420P16', '--pad', '7', '9'],  # refused
+        ['--pel', '4', '--format', 'YUV444P16', '--pad', '7', '9'],
         ['--blksize', '32', '--overlap', '16', '--pel', '4', '--format', 'YUV444P8', '--crop', '1906x1070'],
         ['--onelevel', '--format', 'YUV444P16'], ['--pel', '4', '--onelevel', '--format', 'YUV422P8'],
         ['--crop', '180x100'], ['--crop', '180x100', '--format', 'GRAYS', '--pel', '4'], ['--pel', '4', '--crop', '180x100', '--format', 'YUV420P10'],
@@ -599,6 +609,28 @@ def recalculate_cases():
     ]
 
 
+def convert_cases():
+    ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
+    return [
+        ('16/8 pel 2', ff, ['--frames', '8']),
+        ('recalculated 8/4', ff, ['--frames', '8', '--recalculate', '8', '4']),
+        ('444 32/16 pel 4', ob, ['--frames', '8', '--format', 'YUV444P8', '--blksize', '32', '--overlap', '16', '--pel', '4']),
+        ('YUV420P16 pel 4 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV420P16', '--pel', '4', '--analyse8']),
+        ('YUV444P10 16/6 pel 4 1914x1074', ff, ['--frames', '8', '--format', 'YUV444P10', '--overlap', '6', '--pel', '4', '--crop', '1914x1074']),
+        ('YUV420PS pel 1 recalculated 32/16', ff, ['--frames', '8', '--format', 'YUV420PS', '--pel', '1', '--recalculate', '32', '16']),
+        ('GRAY8 8/4 recalculated 16/8', ob, ['--frames', '8', '--format', 'GRAY8', '--blksize', '8', '--overlap', '4', '--recalculate', '16', '8']),
+        ('GRAY16 radius 3', ff, ['--frames', '8', '--format', 'GRAY16', '--radius', '3']),
+        ('mvuprefix Other', ff, ['--frames', '8', '--mvuprefix', 'Other']),
+        ('4K radius 1', k4, ['--frames', '4', '--radius', '1']),
+    ]
+
+
+def robustness_cases():
+    return [
+        ('1080p', 'football_fast_s3', ['--frames', '10']),
+    ]
+
+
 # The smoke suite: these cases of the others
 SMOKE = {
     'super': ['--pel 4', '--format YUV420PS', '--pel 1 --format YUV444P16', '--pelclip'],
@@ -609,6 +641,8 @@ SMOKE = {
     'masks': ['16/8 pel 2', 'random vectors delta -1', 'YUV420PS'],
     'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4'],
     'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1'],
+    'convert': ['16/8 pel 2', 'YUV420P16 pel 4 analysed on 8 bits'],
+    'robustness': ['1080p'],
 }
 
 
@@ -625,7 +659,8 @@ def smoke_cases():
 
 SUITES = {'super': ('check_super.py', super_cases), 'analyse': ('check_reference.py', analyse_cases), 'degrain': ('check_degrain.py', degrain_cases),
           'flow': ('check_flow.py', flow_cases), 'masks': ('check_masks.py', masks_cases), 'motion': ('check_flow.py', motion_cases),
-          'recalculate': ('check_recalculate.py', recalculate_cases), 'smoke': (None, smoke_cases)}
+          'recalculate': ('check_recalculate.py', recalculate_cases), 'convert': ('check_convert.py', convert_cases),
+          'robustness': ('check_robustness.py', robustness_cases), 'smoke': (None, smoke_cases)}
 
 
 def main():

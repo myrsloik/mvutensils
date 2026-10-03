@@ -32,6 +32,7 @@ struct FlowFetchData {
     VSNode *node = nullptr;  // the clip
     VSNode *super = nullptr;
     VSNode *vectors[2] = {}; // Flow: the vectors; FlowBlur: mvfw (delta -off) and mvbw (delta off)
+    VectorInfo infos[2];     // their first frames' descriptions, which their frames with vectors must have
     const VSVideoInfo *vi = nullptr;
     SuperLayout layout;
     std::string prefix, name;
@@ -124,7 +125,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         const VSFrame *vec[2] = {};
         bool have = load;
         for (int i = 0; i < vectorClips && have; ++i) {
-            vec[i] = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(vecFrame[i], d->vectors[i], frameCtx)), d->prefix, vsapi));
+            std::string error;
+            vec[i] = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(vecFrame[i], d->vectors[i], frameCtx)), d->infos[i], d->prefix, error, vsapi));
+            if (!error.empty())
+                return fail(error);
             have = vec[i] != nullptr;
         }
         const VSFrame *src = hold(vsapi->getFrameFilter(n, d->node, frameCtx));
@@ -135,11 +139,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             return f;
         }
 
-        SuperFrames sup;
-        if (!GetSuperFrames(hold(vsapi->getFrameFilter(superFrame, d->super, frameCtx)), L, d->prefix, sup, vsapi))
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        for (const VSFrame *f : {sup.luma, sup.chroma, sup.pyramid})
-            hold(f);
+        const VSFrame *sup = hold(vsapi->getFrameFilter(superFrame, d->super, frameCtx));
+        SuperRegions regions;
+        if (const std::string e = CheckSuperFrame(sup, L, d->prefix, regions, vsapi); !e.empty())
+            return fail(e);
 
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
@@ -147,13 +150,13 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
 
         const int numPlanes = d->vi->format.numPlanes;
         const bool chroma = L.format.chroma;
-        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlanes[2] = {}, vecPlanes[2] = {};
+        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlane = {}, vecPlanes[2] = {};
         for (int p = 0; p < numPlanes; ++p)
             if (vkapi->getGPUPlane(src, p, &clipPlanes[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the clip's frames aren't GPU resident");
-        if (vkapi->getGPUPlane(sup.luma, 0, &superPlanes[0]) || (chroma && vkapi->getGPUPlane(sup.chroma, 0, &superPlanes[1])))
-            return fail("the super's planes aren't GPU resident");
-        const ptrdiff_t lumaStride = vsapi->getStride(sup.luma, 0), chromaStride = chroma ? vsapi->getStride(sup.chroma, 0) : 0;
+        if (vkapi->getGPUPlane(sup, 0, &superPlane))
+            return fail("the super's frames aren't GPU resident");
+        const ptrdiff_t lumaStride = regions.lumaStride, chromaStride = regions.chromaStride;
         ptrdiff_t recBytes = 0;
         for (int i = 0; i < vectorClips; ++i) {
             if (vkapi->getGPUPlane(vec[i], 0, &vecPlanes[i]))
@@ -176,9 +179,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
         vkapi->gpuExecReadsFrame(ctx, src);
-        for (const VSFrame *f : {sup.luma, sup.chroma})
-            if (f)
-                vkapi->gpuExecReadsFrame(ctx, f);
+        vkapi->gpuExecReadsFrame(ctx, sup);
         for (int i = 0; i < vectorClips; ++i)
             vkapi->gpuExecReadsFrame(ctx, vec[i]);
         for (int p = 0; p < numPlanes; ++p)
@@ -219,8 +220,9 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         // Flow reads the reference frame's super as ref, FlowBlur its own frame's as src
         const int lumaBinding = d->blur ? kFlSrcLuma : kFlRefLuma, chromaBinding = d->blur ? kFlSrcChroma : kFlRefChroma;
         rec.Bind(kFlTaps, d->tapsInfo.buffer);
-        rec.Bind(lumaBinding, superPlanes[0].buffer);
-        rec.Bind(chromaBinding, chroma ? superPlanes[1].buffer : d->tapsInfo.buffer);
+        rec.Bind(lumaBinding, superPlane.buffer, regions.luma, regions.lumaBytes);
+        if (chroma)
+            rec.Bind(chromaBinding, superPlane.buffer, regions.chroma, regions.chromaBytes);
         rec.Bind(kFlVecF, vecPlanes[0].buffer);
         rec.Bind(kFlVecB, d->blur ? vecPlanes[1].buffer : d->tapsInfo.buffer);
         rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
@@ -315,14 +317,17 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         } else {
             d->vectors[0] = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         }
+        CheckClipLength(d->super, "super", d->vi->numFrames, "clip", vsapi);
+        for (int i = 0; i < (d->blur ? 2 : 1); ++i)
+            CheckClipLength(d->vectors[i], "vectors", d->vi->numFrames, "clip", vsapi);
 
         // The vectors: mvgpu.Analyse's of a super with the same level 0 as this one but for the bit
         // depth (mvu's IsCompatibleWithAnalysis); FlowBlur's both on one grid with opposite deltas. The
         // grid is theirs, as in mvu; the super only supplies the planes.
         VectorInfo info[2];
         for (int i = 0; i < (d->blur ? 2 : 1); ++i) {
-            const VectorInfo &v = info[i] = ReadVectorInfo(d->vectors[i], d->prefix, vsapi);
-            const SuperLayout analysed = ImportSuperLayout(d->vectors[i], d->prefix, vsapi);
+            const VectorInfo &v = info[i] = d->infos[i] = ReadVectorInfo(d->vectors[i], d->prefix, vsapi);
+            const SuperLayout analysed = ImportAnalysedLayout(d->vectors[i], d->prefix, vsapi);
             if (i == 0 && (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
                            v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
                 throw std::runtime_error("wrong source or super clip frame size");
@@ -332,10 +337,11 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         }
         const VectorInfo &v = info[0];
         if (d->blur) {
-            const VectorInfo &bw = info[1];
-            if (v.width != bw.width || v.height != bw.height || v.realWidth != bw.realWidth || v.realHeight != bw.realHeight || v.blkX != bw.blkX ||
-                v.blkY != bw.blkY || v.overlapX != bw.overlapX || v.overlapY != bw.overlapY || v.nbx != bw.nbx || v.nby != bw.nby || bw.delta != -v.delta ||
-                v.delta > 0 || bw.delta < 0)
+            // One analysis but for the delta (mvu's IsCompatible)
+            VectorInfo bw = info[1];
+            const int bwDelta = bw.delta;
+            bw.delta = v.delta;
+            if (!SameAnalysis(bw, v) || bwDelta != -v.delta || v.delta > 0 || bwDelta < 0)
                 throw std::runtime_error("mvfw and mvbw must be compatible with each other and have opposite sign delta");
         }
         d->delta = v.delta;

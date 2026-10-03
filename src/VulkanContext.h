@@ -115,7 +115,7 @@ struct SuperParams {
     int32_t lumaPlanes, chromaPlanes, xr, yr;
     int32_t planes, step, sharp, pixelMax;
     int32_t srcStrideY, srcStrideC, pelStrideY, pelStrideC;
-    int32_t level, rfilter, pel, reserved0;
+    int32_t level, rfilter, pel, quad;
 };
 static_assert(sizeof(SuperParams) <= 112, "super_common.glsl's Params must fit the Main layout's push constants");
 
@@ -130,7 +130,7 @@ struct DegrainParams {
     int32_t limit, winOff, thOff, uwOff;
     int32_t nb, pixelMax;
     float limitF;
-    int32_t reserved2;
+    int32_t quad;
 };
 static_assert(sizeof(DegrainParams) == 112, "degrain_common.glsl's Params is 28 ints");
 

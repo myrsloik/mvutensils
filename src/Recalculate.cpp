@@ -27,19 +27,21 @@
 struct RecalcData {
     VSNode *super = nullptr;
     VSNode *vectors = nullptr;
-    const VSVideoInfo *vi = nullptr;
+    const VSVideoInfo *vi = nullptr; // the super clip's
+    VSVideoInfo outVi = {};          // the output's: the vectors' records
     SuperLayout layout;
     std::string prefix;
     int delta = 0;
     bool chroma = true;
     int nbxOld = 0, nbyOld = 0;
+    VectorInfo info;        // the old vectors' first frame's description, which every frame with vectors must have
     RecalcParams base = {}; // the push constants of every frame, but for the records' strides
     VSVideoFormat gray32 = {};
 
     std::shared_ptr<VulkanContext> vc;
     VSGPUExecPool *pool = nullptr;
     VkPipeline search = VK_NULL_HANDLE;
-    VSGPUBuffer *zeros = nullptr; // the old vectors where a frame has none, all zero; also bound where a Gray super has no chroma
+    VSGPUBuffer *zeros = nullptr; // bound where a Gray super has no chroma
     VSVulkanBufferInfo zerosInfo = {};
     std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
@@ -62,19 +64,27 @@ struct RecalcData {
 
 // The analysis description mvu.Recalculate attaches: the super's, with the vectors' delta, and one
 // level, the recalculated one
-static void ExportRecalculated(VSFrame *dst, const RecalcData *d, const VSFrame *vectors, const VSAPI *vsapi) {
-    ExportAnalysis(dst, d->layout, d->delta, d->chroma, vectors, d->prefix, vsapi);
+static void ExportRecalculated(VSFrame *dst, const RecalcData *d, bool hasVectors, const VSAPI *vsapi) {
+    ExportAnalysis(dst, d->layout, d->delta, d->chroma, hasVectors, d->prefix, vsapi);
     vsapi->mapSetInt(vsapi->getFramePropertiesRW(dst), (d->prefix + "AnalysisLevels").c_str(), 1, maReplace);
 }
 
 static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
     RecalcData *d = reinterpret_cast<RecalcData *>(instanceData);
-    const int nref = std::clamp(n + d->delta, 0, d->vi->numFrames - 1);
+    // As in mvu, a frame whose reference frame lies outside the super clip gets no vectors, also when
+    // the vector clip, which may be longer, has some for it: they belong to a reference this super
+    // doesn't have
+    const int nref = n + d->delta;
+    const bool hasRef = nref >= 0 && nref < d->vi->numFrames;
 
     if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->vectors, frameCtx);
-        vsapi->requestFrameFilter(std::min(n, nref), d->super, frameCtx);
-        vsapi->requestFrameFilter(std::max(n, nref), d->super, frameCtx);
+        if (hasRef) {
+            vsapi->requestFrameFilter(n, d->vectors, frameCtx);
+            vsapi->requestFrameFilter(std::min(n, nref), d->super, frameCtx);
+            vsapi->requestFrameFilter(std::max(n, nref), d->super, frameCtx);
+        } else {
+            vsapi->requestFrameFilter(n, d->super, frameCtx);
+        }
     } else if (activationReason == arAllFramesReady) {
         const VulkanContext &vc = *d->vc;
         const VSVULKANAPI *vkapi = vc.vkapi;
@@ -82,7 +92,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
 
         // Everything this frame holds a reference to, released on every way out
         std::vector<const VSFrame *> held;
-        VSFrame *dst = nullptr, *vectors = nullptr;
+        VSFrame *vectors = nullptr;
         VSGPUExecContext *ctx = nullptr;
         auto release = [&]() {
             for (const VSFrame *f : held)
@@ -94,7 +104,6 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
                 vkapi->gpuExecAbandon(ctx);
             release();
             vsapi->freeFrame(vectors);
-            vsapi->freeFrame(dst);
             vsapi->setFilterError((std::string("Recalculate: ") + message).c_str(), frameCtx);
             return nullptr;
         };
@@ -104,47 +113,52 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
             return f;
         };
 
-        // A frame without old vectors (its reference frame outside the clip) is recalculated from zero
-        // vectors against the reference frame clamped to the clip, as mvu does it: its early exit for
-        // them never runs, the analysis it reads them into having zero vectors by then
         const VSFrame *src = hold(vsapi->getFrameFilter(n, d->super, frameCtx));
-        const VSFrame *old = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->prefix, vsapi));
-        dst = vsapi->copyFrame(src, core);
+        SuperRegions cur, rf;
+        if (const std::string e = CheckSuperFrame(src, L, d->prefix, cur, vsapi); !e.empty())
+            return fail(e);
+        std::string error;
+        const VSFrame *old = hasRef ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->info, d->prefix, error, vsapi)) : nullptr;
+        if (!error.empty())
+            return fail(error);
+        if (!old) {
+            // A frame without old vectors or without a reference frame stays without vectors, as in
+            // mvu: records that don't count, with the new grid's description
+            VSFrame *out = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+            if (!out)
+                return fail("failed to allocate the vector frame");
+            ExportRecalculated(out, d, false, vsapi);
+            release();
+            return out;
+        }
+        const VSFrame *refSuper = hold(vsapi->getFrameFilter(nref, d->super, frameCtx));
+        if (const std::string e = CheckSuperFrame(refSuper, L, d->prefix, rf, vsapi); !e.empty())
+            return fail(e);
 
-        SuperFrames cur, rf;
-        if (!GetSuperFrames(src, L, d->prefix, cur, vsapi))
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        for (const VSFrame *f : {cur.luma, cur.chroma, cur.pyramid})
-            hold(f);
-        if (!GetSuperFrames(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), L, d->prefix, rf, vsapi))
-            return fail("the super clip's frames lack their GPU planes; it must come from mvgpu.Super with the same prefix");
-        for (const VSFrame *f : {rf.luma, rf.chroma, rf.pyramid})
-            hold(f);
-
-        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, nullptr, core);
+        // The output: the records, with the super frame's properties
+        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
         if (!vectors)
             return fail("failed to allocate the vector frame");
-        const ptrdiff_t recBytes = vsapi->getStride(vectors, 0), oldBytes = old ? vsapi->getStride(old, 0) : 16 * d->nbxOld;
-        if (recBytes % 16 || oldBytes % 16 || (old && (vsapi->getFrameWidth(old, 0) != 4 * d->nbxOld || vsapi->getFrameHeight(old, 0) != d->nbyOld)))
+        const ptrdiff_t recBytes = vsapi->getStride(vectors, 0), oldBytes = vsapi->getStride(old, 0);
+        if (recBytes % 16 || oldBytes % 16 || vsapi->getFrameWidth(old, 0) != 4 * d->nbxOld || vsapi->getFrameHeight(old, 0) != d->nbyOld)
             return fail("a vector frame doesn't match its grid");
 
         const bool chroma = L.format.chroma;
         const ptrdiff_t bytes = L.format.Bytes();
-        const ptrdiff_t lumaStride = vsapi->getStride(cur.luma, 0), chromaStride = chroma ? vsapi->getStride(cur.chroma, 0) : 0;
-        if (lumaStride != vsapi->getStride(rf.luma, 0) || (chroma && chromaStride != vsapi->getStride(rf.chroma, 0)))
+        const ptrdiff_t lumaStride = cur.lumaStride, chromaStride = cur.chromaStride;
+        if (lumaStride != rf.lumaStride || chromaStride != rf.chromaStride)
             return fail("the super frames' storage strides differ");
-        VSVulkanPlaneInfo curLuma, curChroma = {}, refLuma, refChroma = {}, oldRec = {}, outRec;
-        if (vkapi->getGPUPlane(cur.luma, 0, &curLuma) || (chroma && vkapi->getGPUPlane(cur.chroma, 0, &curChroma)) || vkapi->getGPUPlane(rf.luma, 0, &refLuma) ||
-            (chroma && vkapi->getGPUPlane(rf.chroma, 0, &refChroma)) || (old && vkapi->getGPUPlane(old, 0, &oldRec)) || vkapi->getGPUPlane(vectors, 0, &outRec))
+        VSVulkanPlaneInfo curPlane, refPlane, oldRec, outRec;
+        if (vkapi->getGPUPlane(src, 0, &curPlane) || vkapi->getGPUPlane(refSuper, 0, &refPlane) || vkapi->getGPUPlane(old, 0, &oldRec) ||
+            vkapi->getGPUPlane(vectors, 0, &outRec))
             return fail("a frame the search reads isn't GPU resident");
 
         char err[1024] = {};
         ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
         if (!ctx)
             return fail(err);
-        for (const VSFrame *f : {cur.luma, cur.chroma, rf.luma, rf.chroma, old})
-            if (f)
-                vkapi->gpuExecReadsFrame(ctx, f);
+        for (const VSFrame *f : {src, refSuper, old})
+            vkapi->gpuExecReadsFrame(ctx, f);
         vkapi->gpuExecWritesPlane(ctx, vectors, 0);
 
         const VkCommandBuffer cmd = vkapi->gpuExecCommandBuffer(ctx);
@@ -155,11 +169,13 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         pc.recStrideOld = static_cast<int32_t>(oldBytes / 16);
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.wc = static_cast<int32_t>(chromaStride / bytes);
-        rec.Bind(0, curLuma.buffer);
-        rec.Bind(1, chroma ? curChroma.buffer : d->zerosInfo.buffer);
-        rec.Bind(2, refLuma.buffer);
-        rec.Bind(3, chroma ? refChroma.buffer : d->zerosInfo.buffer);
-        rec.Bind(4, old ? oldRec.buffer : d->zerosInfo.buffer);
+        rec.Bind(0, curPlane.buffer, cur.luma, cur.lumaBytes);
+        rec.Bind(2, refPlane.buffer, rf.luma, rf.lumaBytes);
+        if (chroma) {
+            rec.Bind(1, curPlane.buffer, cur.chroma, cur.chromaBytes);
+            rec.Bind(3, refPlane.buffer, rf.chroma, rf.chromaBytes);
+        }
+        rec.Bind(4, oldRec.buffer);
         rec.Bind(5, outRec.buffer);
         rec.Dispatch(d->search, pc, static_cast<uint32_t>(L.nbx), static_cast<uint32_t>(L.nby));
         if (d->profile)
@@ -173,10 +189,11 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         if (d->profile)
             d->profile->Finish(vc, d->pool, signaled, queries);
 
-        ExportRecalculated(dst, d, vectors, vsapi);
-        vsapi->freeFrame(vectors);
+        ExportRecalculated(vectors, d, true, vsapi);
+        VSFrame *out = vectors;
+        vectors = nullptr; // returned, not released
         release();
-        return dst;
+        return out;
     }
 
     return nullptr;
@@ -246,7 +263,8 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
             throw std::runtime_error("fields isn't implemented yet");
 
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
-        const VectorInfo v = ReadVectorInfo(d->vectors, d->prefix, vsapi);
+        CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "super", vsapi); // the output is as long as super
+        const VectorInfo v = d->info = ReadVectorInfo(d->vectors, d->prefix, vsapi);
         if (v.bits != L.format.bits)
             throw std::runtime_error("Incompatible frame format for motion vector recalculation, bitdepth must match");
         if (v.pel != L.pel)
@@ -293,6 +311,10 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
 
         if (!vsapi->queryVideoFormat(&d->gray32, cfGray, stInteger, 32, 0, 0, core))
             throw std::runtime_error("failed to query the Gray32 format");
+        d->outVi = *d->vi;
+        d->outVi.format = d->gray32;
+        d->outVi.width = 4 * L.nbx;
+        d->outVi.height = L.nby;
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
@@ -305,7 +327,7 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
         if (!d->pool)
             throw std::runtime_error(errMsg);
-        const std::vector<int32_t> zeros(std::max<size_t>(64, static_cast<size_t>(4) * v.nbx * v.nby), 0);
+        const std::vector<int32_t> zeros(64, 0);
         d->zeros = vc.Upload(core, d->pool, zeros.data(), zeros.size() * sizeof(int32_t), d->zerosInfo);
         if (StageProfiler::Requested())
             d->profile = std::make_unique<StageProfiler>("Recalculate (pel " + std::to_string(L.pel) + ")", std::vector<std::string>{"search"});
@@ -318,7 +340,7 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         {d->super, rpGeneral},
         {d->vectors, rpStrictSpatial},
     };
-    vsapi->createVideoFilterEx(out, "Recalculate", d->vi, recalculateGetFrame, filterFree<RecalcData>, fmParallel, ffGPUOutput, deps, ARRAY_SIZE(deps), d.get(), core);
+    vsapi->createVideoFilterEx(out, "Recalculate", &d->outVi, recalculateGetFrame, filterFree<RecalcData>, fmParallel, ffGPUOutput, deps, ARRAY_SIZE(deps), d.get(), core);
     d.release();
 }
 

@@ -3,7 +3,9 @@
 
 Both make the super of the same clip with the same arguments. Every sub-pel plane of level 0, padding
 included, is compared sample for sample (float ones bit for bit): mvu.Super's level-0 frames
-(MVUtensilsSuperLevel0, the sub-pel planes stacked) against mvgpu.Super's storage frames (SuperLayout.h).
+(MVUtensilsSuperLevel0, the sub-pel planes stacked) against mvgpu.Super's frames, the storage
+(SuperLayout.h): luma in the frame's rows, chroma and the coarse levels at the offsets the frame's
+properties give.
 At pel 4, where mvgpu keeps only luma's half-pel planes (and 4:4:4 chroma's), its quarter planes are
 computed from them the way the kernels read them and compared with mvu's, and subsampled chroma's
 sixteen are read out of its quarter-pel image (every fourth sample of every fourth row from the phase
@@ -18,7 +20,9 @@ SuperLayout.h's level table).
 
 --format converts the 8-bit 4:2:0 source first (resize.Bicubic); --pelclip gives both a pelclip, the clip
 upscaled pel times by Spline36. mvgpu.Super refuses a pelclip at pel 4 (its luma keeps only the half-pel
-planes), which --pelclip --pel 4 checks instead.
+planes), which --pelclip --pel 4 checks instead. Both refuse a padding the chroma subsampling doesn't
+divide (an odd horizontal one at 4:2:0 and 4:2:2, an odd vertical one at 4:2:0 and 4:4:0), which such a
+--pad checks instead.
 """
 import argparse
 import sys
@@ -181,7 +185,7 @@ def level_table(w, h, chroma, xr, yr, pad):
 
 
 def flat(frame, dtype):
-    """A storage frame's samples as the flat buffer the kernels index"""
+    """A storage frame's samples as the flat buffer the kernels index, and its stride in samples"""
     a = np.asarray(frame[0])
     stride = frame.get_stride(0) // a.itemsize
     return np.lib.stride_tricks.as_strided(a, shape=(a.shape[0] * stride,), strides=(a.itemsize,)).view(dtype), stride
@@ -203,7 +207,7 @@ def main():
     ap.add_argument('--pelclip', action='store_true')
     ap.add_argument('--onelevel', action='store_true')
     ap.add_argument('--plugin', help='the MVGPUtensils library to load, unless it autoloads')
-    ap.add_argument('--mvu', default=r'C:\Libraries\mvuplus\msvc\x64\Release\MVUtensils.dll', help='the MVUtensils library, unless it autoloads')
+    ap.add_argument('--mvu', default=r'C:\Libraries\mvutensils\msvc\x64\Release\MVUtensils.dll', help='the MVUtensils library, unless it autoloads')
     args = ap.parse_args()
 
     core = vs.core
@@ -230,6 +234,16 @@ def main():
 
     kw = dict(blksize=args.blksize, overlap=args.overlap, pad=args.pad, pel=args.pel, sharp=args.sharp, rfilter=args.rfilter, onelevel=args.onelevel)
     gclip = core.std.GPUUpload(clip)
+    if args.pad[0] % xr or args.pad[-1] % yr:
+        refused = []
+        for name, make in (('mvu', lambda: core.mvu.Super(clip, **kw)), ('mvgpu', lambda: core.mvgpu.Super(gclip, **kw))):
+            try:
+                make()
+            except vs.Error as e:
+                if 'pad must be divisible by the chroma subsampling' in str(e):
+                    refused.append(name)
+        print(f'{args.format} pad {args.pad}: refused by {" and ".join(refused) or "neither"}' + ('' if len(refused) == 2 else ', but both must refuse it'))
+        sys.exit(0 if len(refused) == 2 else 1)
     if args.pelclip and args.pel == 4:
         pc = core.std.GPUUpload(core.resize.Spline36(clip, w * 4, h * 4))
         try:
@@ -261,30 +275,35 @@ def main():
 
     planes = 3 if chroma else 1
     cl0 = [core.std.PropToClip(csup, prop='MVUtensilsSuperLevel0', index=p) for p in range(planes)]
-    gl0 = [core.std.GPUDownload(core.std.PropToClip(gsup, prop='MVGPUtensilsSuperLevel0', index=i)) for i in range(2 if chroma else 1)]
-    gpyr = core.std.GPUDownload(core.std.PropToClip(gsup, prop='MVGPUtensilsSuperPyramid')) if top > 0 else None
+    gdown = core.std.GPUDownload(gsup)
 
     differ = compared = 0
     worst = None
     pyr_differ = pyr_compared = 0
     for n in range(args.frames):
-        gframes = [c.get_frame(n) for c in gl0]
+        gframe = gdown.get_frame(n)
+        buf, _ = flat(gframe, dtype)
+        g_luma = np.asarray(gframe[0]).view(dtype)
+        props = gframe.props
+        cbuf = buf[props['MVGPUtensilsSuperChromaOffset'] // buf.itemsize:] if chroma else None
+        cstride = props['MVGPUtensilsSuperChromaStride'] // buf.itemsize if chroma else 0
         g_real = []  # each plane's full-pel plane inside the padding, for the pyramid model
         for p in range(planes):
             W = (aw if p == 0 else aw // xr) + 2 * (padx if p == 0 else padx // xr)
             H = (ah if p == 0 else ah // yr) + 2 * (pady if p == 0 else pady // yr)
             mvu = np.asarray(cl0[p].get_frame(n)[0])
-            g = np.asarray(gframes[0 if p == 0 else 1][0])
             stored = luma_planes if p == 0 else chroma_planes
             base = 0 if p == 0 else (p - 1) * chroma_planes
             if p > 0 and image:
                 # The plane's quarter-pel image: 4 H rows of 4 strides, phase (fx, fy) of pixel (x, y)
                 # at (4 x + fx, 4 y + fy); U's, then V's
-                buf, stride = flat(gframes[1], dtype)
-                img = buf[base * H * stride:(base + n_sub) * H * stride].reshape(4 * H, 4 * stride)
+                img = cbuf[base * H * cstride:(base + n_sub) * H * cstride].reshape(4 * H, 4 * cstride)
                 gsub = lambda slot, img=img: img[slot >> 2::4, slot & 3::4][:H, :W]
+            elif p > 0:
+                rows = cbuf[base * H * cstride:(base + stored) * H * cstride].reshape(stored * H, cstride)
+                gsub = lambda slot, rows=rows: rows[slot * H:(slot + 1) * H, :W]
             else:
-                gsub = lambda slot: g[(base + slot) * H:(base + slot + 1) * H, :W]
+                gsub = lambda slot: g_luma[slot * H:(slot + 1) * H, :W]
             half = None
             if stored == 4 and pel == 4:
                 half = {0: gsub(0), 2: gsub(1), 8: gsub(2), 10: gsub(3)}
@@ -309,8 +328,8 @@ def main():
             ppx, ppy = (padx, pady) if p == 0 else (padx // xr, pady // yr)
             rw, rh = (w, h) if p == 0 else (w // xr, h // yr)
             g_real.append(gsub(0)[ppy:ppy + rh, ppx:ppx + rw])
-        if gpyr is not None:
-            buf, _ = flat(gpyr.get_frame(n), dtype)
+        if top > 0:
+            buf = buf[props['MVGPUtensilsSuperPyramidOffset'] // buf.itemsize:]
             table = level_table(w, h, chroma, xr, yr, padx)
             src = g_real
             for (lw, lh, lwc, lhc, offY, offU, offV, sy, sc, bdy, bdc) in table:

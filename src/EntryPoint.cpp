@@ -14,6 +14,7 @@ void compensateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void recalculateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void maskRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 void scdetectionRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
+void convertRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 
 
 VS_EXTERNAL_API(void)
@@ -31,4 +32,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     recalculateRegister(plugin, vspapi);
     maskRegister(plugin, vspapi);
     scdetectionRegister(plugin, vspapi);
+    convertRegister(plugin, vspapi);
 }

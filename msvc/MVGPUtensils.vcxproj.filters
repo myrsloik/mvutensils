@@ -65,6 +65,9 @@
     <ClCompile Include="..\src\SuperLayout.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\VectorConvert.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\VulkanContext.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

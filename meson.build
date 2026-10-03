@@ -103,6 +103,7 @@ main_sources = files(
     'src/SCDetection.cpp',
     'src/Super.cpp',
     'src/SuperLayout.cpp',
+    'src/VectorConvert.cpp',
     'src/VulkanContext.cpp',
 )
 

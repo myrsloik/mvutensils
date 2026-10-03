@@ -4,9 +4,9 @@
 Both recalculate the same old vectors on supers of the same clip made with the same settings. The
 old vectors:
 
-  mvgpu   mvgpu.Analyse's, of a super with the --old-blksize grid (the super's own by default), on a
-          carrier clip for mvu (mvtest.mvu_vectors).
-  mvu     mvu.Analyse's, on the frames of mvgpu's super of that grid (mvtest.gpu_vectors).
+  mvgpu   mvgpu.Analyse's, of a super with the --old-blksize grid (the super's own by default), mvu's
+          side through mvgpu.ToMVU.
+  mvu     mvu.Analyse's, mvgpu's side through mvgpu.FromMVU with mvgpu's super of that grid.
   random  mvu.Analyse's description with every block given a vector of its own (mvtest.random_vectors).
 
 Every block's vector and SAD is compared, and the analysis description. mvgpu searches float supers
@@ -28,7 +28,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import format_clip, gpu_vectors, mvu_vectors, nv12_clip, random_vectors, scene_limits  # noqa: E402
+from mvtest import format_clip, nv12_clip, random_vectors, scene_limits  # noqa: E402
 
 
 def quantized16(core, clip):
@@ -103,25 +103,25 @@ def main():
     bits_g, bits_c = clip.format.bits_per_sample, cclip.format.bits_per_sample
     if args.vectors == 'mvgpu':
         gold = core.mvgpu.Analyse(gsup_old, delta=args.delta)
-        cold = core.std.SetFrameProps(mvu_vectors(core, gold, cclip, args.frames), MVUtensilsAnalysisBitsPerSample=bits_c)
+        cold = core.std.SetFrameProps(core.mvgpu.ToMVU(gold), MVUtensilsAnalysisBitsPerSample=bits_c)
     else:
         cold = core.mvu.Analyse(csup_old, delta=args.delta, blksize=ok_['blksize'], overlap=ok_['overlap'])
         if args.vectors == 'random':
             th1, scd = scene_limits(cold.get_frame(0).props, 400, 51.0)
             # (vectors past the padding are refused by mvu)
             cold = random_vectors(core, cold, (args.pad - 1) * args.pel, th1, scd, args.seed)
-        gold = core.std.SetFrameProps(gpu_vectors(core, cold, gsup_old), MVGPUtensilsAnalysisBitsPerSample=bits_g)
+        gold = core.std.SetFrameProps(core.mvgpu.FromMVU(cold, gsup_old), MVGPUtensilsAnalysisBitsPerSample=bits_g)
 
     rk = {k: getattr(args, k) for k in ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew') if getattr(args, k) is not None}
     gout = first_clip(core.mvgpu.Recalculate(gsup, gold, **rk))
     cout = first_clip(core.mvu.Recalculate(csup, cold, **rk))
 
-    # Every frame has vectors: one whose reference frame is outside the clip is recalculated from zero
-    # vectors against the reference frame clamped to the clip (as mvu does it)
+    # A frame whose reference frame is outside the clip has no old vectors and gets no new ones, only
+    # the new grid's description
     frames = args.frames
     props = cout.get_frame(0).props
     nbx, nby = props['MVUtensilsAnalysisNBlkX'], props['MVUtensilsAnalysisNBlkY']
-    records = core.std.GPUDownload(core.std.PropToClip(gout, prop='MVGPUtensilsAnalysisVectors'))
+    records = core.std.GPUDownload(gout)
     differ = 0
     desc = 0
     worst = None
@@ -134,7 +134,7 @@ def main():
                     desc += 1
                     if desc == 1:
                         print(f'frame {n}: {k} mvgpu {a.get(k.replace("MVUtensils", "MVGPUtensils", 1))}, mvu {b[k]}')
-        has_g, has_c = 'MVGPUtensilsAnalysisVectors' in a, 'MVUtensilsAnalysisVectors' in b
+        has_g, has_c = a.get('MVGPUtensilsAnalysisHasVectors', 0) == 1, 'MVUtensilsAnalysisVectors' in b
         if has_g != has_c:
             print(f'frame {n}: mvgpu {"has" if has_g else "lacks"} vectors, mvu {"has" if has_c else "lacks"} them')
             sys.exit(1)
