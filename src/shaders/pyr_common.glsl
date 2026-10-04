@@ -28,15 +28,16 @@ layout(std430, set = 0, binding = 18) buffer LevelVec { ivec2 levelVec[]; };
 layout(std430, set = 0, binding = 19) buffer LevelSad { int levelSad[]; };
 
 // Per level: luma and chroma size, plane offsets in a frame's pyramid, blocks, the offset of its
-// coarse field, its padding (pad >> L, at least 1), the offset of its lambda table, the planes'
-// strides and borders. Entry 0 describes the frame itself, the samples of one frame's pyramid and
-// the blocks of one field's coarse fields. Matches LevelEntry in SuperLayout.h.
+// coarse field, its horizontal padding (pad >> L, at least 1), the offset of its lambda table, the
+// planes' strides and borders, its vertical padding (padY >> L, at least 1). Entry 0 describes the
+// frame itself, the samples of one frame's pyramid and the blocks of one field's coarse fields.
+// Matches LevelEntry in SuperLayout.h.
 struct Level {
     int w, h, wc, hc;
     int offY, offU, offV, nbx;
     int nby, fieldOff, pad, lambdaOff;
     int frameSamples, fieldTotal, strideY, strideC;
-    int borderY, borderC, reserved0, reserved1;
+    int borderY, borderC, padY, reserved;
 };
 layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
 // lambda by (worst neighbour SAD) >> (1 + kDepthShift) for each level, mvlambda * 2^(plevel * level)
@@ -98,7 +99,7 @@ uint PyrWord(uint w, bool chroma) {
 
 // Keeps the reference block within the level's padding, as Pyramid::Bound
 ivec2 LevelBound(Level lv, ivec2 v) {
-    return ivec2(clamp(v.x, -(gLX + lv.pad), lv.w + lv.pad - 8 - gLX), clamp(v.y, -(gLY + lv.pad), lv.h + lv.pad - 8 - gLY));
+    return ivec2(clamp(v.x, -(gLX + lv.pad), lv.w + lv.pad - 8 - gLX), clamp(v.y, -(gLY + lv.padY), lv.h + lv.padY - 8 - gLY));
 }
 
 #ifndef NO_BLOCK_CACHE
@@ -120,7 +121,7 @@ void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int
                     at = lv.offY + (gLY + k / kLevelRowWords) * lv.strideY + gLX + (k % kLevelRowWords) * kSPW + i;
                 } else {
                     int kc = (k - kLevelLumaWords) % kLevelChromaWords;
-                    at = (k - kLevelLumaWords < kLevelChromaWords ? lv.offU : lv.offV) + ((gLY >> kLogC) + kc / kLevelRowWordsC) * lv.strideC + (gLX >> kLogC) +
+                    at = (k - kLevelLumaWords < kLevelChromaWords ? lv.offU : lv.offV) + ((gLY >> kLogCY) + kc / kLevelRowWordsC) * lv.strideC + (gLX >> kLogCX) +
                          (kc % kLevelRowWordsC) * kSPW + i;
                 }
                 b[i] = PyrSample(at, k >= kLevelLumaWords);
@@ -132,9 +133,9 @@ void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int
     gSumCur = lanesPerBlock == 8 ? subgroupClusteredAdd(partial, 8u) : subgroupAdd(partial);
 }
 
-// The lane's SAD of its level block for full-pel vector v: luma 8x8 plus U and V at 8 >> kLogC
-// square, the chroma vector the luma one divided by the subsampling toward zero, or luma alone (the
-// reference's CoarseSad). The border stands in for the CPU's clamping, so rows are read as words
+// The lane's SAD of its level block for full-pel vector v: luma 8x8 plus U and V (8 >> kLogCX) x
+// (8 >> kLogCY), the chroma vector the luma one divided by the subsampling toward zero, or luma alone
+// (the reference's CoarseSad). The border stands in for the CPU's clamping, so rows are read as words
 // like LaneSad's, with the same packed arithmetic. One lane measures the whole SAD (kSplit 1).
 int LevelSadOf(Level lv, ivec2 v) {
     uint a = uint(lv.offY + (gLY + v.y) * lv.strideY + gLX + v.x);
@@ -155,12 +156,12 @@ int LevelSadOf(Level lv, ivec2 v) {
     }
     if (!kChroma)
         return SadOf(sa, sm);
-    int cvx = ChromaComponent(v.x), cvy = ChromaComponent(v.y);
-    int rowC = ((gLY >> kLogC) + cvy) * lv.strideC + (gLX >> kLogC) + cvx;
+    ivec2 cv = ChromaVector(v);
+    int rowC = ((gLY >> kLogCY) + cv.y) * lv.strideC + (gLX >> kLogCX) + cv.x;
     uint au = uint(lv.offU + rowC), av = uint(lv.offV + rowC);
     uint wu = WordOf(au), shiftU = ShiftOf(au), wv = WordOf(av), shiftV = ShiftOf(av), strideC = uint(lv.strideC) >> uint(kLogSPW);
     int curU = cur + kLevelLumaWords, curV = curU + kLevelChromaWords;
-    for (int j0 = 0; j0 < pc.blockRows >> kLogC; j0 += kRowChunk) {
+    for (int j0 = 0; j0 < pc.blockRows >> kLogCY; j0 += kRowChunk) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
             uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;

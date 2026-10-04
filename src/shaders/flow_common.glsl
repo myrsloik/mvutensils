@@ -40,10 +40,13 @@ layout(push_constant) uniform Params {
     int colOff, rowOff;                     // flow_inter.comp: the plane's resize taps in taps[]
     float occnormX, occnormY;               // flow_prep.comp: MakeVectorOcclusionMask's occnorm
     int time4096FX, time4096FY, time4096BX, time4096BY; // and its time4096 for F and B; flow_blur.comp's prec in time4096FX
+    int stepY, overlapY;                    // compensate.comp: its grid's vertical step and overlap
+    int fieldShift;                         // Flow's and Compensate's field shift (fields)
 } pc;
 
-// flags: F and B have vectors, FF and BB have (for the extra masks), blend when F and B don't serve
-const int kHaveFB = 1, kHaveExtra = 2, kBlend = 4;
+// flags: F and B have vectors, FF and BB have (for the extra masks), blend when F and B don't serve;
+// the plane's resize goes down first (Interpolate)
+const int kHaveFB = 1, kHaveExtra = 2, kBlend = 4, kVerticalFirst = 8;
 
 // The bindings, FlowBinding in VulkanContext.h: the supers' planes of the frame before (src) and
 // the frame after (ref); the vector frames, records (x, y, SAD, 0) per block, pc.recStride per row:
@@ -124,17 +127,36 @@ uint HalfAddr(int Xh, int Yh, int stride, int rows) {
     return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
 }
 
+// Above the padded plane, (X, Y) 1 / pel pixels of it, where Flow's and Compensate's field shift takes
+// a top block whose vector is at the padding's edge, up to half a pixel: mvu reads row -1 of the sub-pel
+// plane holding the position, which in its storage (planes of rows rows one after the other) is the
+// last row of the plane before. The position of that sample instead; true where mvu.Super never wrote
+// it, the last row of the quarter planes 3/4 of a pixel down at pel 4 (its GeneratePelQuarters leaves
+// it), whose 0 from the new frame's memory mvu reads.
+bool AboveTop(inout int X, inout int Y, int rows) {
+    if (Y >= 0 || Y < -(kPel / 2) || kPel == 1)
+        return false;
+    int logPel = kPel == 4 ? 2 : 1, m = kPel - 1;
+    int p = ((X & m) | ((Y & m) << logPel)) - 1; // the plane before (never the first plane: Y & m >= kPel / 2)
+    X = (X >> logPel) * kPel + (p & m);
+    Y = (rows - 1) * kPel + (p >> logPel);
+    return kPel == 4 && (p >> logPel) == 3;
+}
+
 // mvu's PlaneGather: the sample at (X, Y), 1 / pel pixels from the plane's top left pixel, of the
 // super of the frame before or the frame after (at pel 1 its full-pel plane); between the half-pel
 // samples (luma, and 4:4:4
 // chroma, at pel 4) the rounded average of their neighbours, as mvu.Super's quarter planes hold it;
-// subsampled chroma at pel 4 from its quarter-pel image. The position is clamped to the storage,
-// where mvu reads outside the padding.
+// subsampled chroma at pel 4 from its quarter-pel image. Above the padded plane the sample mvu reads
+// there (AboveTop); otherwise the position is clamped to the storage, where mvu reads outside the
+// padding.
 uint Sample(bool ref, int X, int Y) {
     bool luma = pc.plane == 0;
     int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
     X += kPel * (luma ? pc.pad : pc.padc);
     Y += kPel * (luma ? pc.padY : pc.padcY);
+    if (AboveTop(X, Y, rows))
+        return 0u;
     uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
     if (!luma && kImage) {
         X = clamp(X, 0, 4 * stride - 1);
@@ -164,6 +186,8 @@ float SampleF(bool ref, int X, int Y) {
     int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
     X += kPel * (luma ? pc.pad : pc.padc);
     Y += kPel * (luma ? pc.padY : pc.padcY);
+    if (AboveTop(X, Y, rows))
+        return 0.0;
     uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
     if (!luma && kImage) {
         X = clamp(X, 0, 4 * stride - 1);
@@ -208,15 +232,20 @@ int Lerp(int a, int b, int c) {
 }
 
 // The resize of the four blocks' values at the pixel: across each row, then down, each pass rounded
-// to 16 bits, as zimg resizes horizontally first when it scales both ways up (resize_h_first)
+// to 16 bits, as zimg resizes when it scales both ways up (resize_h_first); or down each column, then
+// across, where it goes vertically first (kVerticalFirst: grids whose rows are a pixel apart in the
+// plane, Flow.cpp's TilesPassOrder)
 int Interpolate(int aa, int ab, int ba, int bb) {
+    if ((pc.flags & kVerticalFirst) != 0)
+        return Lerp(Lerp(aa, ba, gDa), Lerp(ab, bb, gDa), gCa);
     return Lerp(Lerp(aa, ab, gCa), Lerp(ba, bb, gCa), gDa);
 }
 
 // A block's vector as mvu's MakeSmallVectorMasks and AdjustSmallVectorMaskSubSampling keep it:
-// biased into 16 bits, saturated, chroma's then shifted by the subsampling
+// biased into 16 bits, y shifted by Flow's field shift, saturated, chroma's then shifted by the
+// subsampling
 ivec2 Biased(ivec4 rec) {
-    ivec2 v = clamp(rec.xy + 32768, 0, 65535);
+    ivec2 v = clamp(rec.xy + ivec2(32768, 32768 + pc.fieldShift), 0, 65535);
     if (pc.plane != 0)
         v = ((v - 32768) >> ivec2(kLogX, kLogY)) + 32768;
     return v;

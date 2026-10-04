@@ -57,8 +57,11 @@ layout(std430, set = 0, binding = 8) readonly buffer RefVec { ivec4 rec[]; } ref
 
 // Matches DegrainParams in VulkanContext.h
 layout(push_constant) uniform Params {
-    int nbx, nby, step, overlap; // the luma grid: blocks kBlk wide, step apart, overlapping by overlap
-    int pad, padc, wp, hp;       // the super's luma padding, its luma storage stride and rows
+    int nbx, nby, step, stepY;   // the luma grid, the vectors': blocks kBlkX x kBlkY, step and stepY apart,
+    int overlap, overlapY;       // overlapping by overlap and overlapY
+    int pad, padY, padc, padcY;  // the super's padding, luma's horizontal and vertical, then chroma's,
+    int aw, ah;                  // its block-aligned frame (the grid's own, or one the grid fits in),
+    int wp, hp;                  // its luma storage stride and rows,
     int wc, hc;                  // and its chroma storage stride and rows
     int recStride;               // vector records per row
     int refs;                    // 2 * radius
@@ -72,17 +75,22 @@ layout(push_constant) uniform Params {
     int winOff;                  // tables: the plane's 9 overlap windows
     int thOff;                   // each reference's weight steps, luma's refs, then chroma's
     int uwOff;                   // the user weights: the centre's, then each reference's
-    int nb;                      // blocks, nbx * nby
     int pixelMax;                // the clip's largest sample value
     float limitF;                // floats: the largest change of a pixel, where limit isn't -1
-    int quad;                    // degrain.comp: four pixels per lane (Main4)
 } pc;
 
-// The grid's luma block size, 8, 16 or 32 (specialization constant 3), the vectors' units per pixel,
-// 1, 2 or 4 (specialization constant 5), as the other kernels have them, and the variant
-// (specialization constant 6): chroma's subsampling in bits 0 (horizontal) and 1 (vertical), so 3
-// for 4:2:0 and 0 for 4:4:4, bit 2 set for 16-bit samples and bit 3 for float ones
-layout(constant_id = 3) const int kBlk = 8;
+// The grid's blocks
+int Blocks() {
+    return pc.nbx * pc.nby;
+}
+
+// The grid's luma block size, 8 to 32 pixels wide (specialization constant 3) and 2 to 32 tall
+// (specialization constant 7), the vectors' units per pixel, 1, 2 or 4 (specialization constant 5),
+// as the other kernels have them, and the variant (specialization constant 6): chroma's subsampling
+// in bits 0 (horizontal) and 1 (vertical), so 3 for 4:2:0 and 0 for 4:4:4, bit 2 set for 16-bit
+// samples and bit 3 for float ones
+layout(constant_id = 3) const int kBlkX = 8;
+layout(constant_id = 7) const int kBlkY = 8;
 layout(constant_id = 5) const int kPel = 2;
 layout(constant_id = 6) const int kVariant = 3;
 const int kChromaLog = kVariant & 3;

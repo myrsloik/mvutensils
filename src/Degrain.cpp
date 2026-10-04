@@ -30,9 +30,10 @@
 // submission completes: 2 * radius references, each with its super's two planes and its vectors,
 // don't fit a push descriptor set.
 //
-// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's Gray, 4:2:0 and 4:4:4 supers of 8
-// to 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors made
-// from such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+// Implemented: all of mvu.Degrain's arguments, on mvgpu.Super's Gray and YUV supers of any
+// subsampling and 8 to 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and
+// paddings, and vectors made from such supers, of any of those bit depths, as mvgpu.Analyse makes
+// them.
 
 namespace {
 
@@ -180,9 +181,9 @@ struct DegrainData {
     SuperLayout centreLayout; // centerSuper's, which may lack the levels above 0
     std::string prefix, name;
     int radius = 0;
-    // The vectors' grid, which mvu.Degrain takes from them rather than from the super: blk x blk
-    // blocks, step apart, overlapping by overlap, nbx x nby of them
-    int blk = 0, overlap = 0, step = 0, nbx = 0, nby = 0;
+    // The vectors' grid, which mvu.Degrain takes from them rather than from the super: blk x blkY
+    // blocks, step and stepY apart, overlapping by overlap and overlapY, nbx x nby of them
+    int blk = 0, blkY = 0, overlap = 0, overlapY = 0, step = 0, stepY = 0, nbx = 0, nby = 0;
 
     bool process[3] = {};
     int limit[3] = {-1, -1, -1}; // per plane, -1 for none
@@ -443,10 +444,16 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.nbx = d->nbx;
         pc.nby = d->nby;
         pc.step = d->step;
+        pc.stepY = d->stepY;
         pc.overlap = d->overlap;
+        pc.overlapY = d->overlapY;
         const ptrdiff_t bytes = L.format.Bytes();
         pc.pad = L.pad;
+        pc.padY = L.padY;
         pc.padc = L.padc;
+        pc.padcY = L.padcY;
+        pc.aw = L.aw;
+        pc.ah = L.ah;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
         pc.wc = static_cast<int32_t>(chromaStride / bytes);
@@ -459,7 +466,6 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.scdLimit = d->scdLimit;
         pc.thOff = d->thOff;
         pc.uwOff = d->uwOff;
-        pc.nb = nb;
         pc.pixelMax = L.format.Kind() == 2 ? 0 : (1 << L.format.bits) - 1;
 
         // The scene change test's counts start at zero, and stay there when no count can exceed
@@ -486,10 +492,10 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             pc.limitF = d->limitF[p];
             pc.winOff = d->winOff[p ? 1 : 0];
             // Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the
-            // plane's step and overlap multiples of 4
+            // plane's step and overlap multiples of 4 (degrain.comp's Quad, which decides alike)
             const int lx = p ? L.format.xr >> 1 : 0;
-            pc.quad = bytes == 1 && L.pel != 4 && ((pc.step >> lx) & 3) == 0 && ((pc.overlap >> lx) & 3) == 0;
-            dispatch(d->pixels, pc, static_cast<uint32_t>(pc.quad ? (pc.width + 255) / 256 : (pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
+            const bool quad = bytes == 1 && L.pel != 4 && ((pc.step >> lx) & 3) == 0 && ((pc.overlap >> lx) & 3) == 0;
+            dispatch(d->pixels, pc, static_cast<uint32_t>(quad ? (pc.width + 255) / 256 : (pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
         }
         stamp(3);
 
@@ -603,9 +609,6 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
             same.delta = first.delta;
             if (!SameAnalysis(same, first))
                 throw std::runtime_error("The motion vectors passed are not compatible with each other");
-            if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
-                v.nby != analysed.nby)
-                throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
             d->deltas.push_back(v.delta);
             if (r % 2 == 1) {
                 if (d->deltas[r] != -d->deltas[r - 1])
@@ -615,8 +618,11 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
             }
         }
         d->blk = first.blkX;
+        d->blkY = first.blkY;
         d->overlap = first.overlapX;
+        d->overlapY = first.overlapY;
         d->step = d->blk - d->overlap;
+        d->stepY = d->blkY - d->overlapY;
         d->nbx = first.nbx;
         d->nby = first.nby;
 
@@ -679,10 +685,10 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         // The tables: the overlap windows of luma's and chroma's blocks, each reference's weight
         // steps for its thsad, luma's then chroma's, and the user weights
         std::vector<int32_t> tables;
-        if (d->overlap > 0) {
+        if (d->overlap > 0 || d->overlapY > 0) {
             const int xr = L.format.xr, yr = L.format.yr;
-            const std::vector<int32_t> lumaWin = MakeOverlapWindows(d->blk, d->blk, d->overlap, d->overlap);
-            const std::vector<int32_t> chromaWin = MakeOverlapWindows(d->blk / xr, d->blk / yr, d->overlap / xr, d->overlap / yr);
+            const std::vector<int32_t> lumaWin = MakeOverlapWindows(d->blk, d->blkY, d->overlap, d->overlapY);
+            const std::vector<int32_t> chromaWin = MakeOverlapWindows(d->blk / xr, d->blkY / yr, d->overlap / xr, d->overlapY / yr);
             d->winOff[0] = static_cast<int>(tables.size());
             tables.insert(tables.end(), lumaWin.begin(), lumaWin.end());
             d->winOff[1] = static_cast<int>(tables.size());
@@ -704,9 +710,9 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical, and for
         // the pixels bit 2 for 16-bit samples, bit 3 for float ones
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
-        d->count = vc.Pipeline(Kernel::DegrainCount, d->blk, L.pel, chromaLog);
-        d->weights = vc.Pipeline(Kernel::DegrainWeights, d->blk, L.pel, chromaLog);
-        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel, chromaLog | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0));
+        d->count = vc.Pipeline(Kernel::DegrainCount, d->blk, L.pel, chromaLog, d->blkY);
+        d->weights = vc.Pipeline(Kernel::DegrainWeights, d->blk, L.pel, chromaLog, d->blkY);
+        d->pixels = vc.Pipeline(Kernel::DegrainPixels, d->blk, L.pel, chromaLog | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0), d->blkY);
         const VkDeviceSize metaBytes = static_cast<VkDeviceSize>(refs + 1) * d->nbx * d->nby * 4;
         if (metaBytes > vc.limits.maxStorageBufferRange)
             throw std::runtime_error("the frame is too large for the device's storage buffers");

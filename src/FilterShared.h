@@ -51,8 +51,10 @@ std::vector<int32_t> TileTaps(int srcDim, int dstDim, int step, int overlap);
 // - 1) * step + blk, the dstDim of them in the frame resized from them as one plane
 std::vector<ResizeTap> PlaneTaps(int srcDim, int dstDim, int coverDim);
 
-// zimg's choice of the order of the passes (resize/resize.cpp's resize_h_first): true when it
-// resizes horizontally first, for every size of tile MaskResizer makes of a dstW x dstH plane
-bool TilesHorizontalFirst(int srcW, int dstW, int stepX, int overlapX, int srcH, int dstH, int stepY, int overlapY);
-// and for PlaneResizer's resize of the whole plane
+// zimg's choice of the order of the passes (resize/resize.cpp's resize_h_first), for every size of
+// tile MaskResizer makes of a dstW x dstH plane: all of them horizontally first, all of them
+// vertically first, or some one way and some the other
+enum class PassOrder { Horizontal, Vertical, Mixed };
+PassOrder TilesPassOrder(int srcW, int dstW, int stepX, int overlapX, int srcH, int dstH, int stepY, int overlapY);
+// and for PlaneResizer's resize of the whole plane: true when it resizes horizontally first
 bool PlaneHorizontalFirst(int srcW, int dstW, int coverW, int srcH, int dstH, int coverH);

@@ -20,9 +20,13 @@
 // bit given the same supers and old vectors, but for float supers, which are searched as the 16-bit
 // samples they stand for, as mvgpu.Analyse searches them.
 //
-// Implemented: all of mvu.Recalculate's arguments but satd and fields, on the supers mvgpu.Analyse
-// takes, for their own grid (blksize and overlap other than the super's aren't implemented yet), from
-// old vectors of mvgpu's of the same bit depth and pel, on any grid.
+// Implemented: all of mvu.Recalculate's arguments, on the supers mvgpu.Analyse takes, for their own
+// grid or another that fits their block-aligned frame (SuperLayout::WithGrid), from old vectors of
+// mvgpu's of the same bit depth, on any grid and at any pel (rescaled to the super's); satd makes
+// luma's SAD mvu's SATD (16x2 blocks refused, as mvu refuses them). fields changes nothing in mvu's
+// recalculation (the shifted zero and global vectors it sets up aren't among its searches'
+// candidates), so here it only takes the frames' parities as mvu takes them, failing where mvu
+// fails.
 
 struct RecalcData {
     VSNode *super = nullptr;
@@ -30,9 +34,11 @@ struct RecalcData {
     const VSVideoInfo *vi = nullptr; // the super clip's
     VSVideoInfo outVi = {};          // the output's: the vectors' records
     SuperLayout layout;
+    SuperLayout grid;                // the same with the grid recalculated, the super's or another
     std::string prefix;
     int delta = 0;
     bool chroma = true;
+    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
     int nbxOld = 0, nbyOld = 0;
     VectorInfo info;        // the old vectors' first frame's description, which every frame with vectors must have
     RecalcParams base = {}; // the push constants of every frame, but for the records' strides
@@ -65,7 +71,7 @@ struct RecalcData {
 // The analysis description mvu.Recalculate attaches: the super's, with the vectors' delta, and one
 // level, the recalculated one
 static void ExportRecalculated(VSFrame *dst, const RecalcData *d, bool hasVectors, const VSAPI *vsapi) {
-    ExportAnalysis(dst, d->layout, d->delta, d->chroma, hasVectors, d->prefix, vsapi);
+    ExportAnalysis(dst, d->grid, d->delta, d->chroma, hasVectors, d->prefix, vsapi);
     vsapi->mapSetInt(vsapi->getFramePropertiesRW(dst), (d->prefix + "AnalysisLevels").c_str(), 1, maReplace);
 }
 
@@ -88,7 +94,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
     } else if (activationReason == arAllFramesReady) {
         const VulkanContext &vc = *d->vc;
         const VSVULKANAPI *vkapi = vc.vkapi;
-        const SuperLayout &L = d->layout;
+        const SuperLayout &L = d->layout, &G = d->grid; // the super's frames, the new vectors' grid
 
         // Everything this frame holds a reference to, released on every way out
         std::vector<const VSFrame *> held;
@@ -117,6 +123,16 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         SuperRegions cur, rf;
         if (const std::string e = CheckSuperFrame(src, L, d->prefix, cur, vsapi); !e.empty())
             return fail(e);
+        // The frames' parities, as mvu takes them (they don't change its vectors)
+        if (d->fields) {
+            try {
+                (void)GetTopField(src, n, d->tffExists, d->tff, true, vsapi);
+                if (hasRef && L.pel > 1 && d->delta % 2 != 0)
+                    (void)GetTopField(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), nref, d->tffExists, d->tff, true, vsapi);
+            } catch (const std::exception &e) {
+                return fail(e.what());
+            }
+        }
         std::string error;
         const VSFrame *old = hasRef ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->info, d->prefix, error, vsapi)) : nullptr;
         if (!error.empty())
@@ -124,7 +140,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         if (!old) {
             // A frame without old vectors or without a reference frame stays without vectors, as in
             // mvu: records that don't count, with the new grid's description
-            VSFrame *out = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+            VSFrame *out = vkapi->newGPUVideoFrame(&d->gray32, 4 * G.nbx, G.nby, src, core);
             if (!out)
                 return fail("failed to allocate the vector frame");
             ExportRecalculated(out, d, false, vsapi);
@@ -136,7 +152,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
             return fail(e);
 
         // The output: the records, with the super frame's properties
-        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * G.nbx, G.nby, src, core);
         if (!vectors)
             return fail("failed to allocate the vector frame");
         const ptrdiff_t recBytes = vsapi->getStride(vectors, 0), oldBytes = vsapi->getStride(old, 0);
@@ -177,7 +193,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         }
         rec.Bind(4, oldRec.buffer);
         rec.Bind(5, outRec.buffer);
-        rec.Dispatch(d->search, pc, static_cast<uint32_t>(L.nbx), static_cast<uint32_t>(L.nby));
+        rec.Dispatch(d->search, pc, static_cast<uint32_t>(G.nbx), static_cast<uint32_t>(G.nby));
         if (d->profile)
             d->profile->Stamp(vc, cmd, queries, 1);
 
@@ -218,7 +234,9 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         GetPairArgument(blkX, blkY, "blksize", L.blk, L.blkY, in, vsapi);
         GetPairArgument(overlapX, overlapY, "overlap", L.overlap, L.overlapY, in, vsapi);
         const bool useSatd = !!vsapi->mapGetInt(in, "satd", 0, &err);
-        CheckBlockSize(blkX, blkY, overlapX, overlapY, L.format.xr > 1 ? 1 : 0, L.format.yr > 1 ? 1 : 0);
+        CheckBlockSize(blkX, blkY, overlapX, overlapY, L.format.xr > 1 ? 1 : 0, L.format.yr > 1 ? 1 : 0, useSatd);
+        d->grid = L.WithGrid(blkX, blkY, overlapX, overlapY);
+        const SuperLayout &G = d->grid;
 
         int64_t thsad = vsapi->mapGetIntSaturated(in, "thsad", 0, &err); // saturated, so that the scaling below can't overflow
         if (err)
@@ -237,6 +255,10 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
             d->chroma = true;
         if (!L.format.chroma)
             d->chroma = false;
+        // recalc.comp keeps a block's SAD in an int; a SATD reaches at most twice the SAD
+        const int64_t pixels = static_cast<int64_t>(useSatd ? 2 : 1) * G.blk * G.blkY + (d->chroma ? 2 * (G.blk / L.format.xr) * (G.blkY / L.format.yr) : 0);
+        if (pixels * ((1 << std::min(16, L.format.bits)) - 1) > INT32_MAX)
+            throw std::runtime_error("the blocks' SADs can pass 2^31 (128x128 blocks with chroma at 16 bits or float), which isn't implemented");
         int64_t lambda = vsapi->mapGetIntSaturated(in, "mvlambda", 0, &err);
         if (err)
             lambda = 1000;
@@ -248,29 +270,23 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         if (err)
             pnew = 25;
         vsapi->mapGetInt(in, "meander", 0, &err); // the order the CPU took the blocks in; the GPU takes them all at once
-        const bool fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
+        d->tffExists = !err;
         if (search < 0 || search > 5)
             throw std::runtime_error("search must be between 0 and 5");
         if (pnew < 0 || pnew > 256)
             throw std::runtime_error("pnew must be between 0 and 256");
 
-        // What the GPU path implements so far
-        if (blkX != L.blk || blkY != L.blkY || overlapX != L.overlap || overlapY != L.overlapY)
-            throw std::runtime_error("blksize and overlap must be the super clip's; recalculating for another grid isn't implemented yet");
-        if (useSatd)
-            throw std::runtime_error("satd isn't implemented yet");
-        if (fields)
-            throw std::runtime_error("fields isn't implemented yet");
+        // The recalculated vectors take the super's pel (the old ones are rescaled to it)
+        if (d->fields && L.pel < 2)
+            throw std::runtime_error("fields option requires pel > 1");
 
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "super", vsapi); // the output is as long as super
         const VectorInfo v = d->info = ReadVectorInfo(d->vectors, d->prefix, vsapi);
         if (v.bits != L.format.bits)
             throw std::runtime_error("Incompatible frame format for motion vector recalculation, bitdepth must match");
-        if (v.pel != L.pel)
-            throw std::runtime_error("the vectors' pel must be the super clip's");
-        if (v.blkX != v.blkY || v.overlapX != v.overlapY)
-            throw std::runtime_error("the vectors' blocks must be square, with the same overlap either way");
         d->delta = v.delta;
         d->nbxOld = v.nbx;
         d->nbyOld = v.nby;
@@ -286,13 +302,16 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         const int64_t lambdaLevel = lambda / (L.pel * L.pel);
 
         RecalcParams &pc = d->base;
-        pc.nbx = L.nbx;
-        pc.nby = L.nby;
-        pc.step = L.step;
+        pc.nbx = G.nbx;
+        pc.nby = G.nby;
+        pc.step = G.step;
+        pc.stepY = G.stepY;
         pc.nbxOld = v.nbx;
         pc.nbyOld = v.nby;
         pc.blkOld = v.blkX;
+        pc.blkOldY = v.blkY;
         pc.stepOld = v.blkX - v.overlapX;
+        pc.stepOldY = v.blkY - v.overlapY;
         pc.pad = L.pad;
         pc.padY = L.padY;
         pc.padc = L.padc;
@@ -308,20 +327,23 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         pc.search = search;
         pc.searchParam = searchParam;
         pc.smoothing = smooth;
+        // The new vectors take the super's pel, and the old ones are rescaled to it, as mvu does
+        pc.oldPelShift = ilog2(L.pel) - ilog2(v.pel);
 
         if (!vsapi->queryVideoFormat(&d->gray32, cfGray, stInteger, 32, 0, 0, core))
             throw std::runtime_error("failed to query the Gray32 format");
         d->outVi = *d->vi;
         d->outVi.format = d->gray32;
-        d->outVi.width = 4 * L.nbx;
-        d->outVi.height = L.nby;
+        d->outVi.width = 4 * G.nbx;
+        d->outVi.height = G.nby;
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical; bit 2
-        // 16-bit samples, bit 3 float; bit 4 the SADs count chroma
-        const int variant = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0) | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0) | (d->chroma ? 16 : 0);
-        d->search = vc.Pipeline(Kernel::Recalculate, L.blk, L.pel, variant);
+        // 16-bit samples, bit 3 float; bit 4 the SADs count chroma; bit 5 luma's SAD is its SATD
+        const int variant = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0) | (L.format.Kind() == 1 ? 4 : L.format.Kind() == 2 ? 8 : 0) | (d->chroma ? 16 : 0) |
+                            (useSatd ? 32 : 0);
+        d->search = vc.Pipeline(Kernel::Recalculate, G.blk, L.pel, variant, G.blkY);
 
         char errMsg[1024] = {};
         d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));

@@ -9,7 +9,7 @@
                 the records, mvgpu's description and the super's, the source's own properties kept
                 and mvu's gone (its super's planes among them); then back through ToMVU, which must
                 give mvu's description and arrays again.
-  errors        either plugin's vectors where the other's belong, a super of another grid, vectors
+  errors        either plugin's vectors where the other's belong, a super of another block-aligned frame, vectors
                 that would read outside the padded frame, negative SADs, a vector clip without the
                 description of its super.
 
@@ -31,7 +31,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, nv12_clip  # noqa: E402
+from mvtest import eight_bit, format_clip, grid_label, nv12_clip  # noqa: E402
 
 GPU = 'MVGPUtensils'
 DESCRIPTION = ['Width', 'Height', 'RealWidth', 'RealHeight', 'HPad', 'VPad', 'Pel', 'Levels', 'Chroma', 'XRatioUV', 'YRatioUV',
@@ -59,6 +59,16 @@ def unpack(props, prefix):
     """mvu's arrays as x, y and SAD per block"""
     packed = np.array(props[prefix + 'AnalysisVectors'], np.int64)
     return (packed & 0xFFFFFFFF).astype(np.uint32).view(np.int32), (packed >> 32).astype(np.int32), np.array(props[prefix + 'AnalysisSAD'], np.int64)
+
+
+def covered(size, blk, overlap):
+    """The width (or height) mvu's grid covers: the blocks that fit the frame, plus more while they fall
+    short of it; for a super's grid, its block-aligned frame"""
+    step = blk - overlap
+    n = max(0, (size - overlap) // step)
+    while step * n + overlap < size:
+        n += 1
+    return step * n + overlap
 
 
 def first(c):
@@ -176,8 +186,8 @@ def main():
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, GRAYS, ...')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--pel', type=int, default=2)
-    ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
+    ap.add_argument('--overlap', type=int, nargs='+', default=[8], help='the overlap, and the vertical one when it differs')
     ap.add_argument('--radius', type=int, default=2)
     ap.add_argument('--recalculate', type=int, nargs=2, metavar=('BLKSIZE', 'OVERLAP'), help="also both Recalculates' vectors, for this grid")
     ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
@@ -217,6 +227,21 @@ def main():
         csup_r = core.mvu.Super(aclip, prefix=mp, **rk)
         gsets += [(first(core.mvgpu.Recalculate(gsup_r, f)), gsup_r, 'mvgpu recalculated ' + label) for f, _, label in gsets[:2]]
         csets += [(first(core.mvu.Recalculate(csup_r, f, prefix=mp)), core.mvgpu.Super(gclip, **rk), 'mvu recalculated ' + label) for f, _, label in csets[:2]]
+    # A super of another grid serves mvu's vectors, as mvu's filters take one, where its block-aligned
+    # frame is theirs, which their grid then fits; FromMVU refuses one that their grid doesn't fit, or
+    # whose block-aligned frame isn't theirs
+    other = dict(sk, blksize=8 if args.blksize[0] != 8 else 16, overlap=4 if args.blksize[0] != 8 else 8)
+    osup = core.mvgpu.Super(gclip, **other)
+    cp0 = cfields[0].get_frame(0).props
+    ow, oh = covered(w, other['blksize'], other['overlap']), covered(h, other['blksize'], other['overlap'])
+    vgrid = [cp0[mp + 'Analysis' + k] for k in ('BlkSizeX', 'BlkSizeY', 'OverlapX', 'OverlapY')]
+    if (ow, oh) == (cp0[mp + 'AnalysisWidth'], cp0[mp + 'AnalysisHeight']):
+        csets.append((cfields[0], osup, 'mvu delta 1 on a super of another grid'))
+        other_error = None
+    elif covered(w, vgrid[0], vgrid[2]) > ow or covered(h, vgrid[1], vgrid[3]) > oh:
+        other_error = 'has no multiple'
+    else:
+        other_error = "aren't their grid's on the super"
 
     problems = Problems()
     for field, sup, label in gsets:
@@ -234,9 +259,8 @@ def main():
                  lambda: core.mvgpu.Degrain(gclip, core.mvgpu.Super(gclip, prefix=mp, **sk), cfields, prefix=mp), hint, problems)
     expect_error('ToMVU on mvu vectors', lambda: core.mvgpu.ToMVU(cf, mvuprefix=mp), hint, problems)
     expect_error('FromMVU on mvgpu vectors', lambda: core.mvgpu.FromMVU(gf, gsup, mvuprefix=mp), "mvgpu's already", problems)
-    other = dict(sk, blksize=8 if args.blksize != 8 else 16, overlap=4 if args.blksize != 8 else 8)
-    expect_error('FromMVU with a super of another grid', lambda: core.mvgpu.FromMVU(cf, core.mvgpu.Super(gclip, **other), mvuprefix=mp),
-                 "blksize and overlap", problems)
+    if other_error:
+        expect_error('FromMVU with a super of another block-aligned frame', lambda: core.mvgpu.FromMVU(cf, osup, mvuprefix=mp), other_error, problems)
 
     def corrupt(what):
         def modify(n, f):
@@ -260,7 +284,7 @@ def main():
     expect_error('mvgpu.Compensate on vectors without their super description', lambda: core.mvgpu.Compensate(gclip, gsup, bare),
                  'the description of the super it was analysed on', problems)
 
-    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {args.blksize}/{args.overlap} radius {args.radius}'
+    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {grid_label(args.blksize, args.overlap)} radius {args.radius}'
           + (f' + recalculated {args.recalculate[0]}/{args.recalculate[1]}' if args.recalculate else '') + (f' mvuprefix {mp}' if mp != 'MVUtensils' else '')
           + f', {frames} frames: {len(gsets)} mvgpu and {len(csets)} mvu vector clips converted both ways, {problems.error_cases} error cases: {problems.count} problems')
     sys.exit(0 if problems.count == 0 else 1)

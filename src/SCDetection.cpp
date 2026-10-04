@@ -159,9 +159,7 @@ static void VS_CC scdetectionCreate(const VSMap *in, VSMap *out, [[maybe_unused]
 
         CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "clip", vsapi);
         const VectorInfo v = d->info = ReadVectorInfo(d->vectors, d->prefix, vsapi);
-        const SuperLayout analysed = ImportAnalysedLayout(d->vectors, d->prefix, vsapi);
-        if (v.nbx != analysed.nbx || v.nby != analysed.nby)
-            throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        ImportAnalysedLayout(d->vectors, d->prefix, vsapi); // throws unless they come from mvgpu.Analyse
         d->nbx = v.nbx;
         d->nby = v.nby;
         d->scd = ScaleSceneChange(v, thscd1, thscd2);

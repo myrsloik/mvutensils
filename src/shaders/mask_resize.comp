@@ -5,8 +5,9 @@
 layout(local_size_x = 64) in;
 
 // Every pixel of the mask: the blocks' values resized to the frame as mvu's PlaneResizer resizes them,
-// zimg's bilinear resize of the whole plane, horizontally first (Mask.cpp checks zimg would), each
-// output sample from source samples left and left + 1 of its column's and its row's taps; or scval
+// zimg's bilinear resize of the whole plane, horizontally first or, where zimg goes the other way
+// (kVerticalFirst, Mask.cpp), vertically first, each output sample from source samples left and
+// left + 1 of its column's and its row's taps; or scval
 // where the vectors don't serve (none, or at a scene change). zimg resizes 8-bit masks as 16-bit
 // samples (it promotes bytes to words, values << 8, and converts back with its dither type none,
 // rounding half to even), 9 to 16-bit ones as they are, rounding each pass to 16 bits, and float ones
@@ -42,6 +43,21 @@ void main() {
     }
     ivec4 cx = taps[pc.colOff + x], ry = taps[pc.rowOff + y];
     int ia = cx.x, ib = min(ia + 1, pc.nbx - 1), ja = ry.x, jb = min(ja + 1, pc.nby - 1);
+    bool down = (pc.flags & kVerticalFirst) != 0;
+    if (kKind == 2 && down) {
+        float r0 = intBitsToFloat(ry.z), r1 = intBitsToFloat(ry.w);
+        precise float a0 = r0 * ValueF(ia, ja);
+        precise float a1 = r1 * ValueF(ia, jb);
+        precise float v0 = a0 + a1;
+        precise float b0 = r0 * ValueF(ib, ja);
+        precise float b1 = r1 * ValueF(ib, jb);
+        precise float v1 = b0 + b1;
+        precise float h0 = intBitsToFloat(cx.z) * v0;
+        precise float h1 = intBitsToFloat(cx.w) * v1;
+        precise float h = h0 + h1;
+        outPxF[at] = h;
+        return;
+    }
     if (kKind == 2) {
         float c0 = intBitsToFloat(cx.z), c1 = intBitsToFloat(cx.w);
         precise float a0 = c0 * ValueF(ia, ja);
@@ -57,9 +73,16 @@ void main() {
         return;
     }
     int shift = kKind == 0 ? 8 : 0;
-    int h0 = Lerp(Value(ia, ja) << shift, Value(ib, ja) << shift, cx.y);
-    int h1 = Lerp(Value(ia, jb) << shift, Value(ib, jb) << shift, cx.y);
-    int v = Lerp(h0, h1, ry.y);
+    int v;
+    if (down) {
+        int v0 = Lerp(Value(ia, ja) << shift, Value(ia, jb) << shift, ry.y);
+        int v1 = Lerp(Value(ib, ja) << shift, Value(ib, jb) << shift, ry.y);
+        v = Lerp(v0, v1, cx.y);
+    } else {
+        int h0 = Lerp(Value(ia, ja) << shift, Value(ib, ja) << shift, cx.y);
+        int h1 = Lerp(Value(ia, jb) << shift, Value(ib, jb) << shift, cx.y);
+        v = Lerp(h0, h1, ry.y);
+    }
     if (kKind == 1) {
         outPx16[at] = uint16_t(v);
         return;

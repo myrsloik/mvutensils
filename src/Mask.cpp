@@ -30,7 +30,7 @@ namespace {
 
 // mask_common.glsl's kinds and flags
 constexpr int kLength = 0, kSad = 1, kOcclusion = 2;
-constexpr int kNoVectors = 1;
+constexpr int kNoVectors = 1, kVerticalFirst = 2;
 
 // The _Range mvu sets on its masks: full range in API 4.2's VSRange, the API mvu is built for
 // (VSConstants4.h gives the API 4.0 values under VS_USE_API_43)
@@ -46,6 +46,7 @@ struct MaskData {
     std::string name, prefix;
     int nbx = 0, nby = 0;
     MaskParams base = {}; // the push constants of every frame, but for the vectors' and the mask's strides
+    bool verticalFirst = false; // zimg resizes the mask down first
 
     std::shared_ptr<VulkanContext> vc;
     VSGPUExecPool *pool = nullptr;
@@ -151,7 +152,7 @@ static const VSFrame *VS_CC maskGetFrame(int n, int activationReason, void *inst
         MaskParams pc = d->base;
         pc.recStride = static_cast<int32_t>(recBytes / 16);
         pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, 0) / d->vi.format.bytesPerSample);
-        pc.flags = vectors ? 0 : kNoVectors;
+        pc.flags = (vectors ? 0 : kNoVectors) | (d->verticalFirst ? kVerticalFirst : 0);
         rec.Bind(kMkTaps, d->tapsInfo.buffer);
         rec.Bind(kMkOut, outPlane.buffer);
         if (vectors) {
@@ -221,10 +222,7 @@ static void VS_CC maskCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
         d->node = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         const VectorInfo v = d->info = ReadVectorInfo(d->node, d->prefix, vsapi);
-        const SuperLayout analysed = ImportAnalysedLayout(d->node, d->prefix, vsapi);
-        if (v.blkX != analysed.blk || v.blkY != analysed.blkY || v.overlapX != analysed.overlap || v.overlapY != analysed.overlapY || v.nbx != analysed.nbx ||
-            v.nby != analysed.nby)
-            throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        ImportAnalysedLayout(d->node, d->prefix, vsapi); // throws unless they come from mvgpu.Analyse
         d->nbx = v.nbx;
         d->nby = v.nby;
 
@@ -284,8 +282,7 @@ static void VS_CC maskCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
         // The resize's taps, PlaneResizer's: the columns', then the rows'
         const int coverW = stepX * v.nbx + v.overlapX, coverH = stepY * v.nby + v.overlapY;
-        if (!PlaneHorizontalFirst(v.nbx, d->vi.width, coverW, v.nby, d->vi.height, coverH))
-            throw std::runtime_error("zimg would resize the mask vertically first, which isn't implemented");
+        d->verticalFirst = !PlaneHorizontalFirst(v.nbx, d->vi.width, coverW, v.nby, d->vi.height, coverH);
         const std::vector<ResizeTap> cols = PlaneTaps(v.nbx, d->vi.width, coverW), rows = PlaneTaps(v.nby, d->vi.height, coverH);
         std::vector<int32_t> tables;
         auto append = [&](const std::vector<ResizeTap> &taps) {

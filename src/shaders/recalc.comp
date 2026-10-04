@@ -23,22 +23,33 @@
 layout(local_size_x_id = 1) in;
 
 layout(constant_id = 0) const int kSubgroup = 32;
-layout(constant_id = 3) const int kBlk = 16;
+layout(constant_id = 3) const int kBlkX = 16; // the grid's block width,
+layout(constant_id = 7) const int kBlkY = 16; // and height
 layout(constant_id = 5) const int kPel = 2;
 // The variant (specialization constant 6): chroma's subsampling in bits 0 (horizontal) and 1
-// (vertical); bit 2 16-bit samples, bit 3 float; bit 4 the SADs count chroma
+// (vertical); bit 2 16-bit samples, bit 3 float; bit 4 the SADs count chroma; bit 5 luma's SAD is its
+// SATD (satd=True, TileSatd)
 layout(constant_id = 6) const int kVariant = 3;
 const int kLogX = kVariant & 1, kLogY = (kVariant >> 1) & 1;
 const bool kWide = (kVariant & 4) != 0;
 const bool kFloat = (kVariant & 8) != 0;
 const bool kChromaSad = (kVariant & 16) != 0;
+const bool kSatd = (kVariant & 32) != 0;
 // Subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h). No && or || between
 // specialization constants: the core's compiler makes them short-circuit code in the first function
 // that uses them, which the others then can't see.
 const bool kImage = (kPel == 4 ? kVariant & 3 : 0) != 0;
-const int kBlkCX = kBlk >> kLogX, kBlkCY = kBlk >> kLogY;
-const int kLumaPer = (kBlk * kBlk + kSubgroup - 1) / kSubgroup;    // luma pixels a lane holds
+const int kBlkCX = kBlkX >> kLogX, kBlkCY = kBlkY >> kLogY;
+const int kLumaPer = (kBlkX * kBlkY + kSubgroup - 1) / kSubgroup;  // luma pixels a lane holds
 const int kChromaPer = (kBlkCX * kBlkCY + kSubgroup - 1) / kSubgroup; // and of each chroma plane
+// Blocks with more than 32 pixels per lane (wider than 32x32) don't keep them in registers: Sads
+// reads them from the super each time
+const bool kKeep = kLumaPer <= 32;
+// With kSatd the lanes take luma's 4x4 tiles, kTilesPer each, keeping their pixels where those are
+// 32 or fewer (kKeepT)
+const int kTilesX = kBlkX / 4, kTiles = kTilesX * (kBlkY / 4);
+const int kTilesPer = (kTiles + kSubgroup - 1) / kSubgroup;
+const bool kKeepT = kTilesPer <= 2;
 
 // Matches RecalcParams in VulkanContext.h
 layout(push_constant) uniform Params {
@@ -49,6 +60,8 @@ layout(push_constant) uniform Params {
     int hc, aw, ah, lambda;                     // the block-aligned frame; lambda / pel^2
     int thsad, pnew, search, searchParam;       // the search's arguments (search: mvu's SearchType)
     int smoothing;                              // interpolate the old vectors (smooth), else take the nearest
+    int oldPelShift;                            // log2 of the super's pel less log2 of the old vectors'
+    int stepY, blkOldY, stepOldY;               // the grids vertically: the new one's step, the old one's block and step
 } pc;
 
 // The bindings: the supers' storage of the frame (src) and of its reference frame (ref), luma and
@@ -141,33 +154,87 @@ uint SrcSample(int c, int x, int y) {
 }
 
 // The block: its top left pixel in the padded planes, luma's and chroma's, and the pixels this lane
-// holds
+// holds (kKeep; with kSatd luma's tiles', kKeepT)
 int gX, gY, gXc, gYc;
-uint gSrcY[kLumaPer], gSrcU[kChromaPer], gSrcV[kChromaPer];
+uint gSrcY[kKeep ? kLumaPer : 1], gSrcU[kKeep ? kChromaPer : 1], gSrcV[kKeep ? kChromaPer : 1];
+uint gSrcT[kSatd ? (kKeepT ? 16 * kTilesPer : 1) : 1];
 int gLane;
 
 uint AbsDiff(uint a, uint b) {
     return a > b ? a - b : b - a;
 }
 
-// The block's luma SAD and chroma SAD (U's and V's together) at vector (vx, vy), 1 / pel pixels;
-// chroma at the vector divided by the subsampling, rounded toward zero (mvu's GetRefBlockU)
+// mvu's SATD (SADFunctions.cpp's Satd_C) of a 4x4 tile from its rows of differences: the sum of the
+// absolute values of its 4x4 Hadamard transform, halved, which is exact, the sum always being even.
+// Each row transformed, then the first step of the columns'; the second step's absolute values come
+// in pairs, |a + b| + |a - b| = 2 max(|a|, |b|), so the halved sum is the sum of those maxima.
+ivec4 Hadamard4(ivec4 d) {
+    int s0 = d.x + d.y, s1 = d.x - d.y, s2 = d.z + d.w, s3 = d.z - d.w;
+    return ivec4(s0 + s2, s1 + s3, s0 - s2, s1 - s3);
+}
+
+uint TileSatd(ivec4 d0, ivec4 d1, ivec4 d2, ivec4 d3) {
+    ivec4 h0 = Hadamard4(d0), h1 = Hadamard4(d1), h2 = Hadamard4(d2), h3 = Hadamard4(d3);
+    ivec4 p0 = h0 + h1, p1 = h0 - h1, p2 = h2 + h3, p3 = h2 - h3;
+    ivec4 m = max(abs(p0), abs(p2)) + max(abs(p1), abs(p3));
+    return uint(m.x + m.y + m.z + m.w);
+}
+
+// The SATD of luma tile t (kTilesX to a row) at vector (X0, Y0) of the reference, its current pixels
+// those kept at gSrcT[16 * k] (kKeepT) or read from the super
+uint TileSatdAt(int t, int k, int X0, int Y0) {
+    int tx = (t % kTilesX) * 4, ty = (t / kTilesX) * 4;
+    ivec4 d[4];
+    [[unroll]] for (int i = 0; i < 4; ++i)
+        [[unroll]] for (int c = 0; c < 4; ++c) {
+            uint cur = kKeepT ? gSrcT[16 * k + 4 * i + c] : SrcSample(0, gX + tx + c, gY + ty + i);
+            d[i][c] = int(cur) - int(RefSample(0, X0 + (tx + c) * kPel, Y0 + (ty + i) * kPel));
+        }
+    return TileSatd(d[0], d[1], d[2], d[3]);
+}
+
+// The block's luma SAD (with kSatd its SATD) and chroma SAD (U's and V's together) at vector (vx, vy),
+// 1 / pel pixels; chroma at the vector divided by the subsampling, rounded toward zero (mvu's
+// GetRefBlockU)
 uvec2 Sads(int vx, int vy) {
     uint sl = 0u, sc = 0u;
     int X0 = gX * kPel + vx, Y0 = gY * kPel + vy;
-    [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
-        int i = gLane + k * kSubgroup;
-        if (i < kBlk * kBlk)
-            sl += AbsDiff(gSrcY[k], RefSample(0, X0 + (i % kBlk) * kPel, Y0 + (i / kBlk) * kPel));
+    if (kSatd) {
+        if (kKeepT) {
+            [[unroll]] for (int k = 0; k < kTilesPer; ++k) {
+                int t = gLane + k * kSubgroup;
+                if (t < kTiles)
+                    sl += TileSatdAt(t, k, X0, Y0);
+            }
+        } else {
+            for (int t = gLane; t < kTiles; t += kSubgroup)
+                sl += TileSatdAt(t, 0, X0, Y0);
+        }
+    } else if (kKeep) {
+        [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
+            int i = gLane + k * kSubgroup;
+            if (i < kBlkX * kBlkY)
+                sl += AbsDiff(gSrcY[k], RefSample(0, X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
+        }
+    } else {
+        for (int i = gLane; i < kBlkX * kBlkY; i += kSubgroup)
+            sl += AbsDiff(SrcSample(0, gX + i % kBlkX, gY + i / kBlkX), RefSample(0, X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
     }
     if (kChromaSad) {
         int cvx = (vx + (vx < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (vy + (vy < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
         int Xc0 = gXc * kPel + cvx, Yc0 = gYc * kPel + cvy;
-        [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
-            int i = gLane + k * kSubgroup;
-            if (i < kBlkCX * kBlkCY) {
-                int X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
-                sc += AbsDiff(gSrcU[k], RefSample(1, X, Y)) + AbsDiff(gSrcV[k], RefSample(2, X, Y));
+        if (kKeep) {
+            [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
+                int i = gLane + k * kSubgroup;
+                if (i < kBlkCX * kBlkCY) {
+                    int X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
+                    sc += AbsDiff(gSrcU[k], RefSample(1, X, Y)) + AbsDiff(gSrcV[k], RefSample(2, X, Y));
+                }
+            }
+        } else {
+            for (int i = gLane; i < kBlkCX * kBlkCY; i += kSubgroup) {
+                int x = gXc + i % kBlkCX, y = gYc + i / kBlkCX, X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
+                sc += AbsDiff(SrcSample(1, x, y), RefSample(1, X, Y)) + AbsDiff(SrcSample(2, x, y), RefSample(2, X, Y));
             }
         }
     }
@@ -386,23 +453,34 @@ ivec4 Old(int bx, int by) {
     return oldRec[by * pc.recStrideOld + bx];
 }
 
+// mvu's RescaleToPel: an old vector's component in the super's pel, exact toward a finer pel, rounded
+// to the nearest position alike for both signs toward a coarser one
+int RescaleToPel(int v) {
+    if (pc.oldPelShift >= 0)
+        return v * (1 << pc.oldPelShift);
+    int shift = -pc.oldPelShift, round = 1 << (shift - 1);
+    return v >= 0 ? (v + round) >> shift : -((round - v) >> shift);
+}
+
 // mvu's predictor for block (bx, by): the old vectors interpolated at its centre (smooth), or the
-// nearest old block's, in mvu's integer arithmetic, clipped to the vectors the planes hold the block for
+// nearest old block's, in mvu's integer arithmetic, rescaled to the super's pel and clipped to the
+// vectors the planes hold the block for
 ivec2 Predictor(int bx, int by) {
-    int centerX = kBlk / 2 + pc.step * bx, centerY = kBlk / 2 + pc.step * by;
-    int bxOld = DivT(centerX - pc.blkOld / 2, pc.stepOld), byOld = DivT(centerY - pc.blkOld / 2, pc.stepOld);
-    int deltaX = max(0, centerX - (pc.blkOld / 2 + pc.stepOld * bxOld)), deltaY = max(0, centerY - (pc.blkOld / 2 + pc.stepOld * byOld));
+    int centerX = kBlkX / 2 + pc.step * bx, centerY = kBlkY / 2 + pc.stepY * by;
+    int bxOld = DivT(centerX - pc.blkOld / 2, pc.stepOld), byOld = DivT(centerY - pc.blkOldY / 2, pc.stepOldY);
+    int deltaX = max(0, centerX - (pc.blkOld / 2 + pc.stepOld * bxOld)), deltaY = max(0, centerY - (pc.blkOldY / 2 + pc.stepOldY * byOld));
     int bx1 = min(pc.nbxOld - 1, max(0, bxOld)), bx2 = min(pc.nbxOld - 1, max(0, bxOld + 1));
     int by1 = min(pc.nbyOld - 1, max(0, byOld)), by2 = min(pc.nbyOld - 1, max(0, byOld + 1));
     ivec2 v;
     if (pc.smoothing != 0) {
         ivec2 v1 = Old(bx1, by1).xy, v2 = Old(bx2, by1).xy, v3 = Old(bx1, by2).xy, v4 = Old(bx2, by2).xy;
         ivec2 a = v1 * pc.stepOld + deltaX * (v2 - v1), b = v3 * pc.stepOld + deltaX * (v4 - v3);
-        v = ivec2(DivT(a.x + DivT(deltaY * (b.x - a.x), pc.stepOld), pc.stepOld), DivT(a.y + DivT(deltaY * (b.y - a.y), pc.stepOld), pc.stepOld));
+        v = ivec2(DivT(a.x + DivT(deltaY * (b.x - a.x), pc.stepOldY), pc.stepOld), DivT(a.y + DivT(deltaY * (b.y - a.y), pc.stepOldY), pc.stepOld));
     } else {
-        bool right = deltaX * 2 >= pc.stepOld, down = deltaY * 2 >= pc.stepOld;
+        bool right = deltaX * 2 >= pc.stepOld, down = deltaY * 2 >= pc.stepOldY;
         v = Old(right ? bx2 : bx1, down ? by2 : by1).xy;
     }
+    v = ivec2(RescaleToPel(v.x), RescaleToPel(v.y));
     return clamp(v, gBounds.xy, gBounds.zw - 1);
 }
 
@@ -410,23 +488,36 @@ void main() {
     int bx = int(gl_WorkGroupID.x), by = int(gl_WorkGroupID.y);
     gLane = int(gl_SubgroupInvocationID);
     gX = pc.pad + bx * pc.step;
-    gY = pc.padY + by * pc.step;
+    gY = pc.padY + by * pc.stepY;
     gXc = pc.padc + bx * (pc.step >> kLogX);
-    gYc = pc.padcY + by * (pc.step >> kLogY);
-    [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
-        int i = gLane + k * kSubgroup;
-        gSrcY[k] = i < kBlk * kBlk ? SrcSample(0, gX + i % kBlk, gY + i / kBlk) : 0u;
+    gYc = pc.padcY + by * (pc.stepY >> kLogY);
+    if (kSatd) {
+        if (kKeepT) {
+            [[unroll]] for (int k = 0; k < kTilesPer; ++k) {
+                int t = gLane + k * kSubgroup, tx = (t % kTilesX) * 4, ty = (t / kTilesX) * 4;
+                [[unroll]] for (int i = 0; i < 16; ++i)
+                    gSrcT[16 * k + i] = t < kTiles ? SrcSample(0, gX + tx + (i & 3), gY + ty + (i >> 2)) : 0u;
+            }
+        }
     }
-    [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
-        int i = gLane + k * kSubgroup;
-        bool live = kChromaSad && i < kBlkCX * kBlkCY;
-        gSrcU[k] = live ? SrcSample(1, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
-        gSrcV[k] = live ? SrcSample(2, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+    if (kKeep) {
+        if (!kSatd) {
+            [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
+                int i = gLane + k * kSubgroup;
+                gSrcY[k] = i < kBlkX * kBlkY ? SrcSample(0, gX + i % kBlkX, gY + i / kBlkX) : 0u;
+            }
+        }
+        [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
+            int i = gLane + k * kSubgroup;
+            bool live = kChromaSad && i < kBlkCX * kBlkCY;
+            gSrcU[k] = live ? SrcSample(1, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+            gSrcV[k] = live ? SrcSample(2, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+        }
     }
 
     // The vectors the padded planes hold the block for (mvu's search boundaries)
     int paddedW = pc.aw + 2 * pc.pad, paddedH = pc.ah + 2 * pc.padY;
-    gBounds = ivec4(-gX * kPel, -gY * kPel, (paddedW - gX - kBlk) * kPel, (paddedH - gY - kBlk) * kPel);
+    gBounds = ivec4(-gX * kPel, -gY * kPel, (paddedW - gX - kBlkX) * kPel, (paddedH - gY - kBlkY) * kPel);
     gPred = Predictor(bx, by);
     gLambda = by == 0 ? 0l : int64_t(pc.lambda);
 

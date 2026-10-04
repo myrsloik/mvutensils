@@ -219,9 +219,10 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
 
     // Level L halves level L - 1 rounding up, luma and chroma separately, as the CPU reference's
     // Reduce does. Each plane sits inside a border of repeated edge pixels, so no level SAD clamps:
-    // a block reaches up to pad >> L pixels past the luma edges, that divided by the subsampling
-    // (rounded up) past the chroma edges, and LevelSadOf's words up to 3 bytes further on either
-    // side of a row. Rows are whole words apart, planes start on 16 samples.
+    // a block reaches up to padX >> L pixels past the luma's left and right edges and padY >> L past
+    // its top and bottom, those divided by the subsampling (rounded up) past the chroma edges, and
+    // LevelSadOf's words up to 3 bytes further on either side of a row. Rows are whole words apart,
+    // planes start on 16 samples.
     s.levels.assign(s.topLevel + 1, LevelEntry{});
     int offset = 0;
     auto addPlane = [&](int w, int h, int border, int32_t &stride) {
@@ -236,28 +237,29 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
         h = (h + 1) / 2;
         wc = (wc + 1) / 2;
         hc = (hc + 1) / 2;
-        const int levelPad = std::max(1, padX >> L);
+        const int levelPad = std::max(1, padX >> L), levelPadY = std::max(1, padY >> L);
         LevelEntry &e = s.levels[L];
         e.w = w;
         e.h = h;
-        e.borderY = levelPad + 3;
+        e.borderY = std::max(levelPad, levelPadY) + 3;
         e.offY = addPlane(w, h, e.borderY, e.strideY);
         if (format.chroma) {
             e.wc = wc;
             e.hc = hc;
-            e.borderC = std::max((levelPad + format.xr - 1) / format.xr, (levelPad + format.yr - 1) / format.yr) + 4;
+            e.borderC = std::max((levelPad + format.xr - 1) / format.xr, (levelPadY + format.yr - 1) / format.yr) + 4;
             e.offU = addPlane(wc, hc, e.borderC, e.strideC);
             e.offV = addPlane(wc, hc, e.borderC, e.strideC);
         }
         e.nbx = std::max(1, w / 8);
         e.nby = std::max(1, h / 8);
         e.pad = levelPad;
+        e.padY = levelPadY;
         e.lambdaOff = L * kLambdaEntries;
         if (L >= kFinest) {
             e.fieldOff = s.fieldTotal;
             s.fieldTotal += e.nbx * e.nby;
             // vectors stay within the padding, so |v| <= size + pad
-            s.maxCoarseVector = std::max({s.maxCoarseVector, w + levelPad, h + levelPad});
+            s.maxCoarseVector = std::max({s.maxCoarseVector, w + levelPad, h + levelPadY});
         }
     }
     s.pyramidSamples = offset;
@@ -267,22 +269,38 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
     e0.wc = format.chroma ? width / format.xr : 0;
     e0.hc = format.chroma ? height / format.yr : 0;
     e0.pad = padX;
+    e0.padY = padY;
     e0.frameSamples = offset;
     e0.fieldTotal = s.fieldTotal;
     return s;
 }
 
+SuperLayout SuperLayout::WithGrid(int blkX, int blkY, int overlapX, int overlapY) const {
+    SuperLayout g = *this;
+    g.blk = blkX;
+    g.blkY = blkY;
+    g.overlap = overlapX;
+    g.overlapY = overlapY;
+    g.step = blkX - overlapX;
+    g.stepY = blkY - overlapY;
+    // mvu's MotionBlockPyramid: the blocks that fit the frame, plus more while they fall short of it
+    auto count = [](int size, int step, int overlap) {
+        int n = std::max(0, (size - overlap) / step);
+        while (step * n + overlap < size)
+            ++n;
+        return n;
+    };
+    g.nbx = count(width, g.step, overlapX);
+    g.nby = count(height, g.stepY, overlapY);
+    if (g.step * g.nbx + overlapX > aw || g.stepY * g.nby + overlapY > ah)
+        throw std::runtime_error("The chosen block size has no multiple that will process the entire frame without exceeding the super clip padding, derive a "
+                                 "new suitable super clip and try again");
+    return g;
+}
+
 std::string SuperLayout::Unsupported([[maybe_unused]] Use use) const {
-    if (format.chroma && format.xr != format.yr)
-        return "only Gray, 4:2:0 and 4:4:4 supers are implemented so far";
     if (pel != 1 && pel != 2 && pel != 4)
         return "only supers with pel=1, pel=2 or pel=4 are implemented so far";
-    if (blk != blkY || (blk != 8 && blk != 16 && blk != 32))
-        return "only supers with 8x8, 16x16 or 32x32 blocks are implemented so far";
-    if (overlap != overlapY)
-        return "only supers with the same overlap horizontally and vertically are implemented so far";
-    if (pad != padY)
-        return "only supers with the same padding horizontally and vertically are implemented so far";
     if (nbx < 1 || nby < 1)
         return "the frame is too small to hold a single block at this block size and overlap";
     return {};
@@ -457,7 +475,9 @@ void GetPairArgument(int &h, int &v, const char *name, int defaultH, int default
         v = (numElems == 1) ? h : defaultV;
 }
 
-void CheckBlockSize(int blkX, int blkY, int overlapX, int overlapY, int subSamplingW, int subSamplingH) {
+void CheckBlockSize(int blkX, int blkY, int overlapX, int overlapY, int subSamplingW, int subSamplingH, bool satd) {
+    if (satd && blkX == 16 && blkY == 2)
+        throw std::runtime_error("satd cannot work with 16x2 blocks");
     if ((blkX != 4 || blkY != 4) && (blkX != 8 || blkY != 4) && (blkX != 8 || blkY != 8) && (blkX != 16 || blkY != 2) && (blkX != 16 || blkY != 8) &&
         (blkX != 16 || blkY != 16) && (blkX != 32 || blkY != 16) && (blkX != 32 || blkY != 32) && (blkX != 64 || blkY != 32) && (blkX != 64 || blkY != 64) &&
         (blkX != 128 || blkY != 64) && (blkX != 128 || blkY != 128))

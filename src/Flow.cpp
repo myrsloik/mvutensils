@@ -21,12 +21,20 @@
 // resize in 64 x 64 tiles as mvu does it (TileTaps, as for FlowInter). Two kernels per frame: the scene
 // change test's count of badly matched blocks per vector frame (mask_blocks.comp), then every pixel of
 // every plane (flow_fetch.comp, flow_blur.comp), which copies the clip's pixel where the vectors are at
-// a scene change, since the host can't see the count. The result is mvu's bit for bit given the same
-// super and vectors.
+// a scene change, since the host can't see the count. With Flow's fields, the vectors are shifted
+// vertically by the field shift between the frames' parities, as mvu's MakeSmallVectorMasks shifts
+// them. The result is mvu's bit for bit given the same super and vectors.
 //
-// Implemented: all of their arguments but Flow's fields, on mvgpu.Super's Gray, 4:2:0 and 4:4:4 supers
-// of 8 to 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors made from
-// such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+// Implemented: all of their arguments, on mvgpu.Super's Gray and YUV supers of any subsampling and 8 to
+// 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and paddings, and vectors
+// made from such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+
+namespace {
+
+// FlowParams' flags, flow_common.glsl's: the plane's resize goes down first
+constexpr int kVerticalFirst = 8;
+
+} // namespace
 
 struct FlowFetchData {
     VSNode *node = nullptr;  // the clip
@@ -38,6 +46,7 @@ struct FlowFetchData {
     std::string prefix, name;
 
     bool blur = false; // FlowBlur, else Flow
+    bool fields = false, tff = false, tffExists = false; // Flow: the frames are fields, of these parities (GetTopField)
     int delta = 0;     // Flow: the vectors' reference frame is n + delta; FlowBlur: mvfw's delta, -off
     int time256 = 0;   // Flow's time, FlowBlur's blur256
     int prec = 1;      // FlowBlur
@@ -50,6 +59,7 @@ struct FlowFetchData {
     VSGPUBuffer *taps = nullptr; // the resize's taps (TileTaps), also bound where a frame has nothing
     VSVulkanBufferInfo tapsInfo = {};
     int colOff[2] = {}, rowOff[2] = {}; // where luma's and chroma's are in it
+    bool verticalFirst[2] = {};         // whether zimg resizes luma's and chroma's down first
     std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
@@ -83,11 +93,16 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
     const bool load = d->blur ? n + d->delta >= 0 && n - d->delta < frames : superFrame >= 0 && superFrame < frames;
     const int vectorClips = d->blur ? 2 : 1;
 
+    // Flow's field shift reads the parity of frame n's super too
+    const bool parities = d->fields && d->layout.pel > 1 && d->delta % 2 != 0;
+
     if (activationReason == arInitial) {
         if (load) {
             for (int i = 0; i < vectorClips; ++i)
                 vsapi->requestFrameFilter(vecFrame[i], d->vectors[i], frameCtx);
-            vsapi->requestFrameFilter(superFrame, d->super, frameCtx);
+            if (parities)
+                vsapi->requestFrameFilter(std::min(n, superFrame), d->super, frameCtx);
+            vsapi->requestFrameFilter(parities ? std::max(n, superFrame) : superFrame, d->super, frameCtx);
         }
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
@@ -143,6 +158,18 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         SuperRegions regions;
         if (const std::string e = CheckSuperFrame(sup, L, d->prefix, regions, vsapi); !e.empty())
             return fail(e);
+
+        // mvu.Flow's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the super
+        // frames' parities (their _Field, or tff)
+        int fieldShift = 0;
+        if (parities) {
+            const VSFrame *own = hold(vsapi->getFrameFilter(n, d->super, frameCtx));
+            try {
+                fieldShift = ComputeFieldShift(GetTopField(own, n, d->tffExists, d->tff, true, vsapi), GetTopField(sup, superFrame, d->tffExists, d->tff, true, vsapi), L.pel);
+            } catch (const std::exception &e) {
+                return fail(e.what());
+            }
+        }
 
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
@@ -216,6 +243,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
         pc.time4096FX = d->prec; // flow_blur.comp's prec
+        pc.fieldShift = fieldShift;
 
         // Flow reads the reference frame's super as ref, FlowBlur its own frame's as src
         const int lumaBinding = d->blur ? kFlSrcLuma : kFlRefLuma, chromaBinding = d->blur ? kFlSrcChroma : kFlRefChroma;
@@ -234,6 +262,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
             pc.colOff = d->colOff[p ? 1 : 0];
             pc.rowOff = d->rowOff[p ? 1 : 0];
+            pc.flags = d->verticalFirst[p ? 1 : 0] ? kVerticalFirst : 0;
             rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
             rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
@@ -288,8 +317,9 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             double time = vsapi->mapGetFloat(in, "time", 0, &err);
             if (err)
                 time = 100.0;
-            if (vsapi->mapGetInt(in, "fields", 0, &err) && !err)
-                throw std::runtime_error("fields=True isn't implemented");
+            d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+            d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
+            d->tffExists = !err;
             if (!std::isfinite(time) || time < 0.0 || time > 100.0)
                 throw std::runtime_error("time must be between 0 and 100%");
             d->time256 = static_cast<int>(time * 256.0 / 100.0);
@@ -331,9 +361,6 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             if (i == 0 && (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
                            v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
                 throw std::runtime_error("wrong source or super clip frame size");
-            if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
-                v.nby != analysed.nby)
-                throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
         }
         const VectorInfo &v = info[0];
         if (d->blur) {
@@ -359,24 +386,27 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
         // The resize's taps: luma's columns and rows, then chroma's, its blocks luma's shifted by the
         // subsampling, as mvu's MaskResizer has them (4:4:4 chroma takes luma's)
-        const int blk = v.blkX, overlap = v.overlapX;
         std::vector<int32_t> tables;
         for (int c = 0; c < (L.format.xr > 1 || L.format.yr > 1 ? 2 : 1); ++c) {
             const int lx = c ? d->vi->format.subSamplingW : 0, ly = c ? d->vi->format.subSamplingH : 0;
-            const int stepX = (blk >> lx) - (overlap >> lx), stepY = (blk >> ly) - (overlap >> ly);
+            const int overlapX = v.overlapX >> lx, overlapY = v.overlapY >> ly;
+            const int stepX = (v.blkX >> lx) - overlapX, stepY = (v.blkY >> ly) - overlapY;
             const int w = d->vi->width >> lx, h = d->vi->height >> ly;
-            if (!TilesHorizontalFirst(d->nbx, w, stepX, overlap >> lx, d->nby, h, stepY, overlap >> ly))
-                throw std::runtime_error("zimg would resize the vectors vertically first, which isn't implemented");
+            const PassOrder order = TilesPassOrder(d->nbx, w, stepX, overlapX, d->nby, h, stepY, overlapY);
+            if (order == PassOrder::Mixed)
+                throw std::runtime_error("zimg would resize some of the vectors' tiles horizontally first and others vertically first, which isn't implemented");
+            d->verticalFirst[c] = order == PassOrder::Vertical;
             d->colOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, overlap >> lx);
+            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, overlapX);
             tables.insert(tables.end(), cols.begin(), cols.end());
             d->rowOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, overlap >> ly);
+            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, overlapY);
             tables.insert(tables.end(), rows.begin(), rows.end());
         }
         if (L.format.xr == 1 && L.format.yr == 1) {
             d->colOff[1] = d->colOff[0];
             d->rowOff[1] = d->rowOff[0];
+            d->verticalFirst[1] = d->verticalFirst[0];
         }
         tables.resize(std::max<size_t>(tables.size(), 64)); // a dummy for the bindings a frame doesn't use too
 

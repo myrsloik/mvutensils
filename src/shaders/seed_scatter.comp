@@ -18,7 +18,7 @@ void main() {
         return;
     ivec4 r = invRec[RecIndex(b)];
     ivec2 u = r.xy;
-    int tx = RoundDiv(kPel * (b % pc.nbx) * pc.step + u.x, kPel * pc.step), ty = RoundDiv(kPel * (b / pc.nbx) * pc.step + u.y, kPel * pc.step);
+    int tx = RoundDiv(kPel * (b % pc.nbx) * pc.step + u.x, kPel * pc.step), ty = RoundDiv(kPel * (b / pc.nbx) * pc.stepY + u.y, kPel * pc.stepY);
     if (tx < 0 || ty < 0 || tx >= pc.nbx || ty >= pc.nby)
         return;
     atomicMin(invKey[ty * pc.nbx + tx], (uint64_t(r.z) << 32) | uint64_t(b));

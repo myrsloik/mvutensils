@@ -55,10 +55,10 @@
 struct LevelEntry {
     int32_t w, h, wc, hc;
     int32_t offY, offU, offV, nbx;
-    int32_t nby, fieldOff, pad, lambdaOff;
-    int32_t frameSamples, fieldTotal; // entry 0 only
+    int32_t nby, fieldOff, pad, lambdaOff; // pad: the horizontal padding, padY the vertical
+    int32_t frameSamples, fieldTotal;      // entry 0 only
     int32_t strideY, strideC;
-    int32_t borderY, borderC, reserved[2];
+    int32_t borderY, borderC, padY, reserved;
 };
 static_assert(sizeof(LevelEntry) == 80, "pyr_common.glsl's Level is 20 ints");
 
@@ -116,6 +116,12 @@ struct SuperLayout {
     static SuperLayout Make(const SuperFormat &format, int width, int height, int blkX, int blkY, int overlapX, int overlapY, int padX, int padY, int pel,
                             bool pyramid);
 
+    // The same super analysed on another grid, as mvu.Analyse and mvu.Recalculate take one: blkX x blkY
+    // blocks overlapping by overlapX x overlapY, as many as cover the frame (extended as mvu extends
+    // them), within the super's block-aligned frame aw x ah, which stays as it is with the planes and
+    // the padding; throws mvu's error when they don't fit in it
+    SuperLayout WithGrid(int blkX, int blkY, int overlapX, int overlapY) const;
+
     // Chroma kept as its quarter-pel image: subsampled chroma at pel 4
     bool ChromaImage() const { return pel == 4 && format.chroma && (format.xr > 1 || format.yr > 1); }
     // Plane sizes each chroma plane takes: its full-pel plane, its four half-pel planes, or its image
@@ -135,9 +141,9 @@ struct SuperLayout {
     // Which filter is to read the super: the search (Analyse, AnalyseMany), or the filters that
     // compensate motion with its vectors (Degrain, FlowInter, FlowFPS)
     enum class Use { Search, Compensation };
-    // What they implement so far, either of them: Gray, 4:2:0 or 4:4:4 of 8 to 16-bit or float samples
-    // at any pel, square blocks of 8, 16 or 32 with the same overlap and padding either way. Empty when
-    // the layout is one of those, else what it lacks.
+    // What they implement so far, either of them: Gray or YUV of any subsampling, of 8 to 16-bit or
+    // float samples, at any pel, any of mvu's block sizes, overlaps and paddings. Empty when the layout
+    // is one of those, else what it lacks.
     std::string Unsupported(Use use) const;
 
     bool operator==(const SuperLayout &o) const;
@@ -202,4 +208,4 @@ const VSFrame *GetAnalysisVectors(const VSFrame *frame, const VectorInfo &expect
 // mvu's argument helpers: an "h" or "h,v" list argument (absent -> the defaults, one value -> v = h),
 // and the block size and overlap rules
 void GetPairArgument(int &h, int &v, const char *name, int defaultH, int defaultV, const VSMap *in, const VSAPI *vsapi);
-void CheckBlockSize(int blkX, int blkY, int overlapX, int overlapY, int subSamplingW, int subSamplingH);
+void CheckBlockSize(int blkX, int blkY, int overlapX, int overlapY, int subSamplingW, int subSamplingH, bool satd = false);

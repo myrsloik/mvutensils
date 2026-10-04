@@ -4,6 +4,8 @@ mistakes with the same message, or do the same with them.
 
   pad       Super with a padding the chroma subsampling doesn't divide (refused), and with one it does
             (an odd vertical padding at 4:2:2, taken)
+  grid      Analyse and Recalculate on a grid other than the super's: within its block-aligned frame
+            (taken), and past it (refused)
   length    super, centersuper and vector clips shorter than the clip they go with, for every filter
             that pairs them (Recalculate: vectors shorter than the super)
   super     a super clip spliced from two supers made with different arguments (but the same frame
@@ -13,6 +15,10 @@ mistakes with the same message, or do the same with them.
   pairs     vector clips analysed at different bit depths passed to one Degrain or FlowInter
   reference Recalculate with a super shorter than the vector clip: the frames whose reference frame
             is past the super's end get no vectors, though the vector clip has some for them
+  satd      Analyse and Recalculate with satd on 16x2 blocks (refused)
+  fields    Analyse, Compensate, Flow and Recalculate with fields on frames without _Field and without
+            tff (refused at the first frame that needs a parity) and with tff (taken), and at pel 1
+            (Compensate and Recalculate refuse it, Analyse and Flow take it)
 
     check_robustness.py --src clip.nv12 --size 1920x1080 --frames 10
 """
@@ -28,6 +34,9 @@ from mvtest import format_clip, nv12_clip  # noqa: E402
 LENGTH = 'must have at least as many frames as'
 SPLICED_SUPER = 'a super clip frame was made with different Super arguments than its first frame'
 SPLICED_VECTORS = 'a vector clip frame was made with different Analyse/Recalculate arguments than its first frame'
+SATD16X2 = 'satd cannot work with 16x2 blocks'
+NO_FIELD = '_Field property not found in input frame. Therefore, you must pass tff argument'
+FIELDS_PEL = 'fields option requires pel > 1'
 
 
 class Results:
@@ -107,6 +116,21 @@ def main():
                 'pad must be divisible by the chroma subsampling')
     both_accept(results, 'Super pad 8x9 at 4:2:2', lambda: mvu.Super(c422, pad=[8, 9], **sk), lambda: gpu.Super(core.std.GPUUpload(c422), pad=[8, 9], **sk))
 
+    # grids other than the super's: within its block-aligned frame, or past it (of a 1914x1074 crop, a
+    # 16/8 super's frame is 1920x1080, which an 8/4 grid fits; an 8/4 super's is 1916x1076, which 16/8
+    # and 32/16 grids overrun)
+    crop = core.std.CropAbs(clip, 1914, 1074)
+    gcrop = core.std.GPUUpload(crop)
+    cbig, gbig = core.mvu.Super(crop, blksize=16, overlap=8), core.mvgpu.Super(gcrop, blksize=16, overlap=8)
+    csmall, gsmall = core.mvu.Super(crop, blksize=8, overlap=4), core.mvgpu.Super(gcrop, blksize=8, overlap=4)
+    both_accept(results, 'Analyse 8/4 on a 16/8 super', lambda: mvu.Analyse(cbig, blksize=8, overlap=4), lambda: gpu.Analyse(gbig, blksize=8, overlap=4))
+    both_refuse(results, 'Analyse 16/8 on an 8/4 super', lambda: mvu.Analyse(csmall, blksize=16, overlap=8), lambda: gpu.Analyse(gsmall, blksize=16, overlap=8),
+                'has no multiple')
+    both_refuse(results, 'Analyse 32/16 on an 8/4 super', lambda: mvu.Analyse(csmall, blksize=32, overlap=16), lambda: gpu.Analyse(gsmall, blksize=32, overlap=16),
+                'has no multiple')
+    both_refuse(results, 'Recalculate 32/16 on an 8/4 super', lambda: mvu.Recalculate(csmall, mvu.Analyse(csmall), blksize=32, overlap=16),
+                lambda: gpu.Recalculate(gsmall, gpu.Analyse(gsmall), blksize=32, overlap=16), 'has no multiple', frames=(1,))
+
     # length
     short = frames - 1
     for label, make_mvu, make_gpu, text in [
@@ -181,6 +205,33 @@ def main():
             results.fail(f'reference: Recalculate frame {n}: mvu {"has" if has_c else "lacks"} vectors, mvgpu {"has" if has_g else "lacks"} them')
         if n == keep - 1 and (has_c or has_g):
             results.fail(f'reference: Recalculate frame {n}, whose reference is past the super, has vectors')
+
+    # satd: not on 16x2 blocks
+    both_refuse(results, 'satd: Analyse 16x2', lambda: mvu.Analyse(csup, blksize=[16, 2], overlap=[8, 0], satd=1),
+                lambda: gpu.Analyse(gsup, blksize=[16, 2], overlap=[8, 0], satd=1), SATD16X2)
+    both_refuse(results, 'satd: Recalculate 16x2', lambda: mvu.Recalculate(csup, cvec[0], blksize=[16, 2], overlap=[8, 0], satd=1),
+                lambda: gpu.Recalculate(gsup, gvec[0], blksize=[16, 2], overlap=[8, 0], satd=1), SATD16X2)
+
+    # fields: the frames' parities, from _Field (the clip has none) or tff; delta 1, the first frame with a
+    # reference frame
+    for label, make_mvu, make_gpu in [
+        ('Analyse', lambda **k: mvu.Analyse(csup, fields=1, **k), lambda **k: gpu.Analyse(gsup, fields=1, **k)),
+        ('Compensate', lambda **k: mvu.Compensate(clip, csup, cvec[0], fields=1, **k), lambda **k: gpu.Compensate(gclip, gsup, gvec[0], fields=1, **k)),
+        ('Flow', lambda **k: mvu.Flow(clip, csup, cvec[0], fields=1, **k), lambda **k: gpu.Flow(gclip, gsup, gvec[0], fields=1, **k)),
+        ('Recalculate', lambda **k: mvu.Recalculate(csup, cvec[0], fields=1, **k), lambda **k: gpu.Recalculate(gsup, gvec[0], fields=1, **k)),
+    ]:
+        both_refuse(results, f'fields: {label} without _Field or tff', make_mvu, make_gpu, NO_FIELD, frames=(1,))
+        both_accept(results, f'fields: {label} with tff', lambda m=make_mvu: m(tff=1), lambda g=make_gpu: g(tff=1), frames=(1,))
+    sk1 = dict(sk, pel=1)
+    csup1, gsup1 = core.mvu.Super(clip, **sk1), core.mvgpu.Super(gclip, **sk1)
+    cvec1, gvec1 = core.mvu.Analyse(csup1), core.mvgpu.Analyse(gsup1)
+    both_refuse(results, 'fields: Compensate at pel 1', lambda: mvu.Compensate(clip, csup1, cvec1, fields=1, tff=1),
+                lambda: gpu.Compensate(gclip, gsup1, gvec1, fields=1, tff=1), FIELDS_PEL)
+    both_refuse(results, 'fields: Recalculate at pel 1', lambda: mvu.Recalculate(csup1, cvec1, fields=1, tff=1),
+                lambda: gpu.Recalculate(gsup1, gvec1, fields=1, tff=1), FIELDS_PEL)
+    both_accept(results, 'fields: Analyse at pel 1', lambda: mvu.Analyse(csup1, fields=1, tff=1), lambda: gpu.Analyse(gsup1, fields=1, tff=1), frames=(1,))
+    both_accept(results, 'fields: Flow at pel 1', lambda: mvu.Flow(clip, csup1, cvec1, fields=1, tff=1), lambda: gpu.Flow(gclip, gsup1, gvec1, fields=1, tff=1),
+                frames=(1,))
 
     print(f'{frames} frames: {results.cases} cases, {results.problems} problems')
     sys.exit(0 if results.problems == 0 else 1)

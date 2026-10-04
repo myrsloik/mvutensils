@@ -40,20 +40,26 @@ ivec2 HalfGrid(ivec2 v) {
 // when pc.flags & 2 (seed_scatter.comp, whose key is reset here for the next field); the vectors of
 // the finest level's block covering the block's centre and its four neighbours, scaled to
 // half-pels at full size. The median and the finest level come from the field's coarse result
-// (binding 28, from pc.coarseBase on). One lane per block; dispatched as ((nbx * nby + 63) / 64, 1).
+// (binding 28, from pc.coarseBase on); with pc.flags & 4, a super without coarse levels, there is
+// none, and neither are seeds. Zero and the median are shifted vertically by pc.fieldShift, as
+// mvu.Analyse shifts its zero and global predictors at the finest level (fields). One lane per
+// block; dispatched as ((nbx * nby + 63) / 64, 1).
 void main() {
     int b = int(gl_GlobalInvocationID.x);
     if (b >= pc.nbx * pc.nby)
         return;
     gX = (b % pc.nbx) * pc.step;
-    gY = (b / pc.nbx) * pc.step;
+    gY = (b / pc.nbx) * pc.stepY;
     gCount = 0;
-    Add(ivec2(0));
-    Add(coarse[pc.coarseBase]);
+    ivec2 shift = ivec2(0, pc.fieldShift);
+    Add(shift);
+    bool coarseSearch = (pc.flags & 4) == 0;
+    if (coarseSearch)
+        Add(coarse[pc.coarseBase] + shift);
     if ((pc.flags & 1) != 0) {
         ivec2 v1 = stepRec[RecIndex(b)].xy;
         int tx = clamp(RoundDiv(kPel * gX + v1.x, kPel * pc.step), 0, pc.nbx - 1);
-        int ty = clamp(RoundDiv(kPel * gY + v1.y, kPel * pc.step), 0, pc.nby - 1);
+        int ty = clamp(RoundDiv(kPel * gY + v1.y, kPel * pc.stepY), 0, pc.nby - 1);
         Add(HalfGrid(v1 + restRec[ty * pc.recStride + tx].xy));
     }
     if ((pc.flags & 2) != 0) {
@@ -63,13 +69,15 @@ void main() {
             invKey[b] = ~0ul;
         }
     }
-    Level co = levels[pc.finest];
-    int span = 8 << pc.finest, scale = kPel << pc.finest;
-    ivec2 centre = ivec2(min((gX + kBlk / 2) / span, co.nbx - 1), min((gY + kBlk / 2) / span, co.nby - 1));
-    [[unroll]] for (int i = 0; i < 5; ++i) {
-        ivec2 a = centre + kAround5[i];
-        if (a.x >= 0 && a.y >= 0 && a.x < co.nbx && a.y < co.nby)
-            Add(coarse[pc.coarseBase + 1 + a.y * co.nbx + a.x] * scale);
+    if (coarseSearch) {
+        Level co = levels[pc.finest];
+        int span = 8 << pc.finest, scale = kPel << pc.finest;
+        ivec2 centre = ivec2(min((gX + kBlkX / 2) / span, co.nbx - 1), min((gY + kBlkY / 2) / span, co.nby - 1));
+        [[unroll]] for (int i = 0; i < 5; ++i) {
+            ivec2 a = centre + kAround5[i];
+            if (a.x >= 0 && a.y >= 0 && a.x < co.nbx && a.y < co.nby)
+                Add(coarse[pc.coarseBase + 1 + a.y * co.nbx + a.x] * scale);
+        }
     }
     [[unroll]] for (int i = 0; i < kMaxList; ++i)
         if (i < gCount)

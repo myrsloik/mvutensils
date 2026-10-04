@@ -53,6 +53,11 @@ CLIPS = {
 }
 
 
+def rect(bx, by, ox, oy):
+    """--blksize and --overlap of a grid whose axes may differ, as Super's lists take them"""
+    return ['--blksize', str(bx), str(by), '--overlap', str(ox), str(oy)]
+
+
 def super_cases():
     formats = ['YUV422P8', 'YUV440P8', 'YUV444P8', 'GRAY8', 'YUV420P10', 'YUV420P16', 'YUV444P16', 'GRAY16', 'YUV422P12', 'YUV420PS', 'YUV444PS', 'GRAYS']
     cases = [['--format', f] for f in formats]
@@ -218,6 +223,125 @@ def analyse_cases():
         ('pel 1 16/6 1914x1074', ff, ['--frames', '10', '--crop', '1914x1074'] + grid(16, 6, 1)),
         ('pel 1 badsad 300 badstep 1 16/8', ob, ['--frames', '10', '--badsad', '300', '--badstep', '1'] + grid(16, 8, 1)),
         ('pel 1 radius 3 8/4 plevel 2', ff, ['--frames', '12', '--radius', '3', '--plevel', '2'] + grid(8, 4, 1)),
+        # 4:2:2 and 4:4:0: every block size and pel, high bit depths and floats, and the arguments
+        # that meet chroma's rows and columns apart (the fallback's units, the lane split, the grid's
+        # edges)
+        ('422 8/4 pel 2', ff, ['--frames', '10', '--format', 'YUV422P8'] + grid(8, 4)),
+        ('422 16/8 pel 4', ob, ['--frames', '10', '--format', 'YUV422P8'] + grid(16, 8, 4)),
+        ('422 32/16 pel 2', ff, ['--frames', '10', '--format', 'YUV422P8'] + grid(32, 16)),
+        ('422 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV422P8'] + grid(32, 16, 4)),
+        ('440 8/4 pel 4', ff, ['--frames', '10', '--format', 'YUV440P8'] + grid(8, 4, 4)),
+        ('440 16/8 pel 2', ob, ['--frames', '10', '--format', 'YUV440P8'] + grid(16, 8)),
+        ('440 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV440P8'] + grid(32, 16, 4)),
+        ('YUV422P10 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV422P10'] + grid(16, 8, 4)),
+        ('YUV422P16 32/16 pel 2', ob, ['--frames', '10', '--format', 'YUV422P16'] + grid(32, 16)),
+        ('YUV440P16 8/4 pel 4', ff, ['--frames', '10', '--format', 'YUV440P16'] + grid(8, 4, 4)),
+        ('YUV440P12 32/16 pel 4', ff, ['--frames', '10', '--format', 'YUV440P12'] + grid(32, 16, 4)),
+        ('YUV422PS 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV422PS'] + grid(16, 8, 4)),
+        ('YUV440PS 32/16 pel 2', ob, ['--frames', '10', '--format', 'YUV440PS'] + grid(32, 16)),
+        ('pel 1 422 16/8', ff, ['--frames', '10', '--format', 'YUV422P8'] + grid(16, 8, 1)),
+        ('pel 1 YUV440P16 32/16', ff, ['--frames', '10', '--format', 'YUV440P16'] + grid(32, 16, 1)),
+        ('422 chroma 0 16/8 pel 4', ff, ['--frames', '10', '--format', 'YUV422P8', '--chroma', '0'] + grid(16, 8, 4)),
+        ('422 badsad 200 16/8', ff, ['--frames', '10', '--format', 'YUV422P8', '--badsad', '200'] + grid(16, 8)),
+        ('440 badsad 300 badrange 24 badstep 1 32/16 pel 4', ob, ['--frames', '10', '--format', 'YUV440P8', '--badsad', '300', '--badrange', '24',
+                                                                  '--badstep', '1'] + grid(32, 16, 4)),
+        ('422 32/12 1906x1070', ff, ['--frames', '10', '--format', 'YUV422P8', '--crop', '1906x1070'] + grid(32, 12)),
+        ('440 16/6 pel 4 1914x1074', ob, ['--frames', '10', '--format', 'YUV440P8', '--crop', '1914x1074'] + grid(16, 6, 4)),
+        ('422 standalone 8/4 pel 4', ob, ['--frames', '10', '--format', 'YUV422P8', '--standalone'] + grid(8, 4, 4)),
+        ('440 radius 3 16/8 plevel 2', ff, ['--frames', '12', '--format', 'YUV440P8', '--radius', '3', '--plevel', '2'] + grid(16, 8)),
+        # Rectangular blocks, and overlaps and paddings apart: every shape, pels, formats and depths, and
+        # the arguments that meet the grid's rows (the fallback's units, the seeds' block centres, the
+        # coarse levels' vertical padding)
+        ('16x8/8x4 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(16, 8, 8, 4)),
+        ('16x8/8x4 pel 4', ob, ['--frames', '10', '--pel', '4'] + rect(16, 8, 8, 4)),
+        ('32x16/16x8 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(32, 16, 16, 8)),
+        ('32x16/8x8 pel 4', ff, ['--frames', '10', '--pel', '4'] + rect(32, 16, 8, 8)),
+        ('8x4/4x2 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(8, 4, 4, 2)),
+        ('8x4/4x0 pel 4', ob, ['--frames', '10', '--pel', '4'] + rect(8, 4, 4, 0)),
+        ('16x2/8x0 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(16, 2, 8, 0)),
+        ('16x2/4x0 pel 4', ff, ['--frames', '10', '--pel', '4'] + rect(16, 2, 4, 0)),
+        ('16/8x4 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(16, 16, 8, 4)),
+        ('32/8x16 pel 4', ob, ['--frames', '10', '--pel', '4'] + rect(32, 32, 8, 16)),
+        ('16/8 pad 16x8', ff, ['--frames', '10', '--pad', '16', '8'] + grid(16, 8)),
+        ('16/8 pad 8x24 pel 4', ff, ['--frames', '10', '--pad', '8', '24'] + grid(16, 8, 4)),
+        ('422 16x8/4x2 pad 12x6 pel 4', ff, ['--frames', '10', '--format', 'YUV422P8', '--pad', '12', '6', '--pel', '4'] + rect(16, 8, 4, 2)),
+        ('440 32x16/8x8', ob, ['--frames', '10', '--format', 'YUV440P8'] + rect(32, 16, 8, 8)),
+        ('444 16x2/8x1 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8', '--pel', '4'] + rect(16, 2, 8, 1)),
+        ('YUV420P16 16x8/8x4 pel 4 badsad 200', ff, ['--frames', '10', '--format', 'YUV420P16', '--pel', '4', '--badsad', '200'] + rect(16, 8, 8, 4)),
+        ('YUV444PS 32x16/16x8 pel 1', ff, ['--frames', '10', '--format', 'YUV444PS', '--pel', '1'] + rect(32, 16, 16, 8)),
+        ('YUV422P10 8x4/4x2 pel 4', ob, ['--frames', '10', '--format', 'YUV422P10', '--pel', '4'] + rect(8, 4, 4, 2)),
+        ('chroma 0 8x4/2x2 pel 4', ff, ['--frames', '10', '--chroma', '0', '--pel', '4'] + rect(8, 4, 2, 2)),
+        ('444 16x2/8x0 badsad 150 badstep 3', ff, ['--frames', '10', '--format', 'YUV444P8', '--badsad', '150', '--badstep', '3'] + rect(16, 2, 8, 0)),
+        ('16x8/8x4 radius 3 delta 2', ff, ['--frames', '14', '--radius', '3', '--delta', '2'] + rect(16, 8, 8, 4)),
+        ('32x16/16x8 standalone pel 4 1906x1070', ob, ['--frames', '10', '--standalone', '--pel', '4', '--crop', '1906x1070'] + rect(32, 16, 16, 8)),
+        # 4x4 blocks (their 8-bit chroma rows of 2 pixels at 4:2:0 and 4:2:2), and blocks of 64 and 128
+        # pixels (without the block cache where it would pass 16 KB, the lambda table's steps grown, the
+        # fallback's whole SADs where a cost passes its 32-bit bound)
+        ('4/2 pel 2', ff, ['--frames', '10'] + grid(4, 2)),
+        ('4/0 pel 4', ob, ['--frames', '10'] + grid(4, 0, 4)),
+        ('422 4/2 pel 4', ff, ['--frames', '10', '--format', 'YUV422P8'] + grid(4, 2, 4)),
+        ('444 4/0 pel 4', ff, ['--frames', '10', '--format', 'YUV444P8'] + grid(4, 0, 4)),
+        ('YUV420P16 4/2', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(4, 2)),
+        ('YUV420PS 4/0 pel 1', ff, ['--frames', '10', '--format', 'YUV420PS'] + grid(4, 0, 1)),
+        ('GRAY8 4/2 standalone', ff, ['--frames', '10', '--format', 'GRAY8', '--standalone'] + grid(4, 2)),
+        ('64x32/32x16 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(64, 32, 32, 16)),
+        ('64/32 pel 4', ob, ['--frames', '10'] + grid(64, 32, 4)),
+        ('128x64/64x32 pel 2', ff, ['--frames', '10', '--pel', '2'] + rect(128, 64, 64, 32)),
+        ('128/64 pel 2', ff, ['--frames', '10'] + grid(128, 64)),
+        ('YUV444P16 64/32 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16'] + grid(64, 32, 4)),
+        ('YUV420P16 128/64 pel 4', ff, ['--frames', '10', '--format', 'YUV420P16'] + grid(128, 64, 4)),
+        ('YUV422P16 128/32 mvlambda 20000 badsad 200', ff, ['--frames', '10', '--format', 'YUV422P16', '--mvlambda', '20000', '--badsad', '200'] + grid(128, 32)),
+        ('444 128x64/32x32 badsad 100 badrange 24', ff, ['--frames', '10', '--format', 'YUV444P8', '--badsad', '100', '--badrange', '24'] + rect(128, 64, 32, 32)),
+        ('YUV440PS 64x32/16x16 pel 4', ff, ['--frames', '10', '--format', 'YUV440PS', '--pel', '4'] + rect(64, 32, 16, 16)),
+        ('chroma 0 128/64 pel 4', ff, ['--frames', '10', '--chroma', '0'] + grid(128, 64, 4)),
+        ('YUV420P10 64/16 badsad 200 badstep 1', ff, ['--frames', '10', '--format', 'YUV420P10', '--badsad', '200', '--badstep', '1'] + grid(64, 16)),
+        # Grids other than the super's (Analyse's blksize and overlap), inside its block-aligned frame
+        ('8/4 on a 16/8 super', ff, ['--frames', '10', '--super-blksize', '16', '--super-overlap', '8'] + grid(8, 4)),
+        ('16x8/8x4 on a 32/16 super pel 4', ob, ['--frames', '10', '--super-blksize', '32', '--super-overlap', '16', '--pel', '4'] + rect(16, 8, 8, 4)),
+        ('8/4 on a 32/16 super pel 4 1914x1074', ff, ['--frames', '10', '--crop', '1914x1074', '--super-blksize', '32', '--super-overlap', '16'] + grid(8, 4, 4)),
+        ('YUV444P16 32/16 on a 16/8 super 1920x1072', ff, ['--frames', '10', '--format', 'YUV444P16', '--crop', '1920x1072', '--super-blksize', '16',
+                                                          '--super-overlap', '8'] + grid(32, 16)),
+        ('YUV422P10 16x8/8x4 on a 32/16 super pel 4', ff, ['--frames', '10', '--format', 'YUV422P10', '--super-blksize', '32', '--super-overlap', '16',
+                                                           '--pel', '4'] + rect(16, 8, 8, 4)),
+        ('4/2 on an 8/4 super', ff, ['--frames', '10', '--super-blksize', '8', '--super-overlap', '4'] + grid(4, 2)),
+        ('64/32 on a 32/16 super', ff, ['--frames', '10', '--super-blksize', '32', '--super-overlap', '16'] + grid(64, 32)),
+        ('16/8 on a 32/16 super standalone 1910x1074', ob, ['--frames', '10', '--standalone', '--crop', '1910x1074', '--super-blksize', '32',
+                                                            '--super-overlap', '16'] + grid(16, 8)),
+        # Supers without the coarse levels (onelevel, or frames narrower than 192 pixels, which have none):
+        # no coarse search; and frames wider than 8000 pixels (the coarse median in two rounds)
+        ('onelevel 16/8 pel 2', ff, ['--frames', '10', '--onelevel'] + grid(16, 8)),
+        ('onelevel 444 8/4 pel 4', ob, ['--frames', '10', '--onelevel', '--format', 'YUV444P8'] + grid(8, 4, 4)),
+        ('onelevel standalone chroma 0 32/16', ff, ['--frames', '10', '--onelevel', '--standalone', '--chroma', '0'] + grid(32, 16)),
+        ('onelevel YUV420P16 16x8/8x4 radius 3', ff, ['--frames', '12', '--onelevel', '--format', 'YUV420P16', '--radius', '3'] + rect(16, 8, 8, 4)),
+        ('180x100 16/8', ff, ['--frames', '10', '--crop', '180x100'] + grid(16, 8)),
+        ('120x64 8/4 pel 4', ff, ['--frames', '10', '--crop', '120x64'] + grid(8, 4, 4)),
+        ('9600x1080 16/8 radius 1', ff, ['--frames', '4', '--radius', '1', '--stack', '5'] + grid(16, 8)),
+        ('9600x1080 32/16 pel 4 radius 1', ff, ['--frames', '4', '--radius', '1', '--stack', '5'] + grid(32, 16, 4)),
+        # satd: luma's SATD at the full-size grid (init, the passes, the fallback's units and whole SADs, the
+        # half- and quarter-pel steps), every kind of block and format
+        ('satd 16/8 pel 2', ff, ['--frames', '10', '--satd'] + grid(16, 8)),
+        ('satd 8/4 pel 4', ff, ['--frames', '10', '--satd'] + grid(8, 4, 4)),
+        ('satd 4/2 pel 4', ff, ['--frames', '8', '--satd'] + grid(4, 2, 4)),
+        ('satd 444 32/16 pel 4', ob, ['--frames', '10', '--satd', '--format', 'YUV444P8'] + grid(32, 16, 4)),
+        ('satd 422 16x8/8x4', ff, ['--frames', '10', '--satd', '--format', 'YUV422P8'] + rect(16, 8, 8, 4)),
+        ('satd 440 8x4/4x2 pel 1', ff, ['--frames', '10', '--satd', '--format', 'YUV440P8', '--pel', '1'] + rect(8, 4, 4, 2)),
+        ('satd YUV420P10 32x16/16x8 pel 4', ff, ['--frames', '10', '--satd', '--format', 'YUV420P10', '--pel', '4'] + rect(32, 16, 16, 8)),
+        ('satd YUV444P16 32/16', ff, ['--frames', '8', '--satd', '--format', 'YUV444P16'] + grid(32, 16)),
+        ('satd YUV420PS 16/8 pel 4', ff, ['--frames', '10', '--satd', '--format', 'YUV420PS'] + grid(16, 8, 4)),
+        ('satd GRAY16 128/64', ff, ['--frames', '6', '--satd', '--format', 'GRAY16'] + grid(128, 64)),
+        ('satd 64x32/32x16 pel 4', ff, ['--frames', '8', '--satd', '--pel', '4'] + rect(64, 32, 32, 16)),
+        ('satd chroma 0 standalone 16/8', ff, ['--frames', '10', '--satd', '--chroma', '0', '--standalone'] + grid(16, 8)),
+        ('satd badsad 200 badstep 1 16/8', ff, ['--frames', '10', '--satd', '--badsad', '200', '--badstep', '1'] + grid(16, 8)),
+        ('satd mvlambda 30000 badsad 100 YUV444P16 32/16', ff, ['--frames', '8', '--satd', '--mvlambda', '30000', '--badsad', '100', '--format',
+                                                                 'YUV444P16'] + grid(32, 16)),
+        ('satd onelevel 8/4 on a 16/8 super', ff, ['--frames', '10', '--satd', '--onelevel', '--super-blksize', '16', '--super-overlap', '8'] + grid(8, 4)),
+        # fields: zero and the median of a field of an odd delta shifted by the parities' field shift
+        ('fields tff 1 16/8 pel 2', ff, ['--frames', '10', '--fields', '--tff', '1'] + grid(16, 8)),
+        ('fields tff 0 8/4 pel 4 radius 3', ff, ['--frames', '12', '--fields', '--tff', '0', '--radius', '3'] + grid(8, 4, 4)),
+        ('fields parity 1101001011 standalone 32/16', ff, ['--frames', '10', '--fields', '--parity', '1101001011', '--standalone'] + grid(32, 16)),
+        ('fields tff 1 delta 3 radius 1 pel 4', ff, ['--frames', '10', '--fields', '--tff', '1', '--delta', '3', '--radius', '1'] + grid(16, 8, 4)),
+        ('fields tff 1 pel 1', ff, ['--frames', '10', '--fields', '--tff', '1'] + grid(16, 8, 1)),
+        ('fields satd tff 0 onelevel YUV420P10', ff, ['--frames', '10', '--fields', '--tff', '0', '--satd', '--onelevel', '--format', 'YUV420P10'] + grid(16, 8)),
         # 4K
         ('4K 32/16 pel 4', k4, ['--frames', '6'] + grid(32, 16, 4)),
         ('4K YUV420PS 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV420PS'] + grid(16, 8, 4)),
@@ -226,6 +350,11 @@ def analyse_cases():
         ('4K 444 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV444P8'] + grid(16, 8, 4)),
         ('4K 16/8 chroma 0 plevel 2', k4, ['--frames', '6', '--chroma', '0', '--plevel', '2'] + grid(16, 8)),
         ('4K 8/4 pel 2', k4, ['--frames', '6'] + grid(8, 4)),
+        ('4K 422 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV422P8'] + grid(16, 8, 4)),
+        ('4K YUV440P16 32/16 pel 2', k4, ['--frames', '6', '--format', 'YUV440P16'] + grid(32, 16)),
+        ('4K 16x8/8x4 pel 4', k4, ['--frames', '6', '--pel', '4'] + rect(16, 8, 8, 4)),
+        ('4K 128/64 pel 4', k4, ['--frames', '6'] + grid(128, 64, 4)),
+        ('4K satd fields tff 1 16/8 pel 4', k4, ['--frames', '6', '--satd', '--fields', '--tff', '1'] + grid(16, 8, 4)),
     ]
     return cases
 
@@ -234,7 +363,7 @@ def degrain_cases():
     ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
     cases = []
     # Every format, block size and pel, overlap half a block; mvgpu's vectors where Analyse searches the grid
-    for fmt in ('YUV420P8', 'YUV444P8'):
+    for fmt in ('YUV420P8', 'YUV444P8', 'YUV422P8', 'YUV440P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
                 vec = 'mvgpu'
@@ -363,6 +492,60 @@ def degrain_cases():
         ('pel 1 radius 3 limit 3 2', ff, ['--frames', '12', '--pel', '1', '--radius', '3', '--limit', '3', '2']),
         ('pel 1 16/0 1916x1076', ff, ['--frames', '8', '--pel', '1', '--blksize', '16', '--overlap', '0', '--crop', '1916x1076']),
     ]
+    # 4:2:2 and 4:4:0 beyond the grid loop: high bit depths, floats, pel 1, mvu's vectors, grids that
+    # end inside a block, and the arguments that treat chroma apart
+    cases += [
+        ('YUV422P16 32/16 pel 4 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV422P16', '--blksize', '32', '--overlap', '16', '--pel', '4']),
+        ('YUV440P16 8/4 pel 2 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV440P16', '--blksize', '8', '--overlap', '4'] + a8),
+        ('YUV422P10 16/8 pel 4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV422P10', '--pel', '4', '--vectors', 'mvu']),
+        ('YUV440P12 16/8 pel 2 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV440P12']),
+        ('YUV422PS 16/8 pel 2 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV422PS']),
+        ('YUV440PS 32/16 pel 4 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV440PS', '--blksize', '32', '--overlap', '16', '--pel', '4']),
+        ('pel 1 422 16/8', ff, ['--frames', '8', '--pel', '1', '--format', 'YUV422P8']),
+        ('pel 1 YUV440P16 8/4', ff, ['--frames', '8', '--pel', '1', '--format', 'YUV440P16', '--blksize', '8', '--overlap', '4']),
+        ('422 16/6 pel 4 1914x1074 mvu vectors', ff, ['--frames', '8', '--format', 'YUV422P8', '--blksize', '16', '--overlap', '6', '--pel', '4', '--crop', '1914x1074',
+                                                      '--vectors', 'mvu']),
+        ('440 8/2 pel 2 1910x1078 mvu vectors', ff, ['--frames', '8', '--format', 'YUV440P8', '--blksize', '8', '--overlap', '2', '--crop', '1910x1078', '--vectors', 'mvu']),
+        ('422 planes 1 2 limit 3 2 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--planes', '1', '2', '--limit', '3', '2', '--pel', '4']),
+        ('440 radius 3 thsad 600 300 thsad2 200', ff, ['--frames', '12', '--format', 'YUV440P8', '--radius', '3', '--thsad', '600', '300', '--thsad2', '200']),
+        ('422 render 8/4 for 16/8 vectors pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--render', '8', '4', '--pel', '4']),
+        ('440 centersuper 32/16', ff, ['--frames', '8', '--format', 'YUV440P8', '--centersuper', '--blksize', '32', '--overlap', '16']),
+        ('4K 422 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV422P8', '--pel', '4']),
+    ]
+    # Rectangular blocks, and overlaps apart (an overlap of 0 one way takes the windows all the same)
+    cases += [
+        ('16x8/8x4 pel 2', ff, ['--frames', '8'] + rect(16, 8, 8, 4)),
+        ('32x16/16x8 pel 4', ff, ['--frames', '8', '--pel', '4'] + rect(32, 16, 16, 8)),
+        ('8x4/4x0 422', ff, ['--frames', '8', '--format', 'YUV422P8'] + rect(8, 4, 4, 0)),
+        ('16x2/8x0 pel 4', ff, ['--frames', '8', '--pel', '4'] + rect(16, 2, 8, 0)),
+        ('16/8x4 YUV420P16', ff, ['--frames', '8', '--format', 'YUV420P16'] + rect(16, 16, 8, 4)),
+        ('16/0x8 YUV440PS pel 4', ff, ['--frames', '8', '--format', 'YUV440PS', '--pel', '4'] + rect(16, 16, 0, 8)),
+        ('16x8/4x2 mvu vectors 1914x1074', ff, ['--frames', '8', '--vectors', 'mvu', '--crop', '1914x1074'] + rect(16, 8, 4, 2)),
+        ('16x8/8x4 radius 3 thsad 600 300', ff, ['--frames', '12', '--radius', '3', '--thsad', '600', '300'] + rect(16, 8, 8, 4)),
+        ('32x16/8x4 pel 1 planes 1 2', ff, ['--frames', '8', '--pel', '1', '--planes', '1', '2'] + rect(32, 16, 8, 4)),
+        ('444 16x2/8x1 YUV444P10', ff, ['--frames', '8', '--format', 'YUV444P10'] + rect(16, 2, 8, 1)),
+        ('4K 16x8/8x4 pel 4', k4, ['--frames', '6', '--pel', '4'] + rect(16, 8, 8, 4)),
+    ]
+    # 4x4 blocks, and blocks of 64 and 128 pixels
+    cases += [
+        ('4/2 pel 2', ff, ['--frames', '8', '--blksize', '4', '--overlap', '2']),
+        ('4/0 pel 4 YUV422PS', ff, ['--frames', '8', '--format', 'YUV422PS', '--blksize', '4', '--overlap', '0', '--pel', '4']),
+        ('64/32 pel 4', ff, ['--frames', '8', '--blksize', '64', '--overlap', '32', '--pel', '4']),
+        ('128x64/32x16 YUV444P16', ff, ['--frames', '8', '--format', 'YUV444P16'] + rect(128, 64, 32, 16)),
+        ('128/64 radius 3', ff, ['--frames', '12', '--radius', '3', '--blksize', '128', '--overlap', '64']),
+        ('64x32/16x16 mvu vectors 1916x1076', ff, ['--frames', '8', '--vectors', 'mvu', '--crop', '1916x1076'] + rect(64, 32, 16, 16)),
+        ('4K 128/64 pel 4', k4, ['--frames', '6', '--blksize', '128', '--overlap', '64', '--pel', '4']),
+        # Vectors of a grid other than the super's, from both plugins' Analyse
+        ('16/8 super, analysed 8/4', ff, ['--frames', '8', '--analyse-blksize', '8', '--analyse-overlap', '4']),
+        ('32/16 super, analysed 8/4 pel 4 1914x1074', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '8',
+                                                           '--analyse-overlap', '4', '--pel', '4', '--crop', '1914x1074']),
+        ('32/16 super, analysed 32x16/16x8 mvu vectors', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '32', '16',
+                                                              '--analyse-overlap', '16', '8', '--vectors', 'mvu']),
+        ('8/4 super, analysed 16/8 YUV420P16 radius 3', ff, ['--frames', '12', '--format', 'YUV420P16', '--radius', '3', '--blksize', '8', '--overlap', '4',
+                                                            '--analyse-blksize', '16', '--analyse-overlap', '8']),
+        # A frame too small for the coarse search
+        ('180x100 mvgpu vectors', ff, ['--frames', '8', '--crop', '180x100']),
+    ]
     return cases
 
 
@@ -370,7 +553,7 @@ def flow_cases():
     ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
     cases = []
     # Every format, block size and pel, overlap half a block; mvgpu's vectors where Analyse searches the grid
-    for fmt in ('YUV420P8', 'YUV444P8'):
+    for fmt in ('YUV420P8', 'YUV444P8', 'YUV422P8', 'YUV440P8'):
         for blk in (8, 16, 32):
             for pel in (2, 4):
                 vec = 'mvgpu'
@@ -491,6 +674,50 @@ def flow_cases():
         ('inter pel 1 YUV420PS', ff, ['--frames', '8', '--pel', '1', '--format', 'YUV420PS'] + inter),
         ('inter pel 1 GRAY8 time 25', ff, ['--frames', '8', '--pel', '1', '--format', 'GRAY8', '--time', '25'] + inter),
     ]
+    # 4:2:2 and 4:4:0 beyond the grid loop
+    cases += [
+        ('inter const 422 blend 0', ff, ['--frames', '15', '--vectors', 'const', '--format', 'YUV422P8', '--blend', '0'] + inter),
+        ('fps const 440 8/4 pel 4', ff, ['--frames', '15', '--vectors', 'const', '--format', 'YUV440P8', '--blksize', '8', '--overlap', '4', '--pel', '4',
+                                         '--num', '60', '--den', '1'] + fps),
+        ('inter YUV422P16 32/16 pel 4 analysed on 8 bits', ff, ['--frames', '8', '--format', 'YUV422P16', '--blksize', '32', '--overlap', '16', '--pel', '4'] + a8 + inter),
+        ('fps YUV440P10 16/8 mvgpu vectors', ff, ['--frames', '8', '--format', 'YUV440P10', '--num', '60', '--den', '1'] + fps),
+        ('inter YUV440PS 16/8 pel 2', ff, ['--frames', '8', '--format', 'YUV440PS'] + inter),
+        ('fps YUV422PS 8/4 pel 4', ff, ['--frames', '8', '--format', 'YUV422PS', '--blksize', '8', '--overlap', '4', '--pel', '4', '--num', '60', '--den', '1'] + fps),
+        ('inter 422 16/4 1914x1074 mvu vectors', ff, ['--frames', '8', '--format', 'YUV422P8', '--blksize', '16', '--overlap', '4', '--crop', '1914x1074',
+                                                      '--vectors', 'mvu'] + inter),
+        ('inter pel 1 440 16/8 time 25', ff, ['--frames', '8', '--pel', '1', '--format', 'YUV440P8', '--time', '25'] + inter),
+        ('4K inter 422 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV422P8', '--pel', '4'] + inter),
+    ]
+    # Rectangular blocks, and overlaps and paddings apart; with rows a pixel apart in a plane zimg
+    # resizes it vertically first (8x4/4x2 and 16x2's chroma at 4:2:0, 16x2/8x1's luma)
+    cases += [
+        ('inter 16x8/8x4', ff, ['--frames', '8'] + rect(16, 8, 8, 4) + inter),
+        ('fps 16x8/8x4 pel 4', ff, ['--frames', '8', '--pel', '4', '--num', '60', '--den', '1'] + rect(16, 8, 8, 4) + fps),
+        ('inter 32x16/8x8 422 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4'] + rect(32, 16, 8, 8) + inter),
+        ('fps 16/4x8 pad 16x8 440', ff, ['--frames', '8', '--format', 'YUV440P8', '--pad', '16', '8', '--num', '60', '--den', '1'] + rect(16, 16, 4, 8) + fps),
+        ('inter 8x4/4x2', ff, ['--frames', '8'] + rect(8, 4, 4, 2) + inter),
+        ('fps 8x4/4x2 YUV420PS mvu vectors', ff, ['--frames', '8', '--format', 'YUV420PS', '--vectors', 'mvu', '--num', '60', '--den', '1'] + rect(8, 4, 4, 2) + fps),
+        ('inter 16x2/8x0 pel 4', ff, ['--frames', '8', '--pel', '4'] + rect(16, 2, 8, 0) + inter),
+        ('fps 16x2/8x1 YUV422P16', ff, ['--frames', '8', '--format', 'YUV422P16', '--num', '60', '--den', '1'] + rect(16, 2, 8, 1) + fps),
+        ('inter const 16x8/8x4', ff, ['--frames', '15', '--vectors', 'const'] + rect(16, 8, 8, 4) + inter),
+        ('inter const 444 16x2/8x1 blend 0', ff, ['--frames', '15', '--vectors', 'const', '--format', 'YUV444P8', '--blend', '0'] + rect(16, 2, 8, 1) + inter),
+        # 4x4 blocks, and blocks of 64 and 128 pixels
+        ('inter 4/2', ff, ['--frames', '8', '--blksize', '4', '--overlap', '2'] + inter),
+        ('fps 64x32/16x16 422 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4', '--num', '60', '--den', '1'] + rect(64, 32, 16, 16) + fps),
+        ('inter 128/64 YUV420P10', ff, ['--frames', '8', '--format', 'YUV420P10', '--blksize', '128', '--overlap', '64'] + inter),
+        ('fps 4/0 YUV420PS mvu vectors', ff, ['--frames', '8', '--format', 'YUV420PS', '--vectors', 'mvu', '--blksize', '4', '--overlap', '0', '--num', '60', '--den', '1'] + fps),
+        ('inter const 128x64/32x32', ff, ['--frames', '15', '--vectors', 'const'] + rect(128, 64, 32, 32) + inter),
+        # Vectors of a grid other than the super's
+        ('inter 16/8 super, analysed 8/4', ff, ['--frames', '8', '--analyse-blksize', '8', '--analyse-overlap', '4'] + inter),
+        ('fps 32/16 super, analysed 8/4 1914x1074', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '8', '--analyse-overlap', '4',
+                                                         '--crop', '1914x1074', '--num', '60', '--den', '1'] + fps),
+        ('inter 32/16 super, analysed 16x8/8x4 mvu vectors pel 4', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '16', '8',
+                                                                        '--analyse-overlap', '8', '4', '--vectors', 'mvu', '--pel', '4'] + inter),
+        # Frames too small for the coarse search, on mvgpu's vectors
+        ('inter 180x100 mvgpu vectors', ff, ['--frames', '8', '--crop', '180x100'] + inter),
+        ('fps 444 182x102 32/16 pel 4 mvgpu vectors', ff, ['--frames', '8', '--crop', '182x102', '--format', 'YUV444P8', '--blksize', '32', '--overlap', '16',
+                                                           '--pel', '4', '--num', '60', '--den', '1'] + fps),
+    ]
     return cases
 
 
@@ -522,6 +749,22 @@ def masks_cases():
         ('GRAYS random time 50 ml 30', ff, ['--frames', '8', '--format', 'GRAYS', '--time', '50', '--ml', '30'] + rnd),
         ('YUV444PS gamma 0.37 ml 20', ff, ['--frames', '8', '--format', 'YUV444PS', '--gamma', '0.37', '--ml', '20', '--tolerance', '2.4e-7'] + rnd),
         ('YUV420PS scval 0.5', ff, ['--frames', '12', '--format', 'YUV420PS', '--scval', '0.5', '--thscd1', '300', '--thscd2', '20'] + rnd),
+        ('422 16/8 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4']),
+        ('YUV440P16 random', ff, ['--frames', '8', '--format', 'YUV440P16'] + rnd),
+        ('YUV422PS mvu vectors 8/4', ff, ['--frames', '8', '--format', 'YUV422PS', '--vectors', 'mvu', '--blksize', '8', '--overlap', '4']),
+        ('16x8/8x4', ff, ['--frames', '8'] + rect(16, 8, 8, 4)),
+        ('32x16/16x0 pel 4 random pad 16x8', ff, ['--frames', '8', '--pel', '4', '--vectors', 'random', '--pad', '16', '8'] + rect(32, 16, 16, 0)),
+        ('8x4/4x2 YUV420P16 mvu vectors', ff, ['--frames', '8', '--format', 'YUV420P16', '--vectors', 'mvu'] + rect(8, 4, 4, 2)),
+        ('422 16x2/8x1', ff, ['--frames', '8', '--format', 'YUV422P8'] + rect(16, 2, 8, 1)),  # resized vertically first
+        ('YUV444PS 16x2/8x1 random', ff, ['--frames', '8', '--format', 'YUV444PS', '--vectors', 'random'] + rect(16, 2, 8, 1)),
+        ('GRAY10 16x2/4x1 mvu vectors', ff, ['--frames', '8', '--format', 'GRAY10', '--vectors', 'mvu'] + rect(16, 2, 4, 1)),
+        ('4/2', ff, ['--frames', '8', '--blksize', '4', '--overlap', '2']),
+        ('128x64/64x0 YUV420P16 random', ff, ['--frames', '8', '--format', 'YUV420P16', '--vectors', 'random'] + rect(128, 64, 64, 0)),
+        ('64/32 YUV444PS mvu vectors', ff, ['--frames', '8', '--format', 'YUV444PS', '--vectors', 'mvu', '--blksize', '64', '--overlap', '32']),
+        ('32/16 super, analysed 16x8/8x4 mvu vectors', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '16', '8',
+                                                            '--analyse-overlap', '8', '4', '--vectors', 'mvu']),
+        ('16/8 super, analysed 8/4', ff, ['--frames', '8', '--analyse-blksize', '8', '--analyse-overlap', '4']),
+        ('180x100', ff, ['--frames', '8', '--crop', '180x100']),
         ('4K 16/8 pel 4', k4, ['--frames', '6', '--pel', '4']),
     ]
 
@@ -548,6 +791,23 @@ def motion_cases():
             (f'{name} YUV420PS pel 4', ff, ['--frames', '8', '--format', 'YUV420PS', '--pel', '4'] + f),
             (f'{name} YUV444PS 8/4 mvu vectors', ff, ['--frames', '8', '--format', 'YUV444PS', '--blksize', '8', '--overlap', '4', '--vectors', 'mvu'] + f),
             (f'{name} GRAYS const', ff, ['--frames', '15', '--format', 'GRAYS', '--vectors', 'const'] + f),
+            (f'{name} 422 16/8 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4'] + f),
+            (f'{name} 440 32/16 pel 2', ff, ['--frames', '8', '--format', 'YUV440P8', '--blksize', '32', '--overlap', '16'] + f),
+            (f'{name} YUV422P10 mvu vectors 8/2 pel 4 1910x1078', ff, ['--frames', '8', '--format', 'YUV422P10', '--vectors', 'mvu', '--blksize', '8', '--overlap', '2',
+                                                                     '--pel', '4', '--crop', '1910x1078'] + f),
+            (f'{name} YUV440PS const', ff, ['--frames', '15', '--format', 'YUV440PS', '--vectors', 'const'] + f),
+            (f'{name} 16x8/8x4', ff, ['--frames', '8'] + rect(16, 8, 8, 4) + f),
+            (f'{name} 32x16/8x8 422 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4'] + rect(32, 16, 8, 8) + f),
+            (f'{name} 16/4x8 pad 16x8 440', ff, ['--frames', '8', '--format', 'YUV440P8', '--pad', '16', '8'] + rect(16, 16, 4, 8) + f),
+            (f'{name} 8x4/4x2 440', ff, ['--frames', '8', '--format', 'YUV440P8'] + rect(8, 4, 4, 2) + f),
+            (f'{name} 16x2/8x0 YUV420P16 pel 4', ff, ['--frames', '8', '--format', 'YUV420P16', '--pel', '4'] + rect(16, 2, 8, 0) + f),
+            (f'{name} 4/2', ff, ['--frames', '8', '--blksize', '4', '--overlap', '2'] + f),
+            (f'{name} 64x32/16x16 422 pel 4', ff, ['--frames', '8', '--format', 'YUV422P8', '--pel', '4'] + rect(64, 32, 16, 16) + f),
+            (f'{name} 128/64 YUV420P10', ff, ['--frames', '8', '--format', 'YUV420P10', '--blksize', '128', '--overlap', '64'] + f),
+            (f'{name} 32/16 super, analysed 8/4 pel 4', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '8', '--analyse-overlap', '4',
+                                                             '--pel', '4'] + f),
+            (f'{name} 32/16 super, analysed 16/8 mvu vectors', ff, ['--frames', '8', '--blksize', '32', '--overlap', '16', '--analyse-blksize', '16',
+                                                                    '--analyse-overlap', '8', '--vectors', 'mvu'] + f),
             (f'4K {name} 16/8 pel 4', k4, ['--frames', '6', '--pel', '4'] + f),
         ]
     cases += [
@@ -568,6 +828,29 @@ def motion_cases():
         ('compensate thsad 400 YUV420PS time 75', ff, ['--frames', '8', '--thsad', '400', '--format', 'YUV420PS', '--time', '75'] + comp),
         ('compensate const delta -3 444 32/16', ff, ['--frames', '15', '--vectors', 'const', '--delta', '-3', '--format', 'YUV444P8', '--blksize', '32',
                                                      '--overlap', '16'] + comp),
+        # fields: every block shifted by the parities' field shift (with mvu's reads above the padded plane
+        # for the top blocks at the padding's edge); Compensate's blocks not under thsad come from the
+        # frame's own super, here one of another clip than the vectors' (--other-super)
+        ('compensate fields tff 1', ff, ['--frames', '8', '--fields', '1', '--tff', '1'] + comp),
+        ('compensate fields tff 0 thsad 300 pel 4', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--thsad', '300', '--pel', '4'] + comp),
+        ('compensate fields parity 00101101 thsad 200 444', ff, ['--frames', '8', '--fields', '1', '--parity', '00101101', '--thsad', '200', '--format',
+                                                                 'YUV444P8'] + comp),
+        ('compensate fields tff 1 thsad 300 pel 4 16/0 YUV420P10', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--pel', '4',
+                                                                        '--overlap', '0', '--format', 'YUV420P10'] + comp),
+        ('compensate fields tff 1 thsad 300 YUV420PS delta -1', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--format', 'YUV420PS',
+                                                                     '--delta', '-1'] + comp),
+        ('compensate fields tff 1 thsad 300 delta 2', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--delta', '2'] + comp),
+        ('compensate fields tff 1 pel 4 const', ff, ['--frames', '15', '--vectors', 'const', '--fields', '1', '--tff', '1', '--pel', '4'] + comp),
+        ('compensate other super thsad 300', ff, ['--frames', '8', '--other-super', '--thsad', '300'] + comp),
+        ('compensate other super fields tff 1 thsad 300 YUV420P16 16/0', ff, ['--frames', '8', '--other-super', '--fields', '1', '--tff', '1', '--thsad', '300',
+                                                                              '--format', 'YUV420P16', '--overlap', '0'] + comp),
+        ('flow fields tff 1', ff, ['--frames', '8', '--fields', '1', '--tff', '1'] + flow),
+        ('flow fields parity 10011010 pel 4 422', ff, ['--frames', '8', '--fields', '1', '--parity', '10011010', '--pel', '4', '--format', 'YUV422P8'] + flow),
+        ('flow fields tff 0 pel 4 YUV444PS', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--pel', '4', '--format', 'YUV444PS'] + flow),
+        ('flow other super fields tff 0 delta -1', ff, ['--frames', '8', '--other-super', '--fields', '1', '--tff', '0', '--delta', '-1'] + flow),
+        ('flow fields tff 1 time 50', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--time', '50'] + flow),
+        ('compensate fields tff 0 time 33.3 pel 4 thsad 300', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--time', '33.3', '--pel', '4', '--thsad',
+                                                                   '300'] + comp),
     ]
     return cases
 
@@ -575,6 +858,9 @@ def motion_cases():
 def recalculate_cases():
     ff, ob, k4 = 'football_fast_s3', 'objects1080fast_s3', 'c0065_s3'
     t0 = ['--thsad', '0']  # every block searched
+
+    def grid_args(blk, overlap):
+        return ['--blksize', str(blk), '--overlap', str(overlap)]
     return [
         ('16/8 pel 2', ff, ['--frames', '6']),
         ('thsad 50', ff, ['--frames', '6', '--thsad', '50']),
@@ -606,6 +892,62 @@ def recalculate_cases():
         ('YUV444PS pel 1 search 3', ff, ['--frames', '6', '--format', 'YUV444PS', '--pel', '1', '--search', '3'] + t0),
         ('GRAYS 32/16 pel 1', ff, ['--frames', '6', '--format', 'GRAYS', '--blksize', '32', '--overlap', '16', '--pel', '1'] + t0),
         ('4K 16/8 pel 4', k4, ['--frames', '4', '--pel', '4'] + t0),
+        # old vectors at another pel, rescaled to the super's
+        ('from pel 1', ff, ['--frames', '6', '--old-pel', '1'] + t0),
+        ('from pel 4 smooth 0', ff, ['--frames', '6', '--old-pel', '4', '--smooth', '0'] + t0),
+        ('random pel 1 from pel 4', ff, ['--frames', '6', '--vectors', 'random', '--pel', '1', '--old-pel', '4'] + t0),
+        ('random 444 pel 4 from pel 1 smooth 0', ff, ['--frames', '6', '--vectors', 'random', '--format', 'YUV444P8', '--pel', '4', '--old-pel', '1', '--smooth', '0'] + t0),
+        ('mvu from 32/16 pel 4', ff, ['--frames', '6', '--vectors', 'mvu', '--old-blksize', '32', '--old-overlap', '16', '--old-pel', '4']),
+        ('YUV420P16 pel 4 from pel 2', ff, ['--frames', '6', '--format', 'YUV420P16', '--pel', '4', '--old-pel', '2'] + t0),
+        ('GRAY8 8/4 pel 1 from pel 2', ff, ['--frames', '6', '--format', 'GRAY8', '--blksize', '8', '--overlap', '4', '--pel', '1', '--old-pel', '2'] + t0),
+        ('YUV420PS pel 1 from pel 4', ff, ['--frames', '6', '--format', 'YUV420PS', '--pel', '1', '--old-pel', '4'] + t0),
+        # 4:2:2 and 4:4:0
+        ('422 pel 4', ff, ['--frames', '6', '--format', 'YUV422P8', '--pel', '4'] + t0),
+        ('440 search 3 from 32/16', ff, ['--frames', '6', '--format', 'YUV440P8', '--search', '3', '--old-blksize', '32', '--old-overlap', '16'] + t0),
+        ('YUV422P16 mvu vectors pel 1', ff, ['--frames', '6', '--format', 'YUV422P16', '--vectors', 'mvu', '--pel', '1'] + t0),
+        ('YUV440P10 random 8/4 from pel 4', ff, ['--frames', '6', '--format', 'YUV440P10', '--vectors', 'random', '--blksize', '8', '--overlap', '4',
+                                                 '--old-pel', '4'] + t0),
+        ('YUV422PS pel 1', ff, ['--frames', '6', '--format', 'YUV422PS', '--pel', '1'] + t0),
+        # Rectangular blocks, and overlaps and paddings apart, the new grid's and the old one's
+        ('16x8/8x4', ff, ['--frames', '6'] + rect(16, 8, 8, 4) + t0),
+        ('16x8/8x4 from 32x16/16x8 search 3', ff, ['--frames', '6', '--old-blksize', '32', '16', '--old-overlap', '16', '8', '--search', '3'] + rect(16, 8, 8, 4) + t0),
+        ('16/8 from 16x8/4x2 smooth 0', ff, ['--frames', '6', '--old-blksize', '16', '8', '--old-overlap', '4', '2', '--smooth', '0'] + grid_args(16, 8) + t0),
+        ('32x16/8x4 pel 4 mvu from 8x4/4x2 pel 2', ff, ['--frames', '6', '--vectors', 'mvu', '--old-blksize', '8', '4', '--old-overlap', '4', '2', '--pel', '4',
+                                                       '--old-pel', '2'] + rect(32, 16, 8, 4)),
+        ('422 16x2/8x0 random pad 16x8', ff, ['--frames', '6', '--format', 'YUV422P8', '--vectors', 'random', '--pad', '16', '8'] + rect(16, 2, 8, 0) + t0),
+        # 4x4 blocks, and blocks of 64 and 128 pixels (their pixels read from the super each time)
+        ('4/2', ff, ['--frames', '6'] + grid_args(4, 2) + t0),
+        ('64/32 search 3', ff, ['--frames', '6', '--search', '3'] + grid_args(64, 32) + t0),
+        ('128/64 pel 4 from 16/8', ff, ['--frames', '6', '--pel', '4', '--old-blksize', '16', '--old-overlap', '8'] + grid_args(128, 64) + t0),
+        ('16/8 mvu from 128x64/64x32', ff, ['--frames', '6', '--vectors', 'mvu', '--old-blksize', '128', '64', '--old-overlap', '64', '32'] + grid_args(16, 8) + t0),
+        ('YUV422P16 64x32/16x16 random', ff, ['--frames', '6', '--format', 'YUV422P16', '--vectors', 'random'] + rect(64, 32, 16, 16) + t0),
+        ('YUV420PS 4/0 pel 1', ff, ['--frames', '6', '--format', 'YUV420PS', '--pel', '1'] + grid_args(4, 0) + t0),
+        # Recalculating for a grid other than the super's
+        ('16/8 super, to 8/4', ff, ['--frames', '6', '--new-blksize', '8', '--new-overlap', '4'] + t0),
+        ('32/16 super, to 8/4 search 3 1914x1074', ff, ['--frames', '6', '--blksize', '32', '--overlap', '16', '--new-blksize', '8', '--new-overlap', '4',
+                                                        '--search', '3', '--crop', '1914x1074'] + t0),
+        ('32/16 super, to 16/8 from mvu 8/4', ff, ['--frames', '6', '--blksize', '32', '--overlap', '16', '--new-blksize', '16', '--new-overlap', '8',
+                                                   '--old-blksize', '8', '--old-overlap', '4', '--vectors', 'mvu'] + t0),
+        ('YUV422P16 32/16 super, to 16x8/8x4 pel 4', ff, ['--frames', '6', '--format', 'YUV422P16', '--blksize', '32', '--overlap', '16', '--new-blksize', '16',
+                                                          '8', '--new-overlap', '8', '4', '--pel', '4'] + t0),
+        ('180x100', ff, ['--frames', '6', '--crop', '180x100'] + t0),
+        # satd: luma's SATD; and fields, which changes nothing in mvu's recalculation
+        ('satd', ff, ['--frames', '6', '--satd', '1'] + t0),
+        ('satd 8/4 pel 4', ff, ['--frames', '6', '--satd', '1', '--pel', '4'] + grid_args(8, 4) + t0),
+        ('satd 4/2 search 3 searchparam 4', ff, ['--frames', '6', '--satd', '1', '--search', '3', '--searchparam', '4'] + grid_args(4, 2) + t0),
+        ('satd 32/16 pel 1 search 1', ff, ['--frames', '6', '--satd', '1', '--pel', '1', '--search', '1', '--searchparam', '3'] + grid_args(32, 16) + t0),
+        ('satd 8x4/4x2 search 0', ff, ['--frames', '6', '--satd', '1', '--search', '0', '--searchparam', '4'] + rect(8, 4, 4, 2) + t0),
+        ('satd 444 pel 4', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV444P8', '--pel', '4'] + t0),
+        ('satd YUV422P10 16x8/8x4', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV422P10'] + rect(16, 8, 8, 4) + t0),
+        ('satd YUV420P16 32x16/16x8 pel 4', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV420P16', '--pel', '4'] + rect(32, 16, 16, 8) + t0),
+        ('satd GRAY16 64/32', ff, ['--frames', '4', '--satd', '1', '--format', 'GRAY16'] + grid_args(64, 32) + t0),
+        ('satd 128/64 search 4', ff, ['--frames', '4', '--satd', '1', '--search', '4', '--searchparam', '3'] + grid_args(128, 64) + t0),
+        ('satd GRAYS pel 1', ff, ['--frames', '6', '--satd', '1', '--format', 'GRAYS', '--pel', '1'] + t0),
+        ('satd chroma 0 random thsad 300', ff, ['--frames', '6', '--satd', '1', '--chroma', '0', '--vectors', 'random', '--thsad', '300']),
+        ('satd to 8/4', ff, ['--frames', '6', '--satd', '1', '--new-blksize', '8', '--new-overlap', '4'] + t0),
+        ('satd 440 8/4 pel 4 mvu vectors', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV440P8', '--pel', '4', '--vectors', 'mvu'] + grid_args(8, 4) + t0),
+        ('fields tff 1', ff, ['--frames', '6', '--fields', '1', '--tff', '1'] + t0),
+        ('fields tff 0 satd pel 4', ff, ['--frames', '6', '--fields', '1', '--tff', '0', '--satd', '1', '--pel', '4'] + t0),
     ]
 
 
@@ -622,6 +964,14 @@ def convert_cases():
         ('GRAY16 radius 3', ff, ['--frames', '8', '--format', 'GRAY16', '--radius', '3']),
         ('mvuprefix Other', ff, ['--frames', '8', '--mvuprefix', 'Other']),
         ('4K radius 1', k4, ['--frames', '4', '--radius', '1']),
+        ('422 32/16 pel 4 recalculated 16/8', ff, ['--frames', '8', '--format', 'YUV422P8', '--blksize', '32', '--overlap', '16', '--pel', '4', '--recalculate', '16', '8']),
+        ('YUV440P16 pel 1', ff, ['--frames', '8', '--format', 'YUV440P16', '--pel', '1']),
+        ('16x8/8x4 recalculated 8/4', ff, ['--frames', '8', '--recalculate', '8', '4'] + rect(16, 8, 8, 4)),
+        ('YUV440P16 32x16/8x8 pel 4', ff, ['--frames', '8', '--format', 'YUV440P16', '--pel', '4'] + rect(32, 16, 8, 8)),
+        ('4/2 recalculated 8/4', ff, ['--frames', '8', '--blksize', '4', '--overlap', '2', '--recalculate', '8', '4']),
+        ('YUV420P10 128x64/32x32 pel 4', ff, ['--frames', '8', '--format', 'YUV420P10', '--pel', '4'] + rect(128, 64, 32, 32)),
+        ('8/4 1910x1076', ff, ['--frames', '8', '--blksize', '8', '--overlap', '4', '--crop', '1910x1076']),
+        ('180x100', ff, ['--frames', '8', '--crop', '180x100']),
     ]
 
 
@@ -634,13 +984,19 @@ def robustness_cases():
 # The smoke suite: these cases of the others
 SMOKE = {
     'super': ['--pel 4', '--format YUV420PS', '--pel 1 --format YUV444P16', '--pelclip'],
-    'analyse': ['16/8 pel 2', '8/4 pel 4', '444 32/16 pel 4', 'YUV420P16 16/8 pel 4', 'YUV420PS 16/8 pel 2', 'GRAY8 16/8 pel 2', 'pel 1 16/8'],
+    'analyse': ['16/8 pel 2', '8/4 pel 4', '444 32/16 pel 4', 'YUV420P16 16/8 pel 4', 'YUV420PS 16/8 pel 2', 'GRAY8 16/8 pel 2', 'pel 1 16/8',
+                '422 16/8 pel 4', '440 8/4 pel 4', '16x8/8x4 pel 4', '16x2/8x0 pel 2', '4/2 pel 2', '128/64 pel 2', '8/4 on a 32/16 super pel 4 1914x1074',
+                'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4', 'fields tff 1 16/8 pel 2'],
     'degrain': ['YUV420P8 16/8 pel 2 mvgpu vectors', 'radius 3 444 32/16 pel 4', 'YUV420P16 16/8 pel 4 analysed on 8 bits', 'YUV420PS 16/8 pel 2 mvgpu vectors',
-                'thscd1 150 thscd2 20', 'pel 1 16/8'],
-    'flow': ['inter YUV420P8 16/8 pel 2 mvgpu vectors', 'fps YUV444P8 16/8 pel 4 mvgpu vectors', 'inter const', 'inter YUV420PS 16/8 pel 4', 'fps pel 1 8/4'],
-    'masks': ['16/8 pel 2', 'random vectors delta -1', 'YUV420PS'],
-    'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4'],
-    'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1'],
+                'thscd1 150 thscd2 20', 'pel 1 16/8', 'YUV440P8 16/8 pel 4 mvgpu vectors', '32x16/16x8 pel 4', '64/32 pel 4',
+                '32/16 super, analysed 32x16/16x8 mvu vectors'],
+    'flow': ['inter YUV420P8 16/8 pel 2 mvgpu vectors', 'fps YUV444P8 16/8 pel 4 mvgpu vectors', 'inter const', 'inter YUV420PS 16/8 pel 4', 'fps pel 1 8/4',
+             'inter YUV422P8 16/8 pel 4 mvgpu vectors', 'fps 8x4/4x2 YUV420PS mvu vectors', 'inter 4/2'],
+    'masks': ['16/8 pel 2', 'random vectors delta -1', 'YUV420PS', '422 16x2/8x1'],
+    'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4', 'compensate 440 32/16 pel 2',
+               'compensate 16x8/8x4', 'compensate fields tff 0 thsad 300 pel 4', 'flow fields tff 1', 'compensate other super thsad 300'],
+    'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1', 'random pel 1 from pel 4', '16x8/8x4 from 32x16/16x8 search 3',
+                    '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4', 'fields tff 1'],
     'convert': ['16/8 pel 2', 'YUV420P16 pel 4 analysed on 8 bits'],
     'robustness': ['1080p'],
 }

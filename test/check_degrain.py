@@ -3,13 +3,12 @@
 
 Both denoise the same clip with the same vectors. By default they are mvgpu.AnalyseMany's, which
 mvu.Degrain gets through mvgpu.ToMVU, so mvu never searches. With --vectors mvu they are
-mvu.Analyse's, which mvgpu.Degrain gets through mvgpu.FromMVU: vectors mvgpu's search wouldn't find,
-and frames narrower than the 192 pixels mvgpu.Analyse needs. Each side builds its super with
-the same settings (mvgpu.Super's planes are mvu.Super's). With --analyse8 the vectors come from an
-8-bit copy of a high bit depth clip, as mvu lets vectors analysed on 8 bits serve the clip. Every
-pixel of every frame and plane is compared.
+mvu.Analyse's, which mvgpu.Degrain gets through mvgpu.FromMVU: vectors mvgpu's search wouldn't find.
+Each side builds its super with the same settings (mvgpu.Super's planes are mvu.Super's). With
+--analyse8 the vectors come from an 8-bit copy of a high bit depth clip, as mvu lets vectors analysed
+on 8 bits serve the clip. Every pixel of every frame and plane is compared.
 
-    check_degrain.py --src noisy.nv12 --size 1920x1080 --frames 52 --pel 4 --blksize 16 --overlap 8
+    check_degrain.py --src noisy.nv12 --size 1920x1080 --frames 52 --pel 4 --blksize 16 [8] --overlap 8 [4]
                      [--format YUV444P8] [--vectors mvu] [--radius 2] [--thsad 400 300] [--thsad2 150]
                      [--planes 0 2] [--limit 3 2] [--thscd1 400] [--thscd2 51] [--weights 1 2 3 2 1]
                      [--centersuper] [--crop 1914x1074] [--analyse8]
@@ -37,8 +36,10 @@ def main():
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, YUV420P10, ...')
     ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu'], default='mvgpu', help="whose vectors both sides use")
-    ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
+    ap.add_argument('--overlap', type=int, nargs='+', default=[8], help='the overlap, and the vertical one when it differs')
+    ap.add_argument('--analyse-blksize', type=int, nargs='+', help="the grid both sides analyse, where it isn't the super's")
+    ap.add_argument('--analyse-overlap', type=int, nargs='+')
     ap.add_argument('--pel', type=int, default=2)
     ap.add_argument('--radius', type=int, default=2)
     ap.add_argument('--thsad', type=int, nargs='+')
@@ -77,12 +78,13 @@ def main():
     aclip = eight_bit(core, clip) if args.analyse8 else clip
     gasup = core.mvgpu.Super(core.std.GPUUpload(aclip), **sk) if args.analyse8 else gsup
     casup = core.mvu.Super(aclip, **sk) if args.analyse8 else csup
+    ag = dict(blksize=args.analyse_blksize or args.blksize, overlap=args.analyse_overlap if args.analyse_overlap is not None else args.overlap)
     if args.vectors == 'mvgpu':
-        fields = core.mvgpu.AnalyseMany(gasup, radius=args.radius)
+        fields = core.mvgpu.AnalyseMany(gasup, radius=args.radius, **ag)
         cvec = [core.mvgpu.ToMVU(an) for an in fields]
     else:
         deltas = [d for r in range(1, args.radius + 1) for d in (r, -r)]
-        cvec = [core.mvu.Analyse(casup, delta=d, blksize=args.blksize, overlap=args.overlap) for d in deltas]
+        cvec = [core.mvu.Analyse(casup, delta=d, **ag) for d in deltas]
         fields = [core.mvgpu.FromMVU(an, gasup) for an in cvec]
     # Degrain's supers: the analysis one, or one with the render block size and overlap
     rk = dict(sk, blksize=args.render[0], overlap=args.render[1]) if args.render else sk

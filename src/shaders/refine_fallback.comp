@@ -22,18 +22,25 @@ layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; 
 // block's current vector and no more than every position measured so far, and its cost only grows
 // as its SAD adds up. So a position whose partial cost passes that bound is dropped; the winner
 // never is, since the bound never falls below its cost. The SAD adds up in kUnits equal units,
-// unit u being luma rows 2u and 2u + 1 and the chroma rows of U and V beside them, row u at 4:2:0,
-// 2u and 2u + 1 at 4:4:4 (the luma rows alone without chroma), in three phases: every position's
-// first units, then the next for the positions still within the bound, then the rest for those
-// still within it, each phase's survivors gathered into a list so that every lane stays busy.
+// unit u being luma rows 2u and 2u + 1 and the chroma rows of U and V beside them, row u where
+// chroma is subsampled vertically (4:2:0, 4:4:0), 2u and 2u + 1 where it isn't (4:2:2, 4:4:4), or
+// the luma rows alone without chroma; with kSatd luma rows 4u to 4u + 3, a band of luma's SATD tiles,
+// and the chroma rows beside them. In three phases: every position's first units, then the next
+// for the positions still within the bound, then the rest for those still within it, each phase's
+// survivors gathered into a list so that every lane stays busy.
 // Measured on the CPU at 16x16, 8-24% of the positions survive five units.
 // (Dropping each position at whichever unit passes the bound, every lane moving on by itself,
 // saved more units but was slower: the lanes then diverge at every step.)
 
-const int kUnits = kBlk / 2;
-const int kPhase1 = kBlk / 8;      // units in the first phase: 4 at 32x32, 2 at 16x16, 1 at 8x8,
-const int kPhase2 = kBlk * 5 / 16; // and up to 10, 5 and 2 after the second
-const int kPerLane = 4;            // positions per lane in a batch
+const int kUnitRows = kSatd ? 4 : 2;
+const int kUnits = kBlkY / kUnitRows;
+// Units in the first phase: 4 of 16, 2 of 8, 1 of 4 or fewer; and up to 10, 5 and 2 after the second
+const int kPhase1 = kUnits / 4 > 1 ? kUnits / 4 : 1;
+const int kPhase2 = kUnits * 5 / 8 > kPhase1 ? kUnits * 5 / 8 : kPhase1;
+const int kPerLane = 4; // positions per lane in a batch
+// Blocks of 8x8 pixels or fewer, or fewer than 8 rows, take their positions' whole SADs at once
+// (selects rather than ||, as the core's compiler needs: refine_common.glsl's kCurWords)
+const bool kWhole = (kBlkY < 8 ? 1 : (kBlkX * kBlkY <= 64 ? 1 : 0)) != 0;
 
 shared uint64_t sKey[8];              // per subgroup: its least key
 shared uint sPartial[8];              // per subgroup: its part of the block's pixel sum
@@ -41,9 +48,9 @@ shared uint sUnitSum[kUnits];         // the block's pixel sum per unit
 shared uint sUnitBefore[kUnits + 1];  // and the sum of the units before each, the last the whole block's
 shared uint sBound;                   // a position costing more can't win
 shared uint sCount[2];                // entries in sList[0] and sList[1]
-// The survivors of phase 0 and of phase 1: column | row << 16, and the cost so far; at 8x8, where
-// the search doesn't run in phases, one entry each (shared memory counts even when unused)
-shared uvec2 sList[2][kBlk == 8 ? 1 : kPerLane * gl_WorkGroupSize.x];
+// The survivors of phase 0 and of phase 1: column | row << 16, and the cost so far; one entry each
+// where the search doesn't run in phases (kWhole; shared memory counts even when unused)
+shared uvec2 sList[2][kWhole ? 1 : kPerLane * gl_WorkGroupSize.x];
 
 // The least of every lane's key; every lane of the workgroup must call it
 uint64_t WorkgroupMin(uint64_t key) {
@@ -78,10 +85,11 @@ uint gW, gShift, gWU, gWV, gShiftC, gSa, gSm;
 void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     // The search's positions are whole pels (at pel 4 on the full-pel grid, ClampFull); at pel 2 a
     // clamped one near it may not be
-    uint a = LumaAddr(kPel * (gX + pc.pad) + v.x, kPel * (gY + pc.pad) + v.y);
+    uint a = LumaAddr(kPel * (gX + pc.pad) + v.x, kPel * (gY + pc.padY) + v.y);
     gW = WordOf(a);
     gShift = ShiftOf(a);
-    int Xc = kPel * ((gX >> kLogC) + pc.padc) + ChromaComponent(v.x), Yc = kPel * ((gY >> kLogC) + pc.padc) + ChromaComponent(v.y);
+    ivec2 vc = ChromaVector(v);
+    int Xc = kPel * ((gX >> kLogCX) + pc.padc) + vc.x, Yc = kPel * ((gY >> kLogCY) + pc.padcY) + vc.y;
     uint ac = ChromaAddr(Xc, Yc);
     if (kImage) {
         gWU = ac;
@@ -97,30 +105,40 @@ void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     gSm = 0u;
 }
 
-// Adds unit u of the lane's position to its partial sums
+// The bound's cap: a cost within it plus the block's largest SAD stays within 32 bits; and it stays
+// below 2^32 - 2^20 (2^32 - 2^28 for 16-bit samples) as long as that does
+uint BoundCap() {
+    return min(kWide ? 0xF0000000u : 0xFFF00000u, 0xFFFFFFFFu - uint(kBlockPixels * (kWide ? 65535 : 255)));
+}
+
+// Adds unit u of the lane's position to its partial sums (luma's SATD to gSa with kSatd)
 void Unit(int u) {
     uint stride = uint(pc.wp) >> uint(kLogSPW), strideC = uint(pc.wc) >> uint(kLogSPW);
-    [[unroll]] for (int jj = 0; jj < 2; ++jj) {
-        int j = 2 * u + jj;
-        uint wj = gW + uint(j) * stride;
-        uint lo = RefYWord(wj);
-        [[unroll]] for (int i = 0; i < kRowWords; ++i) {
-            uint hi = RefYWord(wj + uint(i) + 1u);
-            PackedStep(Bytes4(lo, hi, gShift), j * kRowWords + i, gSa, gSm);
-            lo = hi;
+    if (kSatd) {
+        gSa += BandSatd(gW, gShift, stride, 4 * u, 0);
+    } else {
+        [[unroll]] for (int jj = 0; jj < 2; ++jj) {
+            int j = 2 * u + jj;
+            uint wj = gW + uint(j) * stride;
+            uint lo = RefYWord(wj);
+            [[unroll]] for (int i = 0; i < kRowWords; ++i) {
+                uint hi = RefYWord(wj + uint(i) + 1u);
+                PackedStep(Bytes4(lo, hi, gShift), j * kRowWords + i, gSa, gSm);
+                lo = hi;
+            }
         }
     }
     if (!kChroma)
         return;
     int curU = kLumaWords, curV = curU + kChromaWords;
-    // chroma rows 2u >> kLogC up to before (2u + 2) >> kLogC
-    [[unroll]] for (int jj = 0; jj < (2 >> kLogC); ++jj) {
-        int jc = ((2 * u) >> kLogC) + jj;
+    // chroma rows kUnitRows * u >> kLogCY up to before kUnitRows * (u + 1) >> kLogCY
+    [[unroll]] for (int jj = 0; jj < (kUnitRows >> kLogCY); ++jj) {
+        int jc = ((kUnitRows * u) >> kLogCY) + jj;
         if (kImage) {
             uint au = gWU + uint(jc * ChromaRow()), av = gWV + uint(jc * ChromaRow());
             [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-                PackedStep(StridedWord(au + uint(4 * kSPW * i)), curU + jc * kRowWordsC + i, gSa, gSm);
-                PackedStep(StridedWord(av + uint(4 * kSPW * i)), curV + jc * kRowWordsC + i, gSa, gSm);
+                PackedStep(StridedWord(au + uint(4 * kSPW * i)) & kChromaMask, curU + jc * kRowWordsC + i, gSa, gSm);
+                PackedStep(StridedWord(av + uint(4 * kSPW * i)) & kChromaMask, curV + jc * kRowWordsC + i, gSa, gSm);
             }
             continue;
         }
@@ -128,8 +146,8 @@ void Unit(int u) {
         uint loU = RefCWord(ru), loV = RefCWord(rv);
         [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
             uint hiU = RefCWord(ru + uint(i) + 1u), hiV = RefCWord(rv + uint(i) + 1u);
-            PackedStep(Bytes4(loU, hiU, gShiftC), curU + jc * kRowWordsC + i, gSa, gSm);
-            PackedStep(Bytes4(loV, hiV, gShiftC), curV + jc * kRowWordsC + i, gSa, gSm);
+            PackedStep(Bytes4(loU, hiU, gShiftC) & kChromaMask, curU + jc * kRowWordsC + i, gSa, gSm);
+            PackedStep(Bytes4(loV, hiV, gShiftC) & kChromaMask, curV + jc * kRowWordsC + i, gSa, gSm);
             loU = hiU;
             loV = hiV;
         }
@@ -147,30 +165,20 @@ void main() {
     int b = int(flagged[entry]);
     int bx = b % pc.nbx, by = b / pc.nbx;
     // The block's current pixels as LoadBlock lays them out, loaded by all the lanes, their sum and
-    // their sum per unit
+    // their sum per unit (with kSatd chroma's alone, as LoadBlock's)
     gGroup = 0;
     gX = bx * pc.step;
-    gY = by * pc.step;
+    gY = by * pc.stepY;
     if (lane < kUnits)
         sUnitSum[lane] = 0u;
     barrier();
     uint partial = 0u;
     for (int k = lane; k < kBlockWords; k += lanes) {
         uint px[4] = uint[4](0u, 0u, 0u, 0u);
-        int unit;
-        for (int i = 0; i < kSPW; ++i) {
-            if (k < kLumaWords) {
-                px[i] = CurLuma((gY + pc.pad + k / kRowWords) * pc.wp + gX + pc.pad + (k % kRowWords) * kSPW + i);
-                unit = k / kRowWords / 2;
-            } else {
-                int kc = k - kLumaWords;
-                uint plane = kc < kChromaWords ? 0u : ChromaV();
-                kc %= kChromaWords;
-                px[i] = CurChroma(plane + ChromaPixel((gX >> kLogC) + pc.padc + (kc % kRowWordsC) * kSPW + i, (gY >> kLogC) + pc.padc + kc / kRowWordsC));
-                unit = ((kc / kRowWordsC) << kLogC) / 2;
-            }
-        }
-        uint sum = px[0] + px[1] + px[2] + px[3];
+        for (int i = 0; i < kSPW; ++i)
+            px[i] = CurSample(k, i);
+        int unit = k < kLumaWords ? k / kRowWords / kUnitRows : ((((k - kLumaWords) % kChromaWords) / kRowWordsC) << kLogCY) / kUnitRows;
+        uint sum = (kSatd ? k >= kLumaWords : true) ? px[0] + px[1] + px[2] + px[3] : 0u;
         partial += sum;
         atomicAdd(sUnitSum[unit], sum);
         StoreWord(k, px[0], px[1], px[2], px[3]);
@@ -196,10 +204,9 @@ void main() {
             before += sUnitSum[u];
         }
         sUnitBefore[kUnits] = before;
-        // capped below 2^32 - 2^20 (2^32 - 2^28 for 16-bit samples), so that a cost within it plus a
-        // SAD stays within 32 bits; the positions searched cost far less (a SAD below 2^20, or 2^28,
-        // and lambda * |v - p|^2 / 256 within a window of a few hundred half-pels)
-        sBound = uint(clamp(bestCost - 1, int64_t(0), int64_t(kWide ? 0xF0000000u : 0xFFF00000u)));
+        // capped (BoundCap); the positions searched cost far less but for the largest blocks at 16
+        // bits, which take their whole SADs at once where their cost passes the cap (below)
+        sBound = uint(clamp(bestCost - 1, int64_t(0), int64_t(BoundCap())));
     }
     barrier();
 
@@ -215,9 +222,10 @@ void main() {
     uint64_t mine = kNoKey;
     int batch = kPerLane * lanes;
     int dc = nx > 0 ? lanes % nx : 0, dr = nx > 0 ? lanes / nx : 0;
-    // At 8x8 a unit is too small to pay for the phases' bookkeeping: every position gets its whole
-    // SAD at once, as LaneSad measures it
-    if (kBlk == 8) {
+    // Small blocks' units are too small to pay for the phases' bookkeeping: every position gets its
+    // whole SAD at once, as LaneSad measures it; so does a block whose cost passes the bound's cap,
+    // which the phases' 32-bit costs couldn't bound exactly (the same in every lane)
+    if (kWhole || bestCost - 1 > int64_t(BoundCap())) {
         for (int k = lane; k < total; k += lanes) {
             ivec2 v = ivec2(x0 + (k % nx) * stepH, y0 + (k / nx) * stepH);
             mine = min(mine, (uint64_t(Cost(LaneSad(v), v, p, lambda)) << 24) | uint64_t(k));
@@ -294,8 +302,8 @@ void main() {
         // The positions up to fallbackStep - 1 px around the best in the CPU's order; one equal to
         // the best, which the CPU skips, has its cost and can't win either. Cost << 8 | position:
         // fallbackStep stays below 9. 8 lanes measure a position together, kUnits / 8 units each
-        // (at 8x8 every other lane one unit, the others idle), so that its SAD takes one round of
-        // loads instead of all of them.
+        // (with fewer than 16 rows some lanes one unit, the others idle), so that its SAD takes one
+        // round of loads instead of all of them.
         // At pel 4 around the best rounded down to the full-pel grid: the block's own vector, kept
         // when nothing in the window beat it, may be on the half-pel grid
         ivec2 cc = kPel == 4 ? ivec2(best.x & ~3, best.y & ~3) : best;

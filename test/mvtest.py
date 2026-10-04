@@ -34,12 +34,23 @@ def nv12_clip(core, path, w, h, frames):
 
 
 def format_clip(core, clip, fmt):
-    """The 8-bit clip in the VapourSynth preset format fmt (resize.Bicubic). Converted to more than 8
-    bits it is shifted a quarter pixel on the way, so that the low bits hold picture, not zeros."""
-    f = core.get_video_format(getattr(vs, fmt))
+    """The 8-bit clip in the VapourSynth preset format fmt (resize.Bicubic), or in a 4:4:0 format of 9
+    to 14 bits, which has no preset: YUV440P10 etc. Converted to more than 8 bits it is shifted a
+    quarter pixel on the way, so that the low bits hold picture, not zeros."""
+    preset = getattr(vs, fmt, None)
+    if preset is None and fmt.startswith('YUV440P'):
+        f = core.query_video_format(vs.YUV, vs.INTEGER, int(fmt.removeprefix('YUV440P')), 0, 1)
+    else:
+        f = core.get_video_format(getattr(vs, fmt))
     if f.bits_per_sample > 8:
         return core.resize.Bicubic(clip, format=f.id, src_left=0.25, src_top=0.25)
     return clip if f.id == clip.format.id else core.resize.Bicubic(clip, format=f.id)
+
+
+def grid_label(blksize, overlap):
+    """A grid as the checks print it, from "h" or "h v" lists: 16/8, or 16x8/8x4 where the axes differ"""
+    bx, by, ox, oy = blksize[0], blksize[-1], overlap[0], overlap[-1]
+    return f'{bx}/{ox}' if (bx, ox) == (by, oy) else f'{bx}x{by}/{ox}x{oy}'
 
 
 def plane_pair(fa, fb, p):

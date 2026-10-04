@@ -24,13 +24,18 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   horizontal one at 4:2:0 and 4:2:2, an odd vertical one at 4:2:0 and 4:4:0). Its level 0 is
   mvu.Super's bit for bit (`test/check_super.py`). Its coarse levels are the GPU search's own,
   reduced with `rfilter`'s filter.
-* The other filters so far take Gray, 4:2:0 and 4:4:4 supers of 8 to 16-bit or float samples at
-  any `pel` (1, 2 or 4) with square blocks of 8×8, 16×16 or 32×32, with the same overlap and padding
-  horizontally and vertically, MVUtensils' extended grids included.
-  Other supers, and the values not implemented yet (`satd`, `fields`, an `Analyse` or `Recalculate`
-  grid other than the super's), are errors. As in mvu, vectors analysed on an 8-bit copy of a clip
-  serve the filters that compensate motion on the 9 to 16-bit or float clip, their SAD thresholds
-  scaled to the depth the vectors were analysed at, and a Gray clip's SADs are luma's.
+* The other filters so far take Gray and YUV supers of every subsampling (4:2:0, 4:2:2, 4:4:0 and
+  4:4:4) and 8 to 16-bit or float samples at any `pel` (1, 2 or 4) with every block size mvu takes
+  (4×4 to 128×128), any overlap and padding, horizontal and vertical apart, MVUtensils' extended
+  grids included; but `Analyse` and `Recalculate` refuse the blocks whose SADs can pass 2^31:
+  128×128 blocks with 4:4:4 chroma at 16 bits or float, and with `satd`, whose SATD can reach twice
+  the SAD, 128×128 blocks with chroma of any subsampling at 16 bits or float.
+  `Analyse` and `Recalculate` take a grid other than the super's, as in mvu, where it fits the
+  super's block-aligned frame; the other filters take vectors of any such grid with the super's
+  planes. As in mvu, vectors analysed
+  on an 8-bit copy of a clip serve the filters that compensate motion on the 9 to 16-bit or float
+  clip, their SAD thresholds scaled to the depth the vectors were analysed at, and a Gray clip's SADs
+  are luma's.
 * The filters check the clips they're given as mvu's do, with mvu's messages: a super, centersuper
   or vector clip shorter than the clip it goes with (for `Recalculate`, vectors shorter than the
   super) is refused, since the frames past its end would be its last one again; every super frame
@@ -39,7 +44,9 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   frame of its clip (a spliced clip can mix them); and the vector clips one filter takes must all
   come from one analysis but for their delta, bit depth included. `Recalculate` gives a frame whose
   reference frame lies past the end of the super no vectors, also where a longer vector clip has
-  some for it. `test/check_robustness.py` runs each of these cases on both plugins.
+  some for it. `satd` on 16×2 blocks, and `fields` on frames without a parity (neither `_Field` nor
+  `tff`) or, for `Compensate` and `Recalculate`, at `pel=1`, are refused as mvu refuses them.
+  `test/check_robustness.py` runs each of these cases on both plugins.
 * `Analyse` searches float supers as the 16-bit samples they stand for: luma's 0 to 1 and
   chroma's −0.5 to 0.5 scaled to 0 to 65535, rounded and clamped, each sample as it is read, which
   puts the SADs on the 16-bit scale mvu gives float SADs. `Degrain`, `FlowInter` and `FlowFPS` take
@@ -52,10 +59,21 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   above `badsad` (radius `badrange`, every `badstep` pixels, an argument mvu doesn't have) and a
   half-pel step (none at `pel=1`). At `pel=4` the seeds and the passes stay on the half-pel grid
   (chained and inverted seeds are rounded to it, toward zero) and a quarter-pel step follows the
-  half-pel one.
+  half-pel one. A super without the coarse levels (`onelevel=True`, or a frame narrower than 192
+  pixels, which has none) leaves out the coarse search: the seeds are zero and, with `AnalyseMany`,
+  the chained and inverted vectors.
   With `chroma=False` every SAD is luma's alone, at every level. Above 8 bits `mvlambda`, `lsad` and
   `badsad` are scaled to the depth as mvu scales them, and `lsad` relaxes lambda by the worst
   neighbour's SAD in steps of 2^(bits − 8), as the search tabulates it.
+  With `satd=True` luma's SAD is mvu's SATD (the absolute values of each 4×4 tile's Hadamard
+  transform added up, halved) wherever the full-size grid's vectors are measured, chroma's staying
+  SADs, so the vectors and their SADs are chosen and scored as mvu's are; the coarse search, mvgpu's
+  own, keeps the SAD. As in mvu, `satd` refuses 16×2 blocks.
+  With `fields=True` the frames are fields, their parities the frames' `_Field` properties or, given,
+  `tff` (with `tff=True` the even frames are top fields, with `tff=False` the odd ones): a field of an
+  odd delta at `pel` 2 or 4 seeds from zero and the median shifted vertically by mvu's field shift
+  between the two frames' parities, ±`pel`/2, as mvu shifts its zero and global predictors at the
+  finest level.
   `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`, `globalmv`,
   `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
   The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
@@ -102,24 +120,32 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   planes: neighbouring blocks' vectors mostly differ in sub-pel phase, and in the image their reads
   stay in one region. That made a `pel=4` chain of `Super`, `AnalyseMany` and `Degrain` 7-19%
   faster on the GPU on moving content and 1-4% on static (RX 6900 XT, 16×16 blocks, radius 3). A
-  4:2:0 super is twice the size of a `pel=2` one instead of four times, a 4:4:4 one the same size.
+  4:2:0 super is twice the size of a `pel=2` one instead of four times (4:2:2 and 4:4:0 two and a
+  half times), a 4:4:4 one the same size.
 * Divergence from MVUtensils: `Super` refuses a `pelclip` at `pel=4`. A pelclip's quarter-pel
   samples needn't be averages of its half-pel ones, so its luma would need all sixteen planes, twice
   the memory of a `pel=4` super that computes them. A `pelclip` at `pel=2` works as in mvu.
 * `Degrain` takes all of mvu.Degrain's arguments, on mvgpu's supers and vectors. Given the same
   vectors its output is mvu.Degrain's bit for bit, at `pel=2` and `pel=4` (`test/check_degrain.py`
-  runs both on mvgpu.AnalyseMany's vectors, or on mvu.Analyse's, which mvgpu's search wouldn't find
-  and which also cover frames narrower than the 192 pixels mvgpu.Analyse needs); its weights, which
-  mvu computes in double precision, are reproduced exactly in integers.
+  runs both on mvgpu.AnalyseMany's vectors, or on mvu.Analyse's, which mvgpu's search wouldn't find);
+  its weights, which mvu computes in double precision, are reproduced exactly in integers.
 * `FlowInter` and `FlowFPS` take all of mvu's arguments, on mvgpu's supers and vectors, and given
   the same vectors their output is mvu's bit for bit (`test/check_flow.py`, on mvgpu.Analyse's
   vectors, mvu.Analyse's, or constant fields with scene changes in between). mvu resizes the blocks'
   vectors and occlusion masks to the pixels with zimg's bilinear resize, in 64×64 tiles; the GPU
   does the same arithmetic, the taps computed for each tile as zimg computes them.
-* `Compensate`, `Flow` and `FlowBlur` take all of mvu's arguments but `fields`, and given the same
-  super and vectors their output is mvu's bit for bit (`test/check_flow.py --filter compensate`,
-  `flow`, `blur`), float `FlowBlur` included, which sums in double precision as mvu does (on a device
-  without 64-bit floats in float, which can round apart).
+* `Compensate`, `Flow` and `FlowBlur` take all of mvu's arguments, and given the same super and
+  vectors their output is mvu's bit for bit (`test/check_flow.py --filter compensate`, `flow`,
+  `blur`), float `FlowBlur` included, which sums in double precision as mvu does (on a device
+  without 64-bit floats in float, which can round apart). As in mvu, `Compensate` takes the blocks
+  whose SAD isn't under `thsad` from the frame's own super, which matters where the super isn't the
+  clip's. With `fields=True` (at `pel` 2 or 4, odd deltas) `Compensate`'s blocks and `Flow`'s vectors
+  are shifted vertically by the field shift between the frames' parities, as in mvu, including where mvu
+  reads above the padded plane, for a top block whose vector is at the padding's edge: there mvu
+  reads the last row of the sub-pel plane before in its storage, and mvgpu that same sample. At
+  `pel=4` that row can be one of the quarter planes mvu.Super never writes (its last row of the
+  planes 3/4 of a pixel down), whose 0 from a new frame's memory mvu reads, and mvgpu reads 0 there
+  too.
 * `VectorLengthMask`, `SADMask` and `OcclusionMask` take all of mvu's arguments, and given the same
   vectors their masks are mvu's bit for bit (`test/check_masks.py`), zimg's resize of the whole plane
   included, but where a `gamma` other than 1 (other than 1 or 2 for `VectorLengthMask`) takes a
@@ -129,10 +155,14 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   more often). `SCDetection` sets mvu's properties on the clip's frames, GPU resident or not; it
   counts the badly matched blocks on the GPU and waits for the count, the one filter whose frames
   wait for their GPU work.
-* `Recalculate` takes all of mvu's arguments but `satd` and `fields`, for the super's own grid (the
-  old vectors can be of any grid, from mvgpu.Analyse or Recalculate of the same bit depth and
-  `pel`), and its vectors are mvu's bit for bit (`test/check_recalculate.py`), every search type
+* `Recalculate` takes all of mvu's arguments, for the super's grid or another that fits it (the old
+  vectors can be of any grid and `pel`, from mvgpu.Analyse or Recalculate of the same bit depth; as
+  in mvu, they're rescaled to the super's `pel`, which the new vectors take), and its vectors are
+  mvu's bit for bit (`test/check_recalculate.py`), every search type
   replicated candidate for candidate: unlike `Analyse`'s, its blocks don't depend on one another.
+  `satd` makes luma's SAD mvu's SATD, as in `Analyse`. `fields` changes nothing in mvu's
+  recalculation (the shifted zero and global vectors it sets up aren't among its searches'
+  candidates), so mvgpu only takes the frames' parities as mvu does, failing where it fails.
   As in mvu, a frame whose old vectors are missing (their reference frame outside the clip) stays
   without vectors, with the new grid's description. Float supers
   are searched as `Analyse` searches them, as the 16-bit samples they stand for (mvu sums float

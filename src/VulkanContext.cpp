@@ -194,7 +194,7 @@ VulkanContext::VulkanContext(VSCore *core, const VSAPI *vsapi) : core(core) {
             Destroy();
             throw std::runtime_error("vkCreateDescriptorSetLayout failed");
         }
-        const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, degrain ? static_cast<uint32_t>(sizeof(DegrainParams)) : static_cast<uint32_t>(sizeof(Params))};
+        const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes};
         VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plci.setLayoutCount = 1;
         plci.pSetLayouts = &setLayouts[l];
@@ -230,11 +230,13 @@ void VulkanContext::RequireDegrain() const {
         throw std::runtime_error(degrainError);
 }
 
-VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant) {
+VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant, int blkY) {
     if (KernelLayout(kernel) == Layout::Degrain)
         RequireDegrain();
+    if (!blkY)
+        blkY = blk;
     std::lock_guard<std::mutex> guard(lock);
-    const std::tuple<int, int, int, int> key(static_cast<int>(kernel), blk, pel, variant);
+    const std::tuple<int, int, int, int, int> key(static_cast<int>(kernel), blk, pel, variant, blkY);
     if (auto it = pipelines.find(key); it != pipelines.end())
         return it->second;
 
@@ -259,12 +261,12 @@ VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant)
         throw std::runtime_error(std::string("vkCreateShaderModule failed for ") + KernelFile(kernel));
 
     // refine_common.glsl's kSubgroup (0), the workgroup size of the kernels that spread a block over
-    // one subgroup (1), median.comp's workgroup size (2), the target grid's block size (3), the
-    // fallback's workgroup size (4), the vectors' units per pixel (5) and the variant (6)
-    const uint32_t constants[7] = {subgroup, subgroup, medianLanes, static_cast<uint32_t>(blk), subgroup * kFallbackSubgroups, static_cast<uint32_t>(pel),
-                                   static_cast<uint32_t>(variant)};
-    const VkSpecializationMapEntry entries[7] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}};
-    const VkSpecializationInfo spec = {7, entries, sizeof(constants), constants};
+    // one subgroup (1), median.comp's workgroup size (2), the target grid's block width (3) and height
+    // (7), the fallback's workgroup size (4), the vectors' units per pixel (5) and the variant (6)
+    const uint32_t constants[8] = {subgroup, subgroup, medianLanes, static_cast<uint32_t>(blk), subgroup * kFallbackSubgroups, static_cast<uint32_t>(pel),
+                                   static_cast<uint32_t>(variant), static_cast<uint32_t>(blkY)};
+    const VkSpecializationMapEntry entries[8] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4}};
+    const VkSpecializationInfo spec = {8, entries, sizeof(constants), constants};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     size.requiredSubgroupSize = subgroup;
     VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};

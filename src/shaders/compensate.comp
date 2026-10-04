@@ -5,16 +5,20 @@
 layout(local_size_x = 64) in;
 
 // The FlowParams slots compensate.comp gives its own meaning (Compensate.cpp): the SAD under which a
-// block takes its vector (thsad, scaled), the grid's step and overlap, the clip's largest value, and
-// where the plane's overlap windows are in taps[]
+// block takes its vector (thsad, scaled), the grid's step and overlap (stepY and overlapY its
+// vertical ones), the clip's largest value, and where the plane's overlap windows are in taps[]
 #define kThSad pc.thscd1
 #define kStep pc.time4096FX
 #define kOverlap pc.time4096FY
+#define kStepY pc.stepY
+#define kOverlapY pc.overlapY
 #define kPixelMax pc.time4096BX
 #define kWinOff pc.colOff
 #define kQuad pc.time4096BY // four pixels per lane (Main4)
 
-// The reference super's planes and the output as words, for Main4
+// The frame's own super's planes and the reference super's, and the output, as words, for Main4
+layout(std430, set = 0, binding = 0) readonly buffer SrcLuma32 { uint srcY32[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SrcChroma32 { uint srcC32[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma32 { uint refY32[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma32 { uint refC32[]; };
 layout(std430, set = 0, binding = 12) writeonly buffer Out32 { uint outPx32[]; };
@@ -24,22 +28,23 @@ int Div256(int a) {
     return a >= 0 ? a >> 8 : -(-a >> 8);
 }
 
-// Where block (bx, by)'s pixel at the plane's (x, y) comes from: true with its position (X, Y), 1 / pel
-// pixels of the plane, in the reference frame's super (bound as ref) when the block's SAD is under
-// thsad, at its vector scaled to the time (Compensate.cpp's blx, bly, chroma's the luma position
-// shifted by the subsampling); else false, the clip's own pixel
+// Where block (bx, by)'s pixel at the plane's (x, y) comes from, (X, Y) in 1 / pel pixels of the plane:
+// true, the reference frame's super (bound as ref) at the block's vector scaled to the time, when the
+// block's SAD is under thsad; else false, the frame's own super (src) at the block's own place, as
+// mvu.Compensate takes the blocks (its blx, bly, chroma's the luma position shifted by the
+// subsampling), both shifted vertically by the field shift (fields)
 bool Source(int bx, int by, int x, int y, int Sx, int Sy, out int X, out int Y) {
     ivec4 r = vecF[by * pc.recStride + bx];
-    if (r.z >= kThSad)
-        return false;
-    int blx = bx * kStep * kPel + Div256(r.x * pc.time256), bly = by * kStep * kPel + Div256(r.y * pc.time256);
+    bool moved = r.z < kThSad;
+    int blx = bx * kStep * kPel + (moved ? Div256(r.x * pc.time256) : 0);
+    int bly = by * kStepY * kPel + (moved ? Div256(r.y * pc.time256) : 0) + pc.fieldShift;
     if (pc.plane != 0) {
         blx >>= kLogX;
         bly >>= kLogY;
     }
     X = blx + (x - bx * Sx) * kPel;
     Y = bly + (y - by * Sy) * kPel;
-    return true;
+    return moved;
 }
 
 // The four bytes from byte a on, of words w0 (holding byte a) and w1
@@ -51,19 +56,24 @@ uvec4 Unpack4(uint w) {
     return uvec4(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu, w >> 24u);
 }
 
-// Sample()'s four samples at (X, Y), (X + kPel, Y), ..., 8-bit at pel 1 or 2: where none of them is
-// clamped they are four bytes in a row of one plane, read as words (the super's spare rows keep the
-// word after the last pixel inside it); else one at a time
-uvec4 Sample4(int X, int Y) {
+// Sample()'s four samples at (X, Y), (X + kPel, Y), ... of the reference frame's super or the frame's
+// own, 8-bit at pel 1 or 2: where none of them is clamped they are four bytes in a row of one plane,
+// read as words (the super's spare rows keep the word after the last pixel inside it); else one at a
+// time
+uint Word(bool ref, bool luma, uint i) {
+    return luma ? (ref ? refY32[i] : srcY32[i]) : (ref ? refC32[i] : srcC32[i]);
+}
+
+uvec4 Sample4(bool ref, int X, int Y) {
     bool luma = pc.plane == 0;
     int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
     int Xp = X + kPel * (luma ? pc.pad : pc.padc), Yp = Y + kPel * (luma ? pc.padY : pc.padcY);
     if (Xp >= 0 && Xp + 3 * kPel <= kPel * stride - 1 && Yp >= 0 && Yp <= kPel * rows - 1) {
         uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
         uint a = base + (kPel == 1 ? uint(Yp * stride + Xp) : HalfAddr(Xp, Yp, stride, rows)), i = a >> 2u;
-        return Unpack4(luma ? Funnel4(refY32[i], refY32[i + 1u], a) : Funnel4(refC32[i], refC32[i + 1u], a));
+        return Unpack4(Funnel4(Word(ref, luma, i), Word(ref, luma, i + 1u), a));
     }
-    return uvec4(Sample(true, X, Y), Sample(true, X + kPel, Y), Sample(true, X + 2 * kPel, Y), Sample(true, X + 3 * kPel, Y));
+    return uvec4(Sample(ref, X, Y), Sample(ref, X + kPel, Y), Sample(ref, X + 2 * kPel, Y), Sample(ref, X + 3 * kPel, Y));
 }
 
 // main's arithmetic for four adjacent pixels per lane, 8-bit samples at pel 1 or 2, where the
@@ -76,19 +86,18 @@ void Main4() {
         return;
     int inside = min(4, pc.width - x); // the group's pixels inside the plane
     uint at = uint(y * pc.outStride + x), c = uint(y * pc.clipStride + x);
-    uvec4 own = uvec4(0u);             // the clip's pixels, read a byte at a time: a plane's last row may end its buffer
-    [[unroll]] for (int i = 0; i < 4; ++i)
-        if (i < inside)
-            own[i] = uint(clipSrc[c + uint(i)]);
-    uvec4 res;
+    uvec4 res = uvec4(0u);
     if (counts[0] > uint(pc.scdLimit)) {
-        res = own;
+        // the clip's pixels, read a byte at a time: a plane's last row may end its buffer
+        [[unroll]] for (int i = 0; i < 4; ++i)
+            if (i < inside)
+                res[i] = uint(clipSrc[c + uint(i)]);
     } else {
         bool luma = pc.plane == 0;
         int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-        int Bx = (kStep + kOverlap) >> lx, By = (kStep + kOverlap) >> ly;
-        int Sx = kStep >> lx, Sy = kStep >> ly;
-        int Ox = kOverlap >> lx, Oy = kOverlap >> ly;
+        int Bx = (kStep + kOverlap) >> lx, By = (kStepY + kOverlapY) >> ly;
+        int Sx = kStep >> lx, Sy = kStepY >> ly;
+        int Ox = kOverlap >> lx, Oy = kOverlapY >> ly;
         int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
         bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
         uvec4 acc = uvec4(0u);
@@ -97,8 +106,9 @@ void Main4() {
                 continue;
             int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? byA - 1 : byA;
             int X, Y;
-            uvec4 v = Source(bx, by, x, y, Sx, Sy, X, Y) ? Sample4(X, Y) : own;
-            if (kOverlap == 0) {
+            bool moved = Source(bx, by, x, y, Sx, Sy, X, Y);
+            uvec4 v = Sample4(moved, X, Y);
+            if ((kOverlap | kOverlapY) == 0) {
                 acc = v;
             } else {
                 int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
@@ -107,7 +117,7 @@ void Main4() {
                 acc += (v * uvec4(uint(taps[t]), uint(taps[t + 1]), uint(taps[t + 2]), uint(taps[t + 3]))) >> 6u;
             }
         }
-        res = kOverlap == 0 ? acc : min((acc + 16u) >> 5u, uvec4(uint(kPixelMax)));
+        res = (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uvec4(uint(kPixelMax)));
     }
     if (inside == 4 && (at & 3u) == 0u) {
         outPx32[at >> 2u] = res.x | (res.y << 8u) | (res.z << 16u) | (res.w << 24u);
@@ -119,7 +129,8 @@ void Main4() {
 }
 
 // mvu.Compensate's pixel of the plane: every block covering it, one or, inside the overlaps, two or
-// four, gives it its motion compensated pixel (Source), weighted by the block's overlap window (mvu's
+// four, gives it its motion compensated pixel, or its own super's (Source), weighted by the block's
+// overlap window (mvu's
 // OverlapWindows, the 9 of them for the frame's edges and corners, values to 2048), each product >> 6
 // and added up in mvu's order, the row above before the block's own and the left column first, then
 // (sum + 16) >> 5, clamped to the clip's largest value; without overlap the one block's pixel. Float
@@ -146,9 +157,9 @@ void main() {
     }
     bool luma = pc.plane == 0;
     int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-    int Bx = (kStep + kOverlap) >> lx, By = (kStep + kOverlap) >> ly; // the plane's block size,
-    int Sx = kStep >> lx, Sy = kStep >> ly;                           // step
-    int Ox = kOverlap >> lx, Oy = kOverlap >> ly;                     // and overlap
+    int Bx = (kStep + kOverlap) >> lx, By = (kStepY + kOverlapY) >> ly; // the plane's block size,
+    int Sx = kStep >> lx, Sy = kStepY >> ly;                            // step
+    int Ox = kOverlap >> lx, Oy = kOverlapY >> ly;                      // and overlap
     int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
     bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
 
@@ -161,14 +172,14 @@ void main() {
         int X, Y;
         bool moved = Source(bx, by, x, y, Sx, Sy, X, Y);
         int win = 2048;
-        if (kOverlap != 0) {
+        if ((kOverlap | kOverlapY) != 0) {
             int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
             int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
             win = taps[kWinOff + ((wby + wbx) * By + y - by * Sy) * Bx + x - bx * Sx];
         }
         if (kFloat) {
-            float v = moved ? SampleF(true, X, Y) : clipSrcF[c];
-            if (kOverlap == 0) {
+            float v = SampleF(moved, X, Y);
+            if ((kOverlap | kOverlapY) == 0) {
                 accF = v;
             } else {
                 precise float t = v * float(win);
@@ -177,18 +188,18 @@ void main() {
                 accF = a;
             }
         } else {
-            uint v = moved ? Sample(true, X, Y) : (kWide ? uint(clipSrc16[c]) : uint(clipSrc[c]));
-            if (kOverlap == 0)
+            uint v = Sample(moved, X, Y);
+            if ((kOverlap | kOverlapY) == 0)
                 acc = v;
             else
                 acc += (v * uint(win)) >> 6u;
         }
     }
     if (kFloat) {
-        precise float v = kOverlap == 0 ? accF : accF * (1.0 / 32.0);
+        precise float v = (kOverlap | kOverlapY) == 0 ? accF : accF * (1.0 / 32.0);
         outPxF[at] = v;
     } else {
-        uint v = kOverlap == 0 ? acc : min((acc + 16u) >> 5u, uint(kPixelMax));
+        uint v = (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uint(kPixelMax));
         if (kWide)
             outPx16[at] = uint16_t(v);
         else

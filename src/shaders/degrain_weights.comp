@@ -67,7 +67,7 @@ uint Normalised(uint a, uint s) {
 // workgroups.
 void main() {
     int b = int(gl_GlobalInvocationID.x);
-    if (b >= pc.nb)
+    if (b >= Blocks())
         return;
     int bx = b % pc.nbx, by = b / pc.nbx;
     int totalL = 256 * tables[pc.uwOff] + 1, totalC = totalL;
@@ -88,7 +88,7 @@ void main() {
         }
         centreL -= int(wl);
         centreC -= int(wc);
-        meta[(1 + r) * pc.nb + b] = wl | (wc << 16u);
+        meta[(1 + r) * Blocks() + b] = wl | (wc << 16u);
     }
     meta[b] = uint(max(centreL, 0)) | (uint(max(centreC, 0)) << 16u);
 }

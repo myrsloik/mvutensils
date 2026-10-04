@@ -37,18 +37,25 @@
 //
 // AnalyseMany wires each field to the fields its seeds come from: (n, d) chains (n, u) and
 // (n + u, d - u), u the step toward d, and for d > 0 inverts (n + d, -d); Analyse on its own
-// seeds from the coarse search only.
+// seeds from the coarse search only. A super without coarse levels (onelevel=True, or a frame
+// narrower than 192 pixels) has no coarse node: its fields seed from zero and the chained and inverted
+// vectors alone.
 //
-// Implemented, on Gray, 4:2:0 and 4:4:4 supers of 8 to 16-bit or float samples (mvlambda, lsad and
-// badsad scaled to the depth as mvu scales them, floats searched as 16-bit samples, a Gray super's
-// SADs luma's): chroma, mvlambda, lsad, plevel (lambda * 2^(plevel * L) at coarse level L, as mvu
-// scales it per level), badsad and badrange (the fallback's threshold and radius), delta, prefix,
-// plus badstep, the fallback's step, which mvu doesn't have. The fallback's defaults are the tested
-// ones (badsad 1000, badrange 40, badstep 2) rather than mvu's (badsad 10000, which this search would
-// almost never reach, and badrange 24). search, searchparam, pelsearch, levels, pnew, pzero,
-// pglobal, globalmv, meander and trymany tune mvu's search, which this one doesn't use; they are
-// checked and otherwise ignored. satd and fields aren't implemented yet, and blksize and overlap
-// must be the super's.
+// Implemented, on Gray and YUV supers of any subsampling (4:2:0, 4:2:2, 4:4:0, 4:4:4) and 8 to
+// 16-bit or float samples (mvlambda, lsad and badsad scaled to the depth as mvu scales them, floats
+// searched as 16-bit samples, a Gray super's SADs luma's): chroma, mvlambda, lsad, plevel (lambda *
+// 2^(plevel * L) at coarse level L, as mvu scales it per level), badsad and badrange (the
+// fallback's threshold and radius), delta, prefix, plus badstep, the fallback's step, which mvu
+// doesn't have. The fallback's defaults are the tested ones (badsad 1000, badrange 40, badstep 2)
+// rather than mvu's (badsad 10000, which this search would almost never reach, and badrange 24).
+// search, searchparam, pelsearch, levels, pnew, pzero, pglobal, globalmv, meander and trymany tune
+// mvu's search, which this one doesn't use; they are checked and otherwise ignored. satd makes luma's
+// SAD its SATD, mvu's, at the full-size grid (the coarse search keeps the SAD; 16x2 blocks are refused,
+// as mvu refuses them). fields and tff shift the zero and median seeds of a field of an odd delta at
+// pel 2 or 4 by mvu's field shift, as mvu shifts its zero and global predictors. Blocks whose SAD can
+// pass 2^31 (128x128 with chroma at 16 bits or float) are refused. blksize and overlap may be other
+// than the super's, as in mvu: the grid then has to fit the super's block-aligned frame
+// (SuperLayout::WithGrid).
 
 namespace {
 
@@ -61,7 +68,13 @@ constexpr int kLevelPairs = 2;    // checkerboard pass pairs at every coarse lev
 
 // The pixels of a block's SAD: luma's, and U's and V's unless it is luma's alone
 int BlockPixels(const SuperLayout &L, bool chroma) {
-    return L.blk * L.blk + (chroma ? 2 * (L.blk / L.format.xr) * (L.blk / L.format.yr) : 0);
+    return L.blk * L.blkY + (chroma ? 2 * (L.blk / L.format.xr) * (L.blkY / L.format.yr) : 0);
+}
+
+// The largest SAD of a block, in largest samples: its pixels, luma's twice with satd, whose SATD reaches
+// at most twice the SAD (refine_common.glsl's kBlockPixels)
+int64_t SadPixels(const SuperLayout &L, bool chroma, bool satd) {
+    return BlockPixels(L, chroma) + (satd ? static_cast<int64_t>(L.blk) * L.blkY : 0);
 }
 
 // The bit depth the search works at: the samples', but 16 for floats, which it searches as the
@@ -70,17 +83,28 @@ int SearchBits(const SuperLayout &L) {
     return L.format.Kind() == 2 ? 16 : L.format.bits;
 }
 
-// Entries of the full-size grid's lambda table: (largest SAD of a block) >> (1 + bits - 8), plus one
-int LambdaEntries(const SuperLayout &L, bool chroma) {
+// The full-size grid's lambda table takes the worst neighbour SAD / 2 in steps of 2^(bits - 8), and
+// for blocks of more than 32x32 pixels in steps 2^AreaShift times that (refine_common.glsl's
+// kAreaShift), so that it stays the size of 32x32 blocks'
+int AreaShift(const SuperLayout &L) {
+    const int area = L.blk * L.blkY;
+    return area > 8192 ? 4 : area > 4096 ? 3 : area > 2048 ? 2 : area > 1024 ? 1 : 0;
+}
+
+// Entries of the full-size grid's lambda table: (largest SAD of a block) >> (1 + bits - 8 + AreaShift),
+// plus one
+int LambdaEntries(const SuperLayout &L, bool chroma, bool satd) {
     const int bits = SearchBits(L);
-    return static_cast<int>(((static_cast<int64_t>(BlockPixels(L, chroma)) * ((1 << bits) - 1)) >> (bits - 7)) + 1);
+    return static_cast<int>(((SadPixels(L, chroma, satd) * ((1 << bits) - 1)) >> (bits - 7 + AreaShift(L))) + 1);
 }
 
 // The search kernels' variant (specialization constant 6, refine_common.glsl): bit 0 for SADs of
-// luma alone, bit 1 for chroma that isn't subsampled, bits 4 to 7 the search's bit depth less 8,
-// bit 8 for float samples
-int SearchVariant(const SuperLayout &L, bool chroma) {
-    return (chroma ? 0 : 1) | (L.format.xr == 1 ? 2 : 0) | ((SearchBits(L) - 8) << 4) | (L.format.Kind() == 2 ? 256 : 0);
+// luma alone, bits 1 and 9 for chroma subsampled horizontally and vertically, bits 4 to 7 the
+// search's bit depth less 8, bit 8 for float samples; bit 10 for luma's SATD, which only the
+// full-size grid's kernels take (satd)
+int SearchVariant(const SuperLayout &L, bool chroma, bool satd = false) {
+    return (chroma ? 0 : 1) | (L.format.xr > 1 ? 2 : 0) | (L.format.yr > 1 ? 512 : 0) | ((SearchBits(L) - 8) << 4) | (L.format.Kind() == 2 ? 256 : 0) |
+           (satd ? 1024 : 0);
 }
 
 // Lanes per candidate in the kernels that measure 8 candidates per block, init, the passes and the
@@ -383,10 +407,13 @@ struct AnalyseData {
     int unit = 0;
 
     VSVideoInfo vi = {};
-    SuperLayout layout;
+    SuperLayout layout; // the super's
+    SuperLayout grid;   // the same with the grid analysed
 
     int deltaFrame = 1;
     bool chroma = true; // the SADs count chroma
+    bool satd = false;  // luma's SAD is its SATD
+    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
     int split = 1;      // RefineSplit
     int badSad = 0;
     int fallbackRadius = 0;
@@ -441,19 +468,20 @@ public:
     // quarter-pel step
     FieldRecorder(const AnalyseData &d, Recorder &rec, VkBuffer scratch, int lumaStride, int chromaStride, int recStride, int coarseBase,
                   std::function<void(int)> stamp)
-        : d(d), L(d.layout), rec(rec), scratch(scratch), lumaStride(lumaStride), chromaStride(chromaStride), recStride(recStride), coarseBase(coarseBase),
+        : d(d), L(d.grid), rec(rec), scratch(scratch), lumaStride(lumaStride), chromaStride(chromaStride), recStride(recStride), coarseBase(coarseBase),
           stamp(std::move(stamp)) {}
 
     // flags is the caller's to set where a kernel uses it
     Params MakeParams(int colour, int stamp) const {
         Params q = {};
-        q.w = L.width;
-        q.h = L.height;
         q.nbx = L.nbx;
         q.nby = L.nby;
         q.step = L.step;
+        q.stepY = L.stepY;
         q.pad = L.pad;
+        q.padY = L.padY;
         q.padc = L.padc;
+        q.padcY = L.padcY;
         q.colour = colour;
         q.wp = lumaStride;
         q.hp = L.hp;
@@ -467,17 +495,21 @@ public:
         q.topRadius = kTopRadius;
         q.medianScale = 1;
         q.finest = SuperLayout::kFinest;
-        q.blockRows = L.blk;
+        q.blockRows = L.blkY;
         q.recStride = recStride;
         q.coarseBase = coarseBase;
+        q.aw = L.aw;
+        q.ah = L.ah;
         return q;
     }
 
-    // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is
-    void SeedLists(int flags) {
+    // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is;
+    // fieldShift: the field shift of zero and the median
+    void SeedLists(int flags, int fieldShift) {
         const uint32_t groups = static_cast<uint32_t>((static_cast<int64_t>(L.nbx) * L.nby + 63) / 64);
         Params q = MakeParams(0, 0);
         q.flags = flags;
+        q.fieldShift = fieldShift;
         if (flags & 2) {
             rec.Dispatch(d.seedScatter, q, groups, 1);
             rec.ComputeBarrier();
@@ -561,7 +593,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (hasRef) {
             vsapi->requestFrameFilter(std::min(n, nref), d->node, frameCtx);
             vsapi->requestFrameFilter(std::max(n, nref), d->node, frameCtx);
-            vsapi->requestFrameFilter(n, d->coarseNode, frameCtx);
+            if (d->coarseNode)
+                vsapi->requestFrameFilter(n, d->coarseNode, frameCtx);
             if (d->stepNode && d->restNode) {
                 vsapi->requestFrameFilter(n, d->stepNode, frameCtx);
                 vsapi->requestFrameFilter(n + d->unit, d->restNode, frameCtx);
@@ -574,25 +607,33 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         }
     } else if (activationReason == arAllFramesReady) {
         const VSVULKANAPI *vkapi = d->vc->vkapi;
-        const SuperLayout &L = d->layout;
+        const SuperLayout &L = d->layout, &G = d->grid; // the super's frames, the vectors' grid
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
 
         if (!hasRef) {
             // No vectors: a frame of records that don't count, with the description. The super frame
-            // is checked all the same, as mvu checks it.
+            // is checked all the same, as mvu checks it, its parity too with fields.
             SuperRegions regions;
-            if (const std::string e = CheckSuperFrame(src, L, d->prefix, regions, vsapi); !e.empty()) {
+            std::string e = CheckSuperFrame(src, L, d->prefix, regions, vsapi);
+            if (e.empty() && d->fields) {
+                try {
+                    (void)GetTopField(src, n, d->tffExists, d->tff, true, vsapi);
+                } catch (const std::exception &x) {
+                    e = x.what();
+                }
+            }
+            if (!e.empty()) {
                 vsapi->freeFrame(src);
                 vsapi->setFilterError(("Analyse: " + e).c_str(), frameCtx);
                 return nullptr;
             }
-            VSFrame *dst = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+            VSFrame *dst = vkapi->newGPUVideoFrame(&d->gray32, 4 * G.nbx, G.nby, src, core);
             vsapi->freeFrame(src);
             if (!dst) {
                 vsapi->setFilterError("Analyse: failed to allocate the vector frame", frameCtx);
                 return nullptr;
             }
-            ExportAnalysis(dst, L, d->deltaFrame, d->chroma, false, d->prefix, vsapi);
+            ExportAnalysis(dst, G, d->deltaFrame, d->chroma, false, d->prefix, vsapi);
             return dst;
         }
 
@@ -622,12 +663,25 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         };
 
         const VSFrame *ref = hold(vsapi->getFrameFilter(nref, d->node, frameCtx));
-        const VSFrame *coarse = hold(vsapi->getFrameFilter(n, d->coarseNode, frameCtx));
+        const VSFrame *coarse = d->coarseNode ? hold(vsapi->getFrameFilter(n, d->coarseNode, frameCtx)) : nullptr;
         SuperRegions cur, rf;
         if (const std::string e = CheckSuperFrame(src, L, d->prefix, cur, vsapi); !e.empty())
             return fail(e);
         if (const std::string e = CheckSuperFrame(ref, L, d->prefix, rf, vsapi); !e.empty())
             return fail(e);
+
+        // mvu.Analyse's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the
+        // frames' parities (their _Field, or tff), which zero and the median take (seed_build.comp)
+        int fieldShift = 0;
+        if (d->fields) {
+            try {
+                const bool srcTop = GetTopField(src, n, d->tffExists, d->tff, true, vsapi), refTop = GetTopField(ref, nref, d->tffExists, d->tff, true, vsapi);
+                if (L.pel > 1 && d->deltaFrame % 2 != 0)
+                    fieldShift = ComputeFieldShift(srcTop, refTop, L.pel);
+            } catch (const std::exception &e) {
+                return fail(e.what());
+            }
+        }
 
         // The fields the seeds chain and invert, refined by the other nodes AnalyseMany made
         const VSFrame *stepVec = nullptr, *restVec = nullptr, *invVec = nullptr;
@@ -639,16 +693,16 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             invVec = hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(nref, d->invNode, frameCtx)), d->prefix, vsapi));
 
         // The output: the records, with the super frame's properties
-        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+        vectors = vkapi->newGPUVideoFrame(&d->gray32, 4 * G.nbx, G.nby, src, core);
         if (!vectors)
             return fail("failed to allocate the vector frame");
         const ptrdiff_t recBytes = vsapi->getStride(vectors, 0);
         if (recBytes % 16)
             return fail("the vector frame's rows don't start on whole records");
         auto sameShape = [&](const VSFrame *f) {
-            return f && vsapi->getFrameWidth(f, 0) == 4 * L.nbx && vsapi->getFrameHeight(f, 0) == L.nby && vsapi->getStride(f, 0) == recBytes;
+            return f && vsapi->getFrameWidth(f, 0) == 4 * G.nbx && vsapi->getFrameHeight(f, 0) == G.nby && vsapi->getStride(f, 0) == recBytes;
         };
-        const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0);
+        const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0) | (coarse ? 0 : 4);
 
         // A Gray super has no chroma
         const bool chroma = L.format.chroma;
@@ -656,13 +710,13 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         const ptrdiff_t bytes = L.format.Bytes();
         if (lumaStride != rf.lumaStride || chromaStride != rf.chromaStride || lumaStride % (4 * bytes) || chromaStride % (4 * bytes))
             return fail("the super frames' storage strides differ");
-        const ptrdiff_t coarseRowBytes = vsapi->getStride(coarse, 0);
+        const ptrdiff_t coarseRowBytes = coarse ? vsapi->getStride(coarse, 0) : 0;
         if (coarseRowBytes % 8)
             return fail("the coarse search's rows don't start on whole vectors");
 
         // The buffers every binding names
-        VSVulkanPlaneInfo curPlane, refPlane, coarsePlane, outRec, stepRec = {}, restRec = {}, invRec = {};
-        if (vkapi->getGPUPlane(src, 0, &curPlane) || vkapi->getGPUPlane(ref, 0, &refPlane) || vkapi->getGPUPlane(coarse, 0, &coarsePlane) ||
+        VSVulkanPlaneInfo curPlane, refPlane, coarsePlane = {}, outRec, stepRec = {}, restRec = {}, invRec = {};
+        if (vkapi->getGPUPlane(src, 0, &curPlane) || vkapi->getGPUPlane(ref, 0, &refPlane) || (coarse && vkapi->getGPUPlane(coarse, 0, &coarsePlane)) ||
             vkapi->getGPUPlane(vectors, 0, &outRec) ||
             ((flags & 1) && (vkapi->getGPUPlane(stepVec, 0, &stepRec) || vkapi->getGPUPlane(restVec, 0, &restRec))) ||
             ((flags & 2) && vkapi->getGPUPlane(invVec, 0, &invRec)))
@@ -681,7 +735,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             return fail(err);
         vkapi->gpuExecUsesBuffer(ctx, scratch);
         for (const VSFrame *f : {src, ref, coarse})
-            vkapi->gpuExecReadsFrame(ctx, f);
+            if (f)
+                vkapi->gpuExecReadsFrame(ctx, f);
         if (flags & 1) {
             vkapi->gpuExecReadsFrame(ctx, stepVec);
             vkapi->gpuExecReadsFrame(ctx, restVec);
@@ -700,7 +755,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             rec.Bind(kCurChroma, curPlane.buffer, cur.chroma, cur.chromaBytes);
             rec.Bind(kRefChroma, refPlane.buffer, rf.chroma, rf.chromaBytes);
         }
-        rec.Bind(kCoarse, coarsePlane.buffer);
+        if (coarse) // else seed_build.comp takes no coarse seeds
+            rec.Bind(kCoarse, coarsePlane.buffer);
         rec.Bind(kLambda, constants, d->lambda.offset, d->lambda.size);
         rec.Bind(kLevels, constants, d->levels.offset, d->levels.size);
         const std::pair<int, const Region *> regions[] = {
@@ -726,7 +782,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
         FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / bytes), static_cast<int>(recBytes / 16),
                             static_cast<int>(d->coarseRow * coarseRowBytes / 8), std::move(stamp));
-        field.SeedLists(flags);
+        field.SeedLists(flags, fieldShift);
         field.Refinement();
 
         uint64_t signaled = 0;
@@ -738,7 +794,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (d->profile)
             d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
-        ExportAnalysis(vectors, L, d->deltaFrame, d->chroma, true, d->prefix, vsapi);
+        ExportAnalysis(vectors, G, d->deltaFrame, d->chroma, true, d->prefix, vsapi);
         VSFrame *dst = vectors;
         vectors = nullptr; // returned, not released
         release();
@@ -755,15 +811,18 @@ namespace {
 struct AnalyseArgs {
     VSNode *node = nullptr; // the super clip, a new reference
     SuperLayout layout;
+    SuperLayout grid;       // the same with the grid analysed, the super's or another (WithGrid)
     std::string prefix;
     int deltaFrame = 1;
     bool chroma = true;
+    bool satd = false;
+    bool fields = false, tff = false, tffExists = false;
     int plevel = 1;
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
     int badrange = 40, badstep = 2;
 
     Scaled Scale() const {
-        const int64_t area = static_cast<int64_t>(layout.blk) * layout.blk;
+        const int64_t area = static_cast<int64_t>(grid.blk) * grid.blkY;
         const int pixelMax = (1 << SearchBits(layout)) - 1;
         auto toDepth = [&](int64_t v) { return static_cast<int64_t>(static_cast<double>(v) * pixelMax / 255.0 + 0.5); };
         const int64_t mvl = toDepth(mvlambda), ls = toDepth(lsad), bs = toDepth(badsad);
@@ -786,20 +845,19 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         a.layout = ImportSuperLayout(a.node, a.prefix, vsapi);
         if (const std::string unsupported = a.layout.Unsupported(SuperLayout::Use::Search); !unsupported.empty())
             throw std::runtime_error(unsupported);
-        if (a.layout.topLevel < 1)
-            throw std::runtime_error("the super clip has no coarse levels, which the search starts from: it was made with onelevel=True, or the frame is narrower than " +
-                                     std::to_string(2 * SuperLayout::kTopWidth) + " pixels");
-        // median.comp's histogram
-        if (a.layout.maxCoarseVector >= 4064)
+        // median.comp's histogram (a super without coarse levels has none to search: onelevel=True, or
+        // a frame narrower than 2 * kTopWidth pixels)
+        if (a.layout.maxCoarseVector >= 65024)
             throw std::runtime_error("the frame is too large for the coarse search");
 
         int blkX, blkY, overlapX, overlapY;
-        GetPairArgument(blkX, blkY, "blksize", a.layout.blk, a.layout.blk, in, vsapi);
-        GetPairArgument(overlapX, overlapY, "overlap", a.layout.overlap, a.layout.overlap, in, vsapi);
+        GetPairArgument(blkX, blkY, "blksize", a.layout.blk, a.layout.blkY, in, vsapi);
+        GetPairArgument(overlapX, overlapY, "overlap", a.layout.overlap, a.layout.overlapY, in, vsapi);
 
-        const bool useSatd = !!vsapi->mapGetInt(in, "satd", 0, &err);
+        a.satd = !!vsapi->mapGetInt(in, "satd", 0, &err);
 
-        CheckBlockSize(blkX, blkY, overlapX, overlapY, a.layout.format.xr > 1 ? 1 : 0, a.layout.format.yr > 1 ? 1 : 0);
+        CheckBlockSize(blkX, blkY, overlapX, overlapY, a.layout.format.xr > 1 ? 1 : 0, a.layout.format.yr > 1 ? 1 : 0, a.satd);
+        a.grid = a.layout.WithGrid(blkX, blkY, overlapX, overlapY);
 
         // levels, search, searchparam and pelsearch steer mvu's hierarchical search
         vsapi->mapGetIntSaturated(in, "levels", 0, &err);
@@ -822,6 +880,9 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
             a.chroma = true;
         if (!a.layout.format.chroma) // a Gray super's SADs are luma's alone, as in mvu
             a.chroma = false;
+        // The kernels keep a block's SAD in an int
+        if (SadPixels(a.grid, a.chroma, a.satd) * ((1 << SearchBits(a.grid)) - 1) > INT32_MAX)
+            throw std::runtime_error("the blocks' SADs can pass 2^31 (128x128 blocks with chroma at 16 bits or float), which isn't implemented");
 
         a.deltaFrame = vsapi->mapGetIntSaturated(in, "delta", 0, &err);
         if (err)
@@ -871,7 +932,10 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (tryMany < 0 || tryMany > 2)
             throw std::runtime_error("trymany must be between 0 and 2");
 
-        const bool fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+        a.fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+
+        a.tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
+        a.tffExists = !err;
 
         if (searchType < 0 || searchType > 5)
             throw std::runtime_error("search must be between 0 and 5");
@@ -896,14 +960,6 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
 
         if (std::abs(a.badrange) > 1024)
             throw std::runtime_error("badrange must be between -1024 and 1024");
-
-        // What the GPU path implements so far
-        if (blkX != a.layout.blk || blkY != a.layout.blk || overlapX != a.layout.overlap || overlapY != a.layout.overlap)
-            throw std::runtime_error("blksize and overlap must be the super clip's; analysing another grid isn't implemented yet");
-        if (useSatd)
-            throw std::runtime_error("satd isn't implemented yet");
-        if (fields)
-            throw std::runtime_error("fields isn't implemented yet");
     } catch (...) {
         vsapi->freeNode(a.node);
         throw;
@@ -984,13 +1040,18 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
                       VSCore *core, const VSAPI *vsapi) {
     std::unique_ptr<AnalyseData> d = std::make_unique<AnalyseData>(vsapi);
     d->node = vsapi->addNodeRef(a.node);
-    d->coarseNode = vsapi->addNodeRef(coarseNode);
+    d->coarseNode = coarseNode ? vsapi->addNodeRef(coarseNode) : nullptr;
     d->coarseRow = coarseRow;
     d->vi = *vsapi->getVideoInfo(a.node);
     d->layout = a.layout;
+    d->grid = a.grid;
     d->prefix = a.prefix;
     d->deltaFrame = delta;
     d->chroma = a.chroma;
+    d->satd = a.satd;
+    d->fields = a.fields;
+    d->tff = a.tff;
+    d->tffExists = a.tffExists;
     if (stepNode && restNode) {
         d->stepNode = vsapi->addNodeRef(stepNode);
         d->restNode = vsapi->addNodeRef(restNode);
@@ -999,8 +1060,9 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     if (invNode)
         d->invNode = vsapi->addNodeRef(invNode);
 
-    const SuperLayout &L = d->layout;
-    const int blk = L.blk;
+    // The kernels work on the grid analysed, in the super's planes, which the grid copies
+    const SuperLayout &L = d->grid;
+    const int blk = L.blk, blkY = L.blkY;
     const Scaled s = a.Scale();
     d->badSad = static_cast<int>(s.badSad);
     d->fallbackRadius = std::abs(a.badrange);
@@ -1009,23 +1071,23 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
     d->split = RefineSplit(L, a.chroma);
-    const int pel = L.pel, variant = SearchVariant(L, a.chroma), split = variant | (d->split == 4 ? 8 : d->split == 2 ? 4 : 0);
-    d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel);
-    d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel);
-    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel, split);
-    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel, split);
-    d->flag = vc.Pipeline(Kernel::RefineFlag, blk, pel);
-    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel, variant);
-    d->apply = vc.Pipeline(Kernel::RefineApply, blk, pel);
-    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel, split);
+    const int pel = L.pel, variant = SearchVariant(L, a.chroma, a.satd), split = variant | (d->split == 4 ? 8 : d->split == 2 ? 4 : 0);
+    d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel, 0, blkY);
+    d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel, 0, blkY);
+    d->init = vc.Pipeline(Kernel::RefineInit, blk, pel, split, blkY);
+    d->pass = vc.Pipeline(Kernel::RefinePass, blk, pel, split, blkY);
+    d->flag = vc.Pipeline(Kernel::RefineFlag, blk, pel, 0, blkY);
+    d->fallback = vc.Pipeline(Kernel::RefineFallback, blk, pel, variant, blkY);
+    d->apply = vc.Pipeline(Kernel::RefineApply, blk, pel, 0, blkY);
+    d->halfpel = vc.Pipeline(Kernel::RefineHalfpel, blk, pel, split, blkY);
     if (pel == 4)
-        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel, split);
+        d->quarter = vc.Pipeline(Kernel::RefineQuarter, blk, pel, split, blkY);
 
-    // lambda for every (worst neighbour SAD) >> (1 + bits - 8), relaxed by lsad as the CPU reference does in
-    // double precision
-    std::vector<int64_t> lambda(LambdaEntries(L, a.chroma));
+    // lambda for every (worst neighbour SAD) >> (1 + bits - 8 + AreaShift), relaxed by lsad as the CPU
+    // reference does in double precision
+    std::vector<int64_t> lambda(LambdaEntries(L, a.chroma, a.satd));
     for (size_t i = 0; i < lambda.size(); ++i) {
-        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << (SearchBits(L) - 8)), 1);
+        const double scale = static_cast<double>(s.lsad) / std::max<int64_t>(s.lsad + (static_cast<int64_t>(i) << (SearchBits(L) - 8 + AreaShift(L))), 1);
         lambda[i] = static_cast<int64_t>(s.lambda0 * scale * scale);
     }
     Regions constants(vc);
@@ -1071,9 +1133,9 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
                                                      std::vector<std::string>{"seeds", "init", "passes before the fallback", "fallback", "passes after it",
                                                                               "half-pel step", "quarter-pel step"});
 
-    VSFilterDependency deps[5] = {{d->node, rpGeneral}, {d->coarseNode, rpGeneral}};
-    int numDeps = 2;
-    for (VSNode *dep : {d->stepNode, d->restNode, d->invNode})
+    VSFilterDependency deps[5] = {{d->node, rpGeneral}};
+    int numDeps = 1;
+    for (VSNode *dep : {d->coarseNode, d->stepNode, d->restNode, d->invNode})
         if (dep)
             deps[numDeps++] = {dep, rpGeneral};
 
@@ -1091,7 +1153,8 @@ static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
     try {
         AnalyseArgs a = ParseAnalyseArgs(in, vsapi);
         try {
-            coarse = CreateCoarse(a, {a.deltaFrame}, core, vsapi);
+            if (a.layout.topLevel >= 1)
+                coarse = CreateCoarse(a, {a.deltaFrame}, core, vsapi);
             vsapi->mapConsumeNode(out, "clip", CreateAnalyse(a, a.deltaFrame, coarse, 0, nullptr, nullptr, 0, nullptr, core, vsapi), maAppend);
         } catch (...) {
             vsapi->freeNode(a.node);
@@ -1139,7 +1202,8 @@ static void VS_CC analyseManyCreate(const VSMap *in, VSMap *out, [[maybe_unused]
                 deltas.push_back(-r * delta);
                 deltas.push_back(r * delta);
             }
-            coarse = CreateCoarse(a, deltas, core, vsapi);
+            if (a.layout.topLevel >= 1)
+                coarse = CreateCoarse(a, deltas, core, vsapi);
             for (int r = 1; r <= radius; ++r) {
                 // (n, -r) chains (n, -1) and (n - 1, -(r - 1)); (n, r) chains (n, 1) and (n + 1, r - 1)
                 // and inverts (n + r, -r)

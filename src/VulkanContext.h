@@ -94,17 +94,22 @@ enum FlowBinding {
     kFlMasks, kFlCounts, kFlClipSrc, kFlClipRef, kFlOut, kFlTaps,
 };
 
+// The push constants of every layout: 128 bytes, as many as every device is guaranteed to take
+// (maxPushConstantsSize); each kernel's parameters fit in them
+constexpr uint32_t kPushBytes = 128;
+
 // Push constants, matching refine_common.glsl's Params
 struct Params {
-    int32_t w, h, nbx, nby;
-    int32_t step, pad, padc, colour;
+    int32_t nbx, nby, step, stepY;
+    int32_t pad, padY, padc, padcY;
     int32_t wp, hp, wc, hc;
     int32_t fallbackRadius, fallbackStep, badSad, maxSeeds;
     int32_t stamp, level, flags, topRadius;
     int32_t medianScale, medianSlot, finest, blockRows;
-    int32_t srcStrideY, srcStrideC, recStride, coarseBase;
+    int32_t colour, recStride, coarseBase, aw;
+    int32_t ah, fieldShift;
 };
-static_assert(sizeof(Params) == 112, "refine_common.glsl's Params is 28 ints");
+static_assert(sizeof(Params) == 120, "refine_common.glsl's Params is 30 ints");
 
 // Super's push constants (super.comp, super_qpel.comp, pyr_reduce.comp), matching
 // super_common.glsl's Params; they share the Main layout and its push constant range
@@ -117,25 +122,27 @@ struct SuperParams {
     int32_t srcStrideY, srcStrideC, pelStrideY, pelStrideC;
     int32_t level, rfilter, pel, quad;
 };
-static_assert(sizeof(SuperParams) <= 112, "super_common.glsl's Params must fit the Main layout's push constants");
+static_assert(sizeof(SuperParams) <= kPushBytes, "super_common.glsl's Params must fit the push constants");
 
 // Degrain's push constants, matching degrain_common.glsl's Params
 struct DegrainParams {
-    int32_t nbx, nby, step, overlap;
-    int32_t pad, padc, wp, hp;
-    int32_t wc, hc, recStride, refs;
+    int32_t nbx, nby, step, stepY;
+    int32_t overlap, overlapY, pad, padY;
+    int32_t padc, padcY, aw, ah;
+    int32_t wp, hp, wc, hc;
+    int32_t recStride, refs;
     uint32_t usable0, usable1;
     int32_t thscd1, scdLimit;
     int32_t plane, width, height, outStride;
     int32_t limit, winOff, thOff, uwOff;
-    int32_t nb, pixelMax;
+    int32_t pixelMax;
     float limitF;
-    int32_t quad;
 };
-static_assert(sizeof(DegrainParams) == 112, "degrain_common.glsl's Params is 28 ints");
+static_assert(sizeof(DegrainParams) == kPushBytes, "degrain_common.glsl's Params is 32 ints");
 
 // The Flow kernels' push constants, matching flow_common.glsl's Params; they share the Main layout.
-// flow_blur.comp takes blur256 in time256 and prec in time4096FX.
+// flow_blur.comp takes blur256 in time256 and prec in time4096FX; compensate.comp its grid's step
+// and overlap in time4096FX and time4096FY, horizontally, and in stepY and overlapY vertically.
 struct FlowParams {
     int32_t nbx, nby, recStride, flags;
     int32_t pad, padY, padc, padcY;
@@ -145,8 +152,9 @@ struct FlowParams {
     int32_t colOff, rowOff;
     float occnormX, occnormY;
     int32_t time4096FX, time4096FY, time4096BX, time4096BY;
+    int32_t stepY, overlapY, fieldShift;
 };
-static_assert(sizeof(FlowParams) == 112, "flow_common.glsl's Params is 28 words");
+static_assert(sizeof(FlowParams) == 124, "flow_common.glsl's Params is 31 words");
 
 // The mask kernels' push constants (mask_blocks.comp, mask_resize.comp), matching mask_common.glsl's
 // Params; they share the Main layout
@@ -158,7 +166,7 @@ struct MaskParams {
     float norm, normY, gamma, scvalF;
     int32_t scval, colOff, rowOff, countSlot;
 };
-static_assert(sizeof(MaskParams) <= 112, "mask_common.glsl's Params must fit the Main layout's push constants");
+static_assert(sizeof(MaskParams) <= kPushBytes, "mask_common.glsl's Params must fit the push constants");
 
 // The mask kernels' bindings in the Main layout (mask_common.glsl): the vector records, the blocks'
 // mask values, the scene change count, the output plane, the resize's taps
@@ -176,9 +184,10 @@ struct RecalcParams {
     int32_t padcY, wp, hp, wc;
     int32_t hc, aw, ah, lambda;
     int32_t thsad, pnew, search, searchParam;
-    int32_t smoothing;
+    int32_t smoothing, oldPelShift, stepY, blkOldY;
+    int32_t stepOldY;
 };
-static_assert(sizeof(RecalcParams) <= 112, "recalc.comp's Params must fit the Main layout's push constants");
+static_assert(sizeof(RecalcParams) <= kPushBytes, "recalc.comp's Params must fit the push constants");
 
 class Recorder;
 // Records mask_blocks.comp (count, a MaskBlocks pipeline) counting the blocks of a vector frame
@@ -195,10 +204,10 @@ public:
     VulkanContext(const VulkanContext &) = delete;
     VulkanContext &operator=(const VulkanContext &) = delete;
 
-    // The kernel's pipeline for blocks of blk x blk and vectors of 1 / pel pixels, compiled on first
-    // use; filters ask for theirs when they are created, not while producing frames. variant is
-    // specialization constant 6, the super kernels' sample kind (SuperFormat::Kind).
-    VkPipeline Pipeline(Kernel kernel, int blk, int pel, int variant = 0);
+    // The kernel's pipeline for blocks of blk x blkY (blk x blk with blkY 0) and vectors of 1 / pel
+    // pixels, compiled on first use; filters ask for theirs when they are created, not while producing
+    // frames. variant is specialization constant 6, the super kernels' sample kind (SuperFormat::Kind).
+    VkPipeline Pipeline(Kernel kernel, int blk, int pel, int variant = 0, int blkY = 0);
 
     // A device-local storage buffer holding size bytes of data, copied there through the pool and
     // waited for: the tables a filter reads for its whole life, uploaded when it is created.
@@ -230,7 +239,7 @@ private:
 
     VSCore *core;
     std::mutex lock;
-    std::map<std::tuple<int, int, int, int>, VkPipeline> pipelines;
+    std::map<std::tuple<int, int, int, int, int>, VkPipeline> pipelines;
     static constexpr int kLayouts = 3;
     std::vector<std::pair<uint32_t, uint32_t>> bindings[kLayouts];
     VkDescriptorSetLayout setLayouts[kLayouts] = {};

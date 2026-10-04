@@ -66,14 +66,22 @@ int ChromaRow() {
 
 // Rows a lane holds at once: a 32-row block's cell row goes in two, which keeps the registers 16 x 16
 // blocks take
-const int kChunk = kBlk > 16 ? 16 : kBlk;
+const int kChunk = kBlkY > 16 ? 16 : kBlkY;
 
-// The range ValidateVectors accepts for block (bx, by)'s vector, the block inside the padded planes;
-// vectors from mvgpu.Analyse are always inside it, so this only guards the reads
+// The range ValidateVectors accepts for block (bx, by)'s vector, the block inside the padded planes
+// of the super's block-aligned frame; vectors from mvgpu.Analyse are always inside it, so this only
+// guards the reads
 ivec2 ClampVec(ivec2 v, int bx, int by) {
-    int gX = bx * pc.step, gY = by * pc.step;
-    return ivec2(clamp(v.x, -kPel * (gX + pc.pad), kPel * ((pc.nbx - 1) * pc.step + pc.pad - gX) - 1),
-                 clamp(v.y, -kPel * (gY + pc.pad), kPel * ((pc.nby - 1) * pc.step + pc.pad - gY) - 1));
+    int gX = bx * pc.step, gY = by * pc.stepY;
+    return ivec2(clamp(v.x, -kPel * (gX + pc.pad), kPel * (pc.aw - kBlkX + pc.pad - gX) - 1),
+                 clamp(v.y, -kPel * (gY + pc.padY), kPel * (pc.ah - kBlkY + pc.padY - gY) - 1));
+}
+
+// Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the plane's step
+// and overlap multiples of 4 (Main4; Degrain.cpp sizes the dispatch for it alike)
+bool Quad() {
+    int lx = pc.plane == 0 ? 0 : kLogX;
+    return !kWide && !kFloat && kPel != 4 && ((pc.step >> lx) & 3) == 0 && ((pc.overlap >> lx) & 3) == 0;
 }
 
 // mvu.Degrain for one plane. A lane is one pixel column of a cell row: the rows between two
@@ -105,17 +113,17 @@ ivec2 ClampVec(ivec2 v, int bx, int by) {
 void MainFloat() {
     bool luma = pc.plane == 0;
     int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-    int Bx = kBlk >> lx, By = kBlk >> ly;
-    int Sx = pc.step >> lx, Sy = pc.step >> ly;
-    int Ox = pc.overlap >> lx, Oy = pc.overlap >> ly;
+    int Bx = kBlkX >> lx, By = kBlkY >> ly;
+    int Sx = pc.step >> lx, Sy = pc.stepY >> ly;
+    int Ox = pc.overlap >> lx, Oy = pc.overlapY >> ly;
     int x = int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
     int y0 = cy * Sy;
     int rows = min(cy == pc.nby - 1 ? By : Sy, pc.height - y0);
     if (x >= pc.width || rows <= 0)
         return;
     uint vOffset = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-    uint curC0 = kImage ? uint(16 * (pc.padc + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padc + y0) * pc.wc + pc.padc + x);
-    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : curC0 + vOffset;
+    uint curC0 = kImage ? uint(16 * (pc.padcY + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padcY + y0) * pc.wc + pc.padc + x);
+    uint cur = luma ? uint((pc.padY + y0) * pc.wp + pc.pad + x) : curC0 + vOffset;
     uint curStride = uint(luma ? pc.wp : ChromaRow());
     uint out0 = uint(y0 * pc.outStride + x);
     int bxA = min(x / Sx, pc.nbx - 1);
@@ -143,14 +151,14 @@ void MainFloat() {
             }
             int dx = x - bx * Sx, dy = y0 + j0 - by * Sy;
             for (int r = 0; r < pc.refs; ++r) {
-                float w = float((meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu);
+                float w = float((meta[(1 + r) * Blocks() + b] >> shift) & 0xFFFFu);
                 float px[kChunk];
                 [[unroll]] for (int j = 0; j < kChunk; ++j)
                     px[j] = centre[j];
                 if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
                     ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
                     if (luma && kPel == 4) {
-                        int X = 4 * (bx * Sx + pc.pad + dx) + v.x, Y = 4 * (by * Sy + pc.pad + dy) + v.y;
+                        int X = 4 * (bx * Sx + pc.pad + dx) + v.x, Y = 4 * (by * Sy + pc.padY + dy) + v.y;
                         int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
                         uint aa = HalfAddr(Xa, Ya), ab = HalfAddr(Xa, Yb), ba = HalfAddr(Xb, Ya), bb = HalfAddr(Xb, Yb);
                         [[unroll]] for (int j = 0; j < kChunk; ++j) {
@@ -159,14 +167,14 @@ void MainFloat() {
                                 px[j] = AvgF(AvgF(refYF[r].px[aa + o], refYF[r].px[ab + o]), AvgF(refYF[r].px[ba + o], refYF[r].px[bb + o]));
                         }
                     } else if (luma) {
-                        int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                        int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.padY + dy) + v.y;
                         uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
                         [[unroll]] for (int j = 0; j < kChunk; ++j)
                             if (j < jEnd)
                                 px[j] = refYF[r].px[a + uint(j * pc.wp)];
                     } else {
                         int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> kLogX);
-                        int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> kLogY);
+                        int Yc = kPel * (pc.padcY + dy) + ((kPel * by * pc.stepY + v.y) >> kLogY);
                         if (kPel == 4 && !kImage) {
                             int Xa = Xc >> 1, Xb = Xa + (Xc & 1), Ya = Yc >> 1, Yb = Ya + (Yc & 1);
                             uint aa = HalfAddrOf(Xa, Ya, pc.wc, pc.hc) + vOffset, ab = HalfAddrOf(Xa, Yb, pc.wc, pc.hc) + vOffset;
@@ -193,7 +201,7 @@ void MainFloat() {
             [[unroll]] for (int j = 0; j < kChunk; ++j) {
                 if (j < jEnd) {
                     precise float value = sum[j] * (1.0 / 256.0);
-                    if (pc.overlap == 0) {
+                    if ((pc.overlap | pc.overlapY) == 0) {
                         acc[j] = value;
                     } else {
                         int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
@@ -210,7 +218,7 @@ void MainFloat() {
 
         [[unroll]] for (int j = 0; j < kChunk; ++j) {
             if (j < n) {
-                precise float v = pc.overlap == 0 ? acc[j] : acc[j] * (1.0 / 32.0);
+                precise float v = (pc.overlap | pc.overlapY) == 0 ? acc[j] : acc[j] * (1.0 / 32.0);
                 if (pc.limit >= 0) {
                     precise float lo = centre[j] - pc.limitF;
                     precise float hi = centre[j] + pc.limitF;
@@ -253,15 +261,15 @@ uint RefChroma4(int r, uint a) {
 const int kChunk4 = 8;
 
 // main's arithmetic for four adjacent pixels per lane, 8-bit samples at pel 1 or 2, where the
-// plane's step and overlap are multiples of 4 (Degrain.cpp sets pc.quad): the four then lie in
+// plane's step and overlap are multiples of 4 (Quad): the four then lie in
 // the same blocks, their reference pixels four bytes in a row of one plane, read as words.
 // Dispatched as ((width + 255) / 256, nby) workgroups.
 void Main4() {
     bool luma = pc.plane == 0;
     int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-    int Bx = kBlk >> lx, By = kBlk >> ly;
-    int Sx = pc.step >> lx, Sy = pc.step >> ly;
-    int Ox = pc.overlap >> lx, Oy = pc.overlap >> ly;
+    int Bx = kBlkX >> lx, By = kBlkY >> ly;
+    int Sx = pc.step >> lx, Sy = pc.stepY >> ly;
+    int Ox = pc.overlap >> lx, Oy = pc.overlapY >> ly;
     int x = 4 * int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
     int y0 = cy * Sy;
     int rows = min(cy == pc.nby - 1 ? By : Sy, pc.height - y0);
@@ -269,7 +277,7 @@ void Main4() {
         return;
     int inside = min(4, pc.width - x); // the group's pixels inside the plane
     uint vOffset = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : uint((pc.padc + y0) * pc.wc + pc.padc + x) + vOffset;
+    uint cur = luma ? uint((pc.padY + y0) * pc.wp + pc.pad + x) : uint((pc.padcY + y0) * pc.wc + pc.padc + x) + vOffset;
     uint curStride = uint(luma ? pc.wp : pc.wc);
     uint out0 = uint(y0 * pc.outStride + x);
     int bxA = min(x / Sx, pc.nbx - 1);
@@ -298,19 +306,19 @@ void Main4() {
             int dx = x - bx * Sx, dy = y0 + j0 - by * Sy;
 
             for (int r = 0; r < pc.refs; ++r) {
-                uint w = valid ? (meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu : 0u;
+                uint w = valid ? (meta[(1 + r) * Blocks() + b] >> shift) & 0xFFFFu : 0u;
                 if (w == 0u)
                     continue;
                 ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
                 if (luma) {
-                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.padY + dy) + v.y;
                     uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
                     [[unroll]] for (int j = 0; j < kChunk4; ++j)
                         if (j < jEnd)
                             sum[j] += Unpack4(RefLuma4(r, a + uint(j * pc.wp))) * w;
                 } else {
                     int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> kLogX);
-                    int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> kLogY);
+                    int Yc = kPel * (pc.padcY + dy) + ((kPel * by * pc.stepY + v.y) >> kLogY);
                     uint a = ChromaAddr(Xc, Yc) + vOffset;
                     [[unroll]] for (int j = 0; j < kChunk4; ++j)
                         if (j < jEnd)
@@ -319,7 +327,7 @@ void Main4() {
             }
 
             if (valid) {
-                if (pc.overlap == 0) {
+                if ((pc.overlap | pc.overlapY) == 0) {
                     [[unroll]] for (int j = 0; j < kChunk4; ++j)
                         acc[j] = sum[j] >> 8u;
                 } else {
@@ -339,7 +347,7 @@ void Main4() {
 
         [[unroll]] for (int j = 0; j < kChunk4; ++j) {
             if (j < n) {
-                uvec4 p = pc.overlap == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax)));
+                uvec4 p = (pc.overlap | pc.overlapY) == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax)));
                 if (pc.limit >= 0) {
                     ivec4 c = ivec4(Unpack4(centre[j]));
                     p = uvec4(clamp(ivec4(p), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
@@ -362,15 +370,15 @@ void main() {
         MainFloat();
         return;
     }
-    if (pc.quad != 0) {
+    if (Quad()) {
         Main4();
         return;
     }
     bool luma = pc.plane == 0;
     int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-    int Bx = kBlk >> lx, By = kBlk >> ly;                     // the plane's block size,
-    int Sx = pc.step >> lx, Sy = pc.step >> ly;               // step
-    int Ox = pc.overlap >> lx, Oy = pc.overlap >> ly;         // and overlap
+    int Bx = kBlkX >> lx, By = kBlkY >> ly;                   // the plane's block size,
+    int Sx = pc.step >> lx, Sy = pc.stepY >> ly;              // step
+    int Ox = pc.overlap >> lx, Oy = pc.overlapY >> ly;        // and overlap
     int x = int(gl_GlobalInvocationID.x), cy = int(gl_WorkGroupID.y);
     int y0 = cy * Sy;
     int rows = min(cy == pc.nby - 1 ? By : Sy, pc.height - y0);
@@ -380,8 +388,8 @@ void main() {
 
     // The centre's pixels, from the centre super's full-pel samples (subsampled chroma at pel 4:
     // every fourth of every fourth row of its image)
-    uint curC0 = kImage ? uint(16 * (pc.padc + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padc + y0) * pc.wc + pc.padc + x);
-    uint cur = luma ? uint((pc.pad + y0) * pc.wp + pc.pad + x) : curC0 + vOffset;
+    uint curC0 = kImage ? uint(16 * (pc.padcY + y0) * pc.wc + 4 * (pc.padc + x)) : uint((pc.padcY + y0) * pc.wc + pc.padc + x);
+    uint cur = luma ? uint((pc.padY + y0) * pc.wp + pc.pad + x) : curC0 + vOffset;
     uint curStride = uint(luma ? pc.wp : ChromaRow());
     uint out0 = uint(y0 * pc.outStride + x);
     int bxA = min(x / Sx, pc.nbx - 1);
@@ -411,12 +419,12 @@ void main() {
             int dx = x - bx * Sx, dy = y0 + j0 - by * Sy; // the lane's place in the block at the chunk's first row
 
             for (int r = 0; r < pc.refs; ++r) {
-                uint w = valid ? (meta[(1 + r) * pc.nb + b] >> shift) & 0xFFFFu : 0u;
+                uint w = valid ? (meta[(1 + r) * Blocks() + b] >> shift) & 0xFFFFu : 0u;
                 if (w == 0u)
                     continue;
                 ivec2 v = ClampVec(Record(r, bx, by).xy, bx, by);
                 if (luma && kPel == 4) {
-                    int X = 4 * (bx * Sx + pc.pad + dx) + v.x, Y = 4 * (by * Sy + pc.pad + dy) + v.y;
+                    int X = 4 * (bx * Sx + pc.pad + dx) + v.x, Y = 4 * (by * Sy + pc.padY + dy) + v.y;
                     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
                     uint aa = HalfAddr(Xa, Ya), ab = HalfAddr(Xa, Yb), ba = HalfAddr(Xb, Ya), bb = HalfAddr(Xb, Yb);
                     [[unroll]] for (int j = 0; j < kChunk; ++j) {
@@ -427,7 +435,7 @@ void main() {
                         }
                     }
                 } else if (luma) {
-                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.pad + dy) + v.y;
+                    int X = kPel * (bx * Sx + pc.pad + dx) + v.x, Y = kPel * (by * Sy + pc.padY + dy) + v.y;
                     uint a = kPel == 1 ? uint(Y * pc.wp + X) : HalfAddr(X, Y);
                     [[unroll]] for (int j = 0; j < kChunk; ++j)
                         if (j < jEnd)
@@ -436,7 +444,7 @@ void main() {
                     // Chroma at the luma position shifted by the subsampling, rounded down
                     // (GetPointer(blx >> xSubUV, bly >> ySubUV))
                     int Xc = kPel * (pc.padc + dx) + ((kPel * bx * pc.step + v.x) >> kLogX);
-                    int Yc = kPel * (pc.padc + dy) + ((kPel * by * pc.step + v.y) >> kLogY);
+                    int Yc = kPel * (pc.padcY + dy) + ((kPel * by * pc.stepY + v.y) >> kLogY);
                     if (kPel == 4 && !kImage) {
                         // 4:4:4 at pel 4: from the half-pel planes, as luma
                         int Xa = Xc >> 1, Xb = Xa + (Xc & 1), Ya = Yc >> 1, Yb = Ya + (Yc & 1);
@@ -459,7 +467,7 @@ void main() {
             }
 
             if (valid) {
-                if (pc.overlap == 0) {
+                if ((pc.overlap | pc.overlapY) == 0) {
                     [[unroll]] for (int j = 0; j < kChunk; ++j)
                         acc[j] = sum[j] >> 8u;
                 } else {
@@ -475,7 +483,7 @@ void main() {
 
         [[unroll]] for (int j = 0; j < kChunk; ++j) {
             if (j < n) {
-                uint p = pc.overlap == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uint(pc.pixelMax));
+                uint p = (pc.overlap | pc.overlapY) == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uint(pc.pixelMax));
                 if (pc.limit >= 0)
                     p = uint(clamp(int(p), max(int(centre[j]) - pc.limit, 0), min(int(centre[j]) + pc.limit, kWide ? 65535 : 255)));
                 uint o = out0 + uint((j0 + j) * pc.outStride);

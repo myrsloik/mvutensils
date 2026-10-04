@@ -10,7 +10,7 @@ struct Level {
     int offY, offU, offV, nbx;
     int nby, fieldOff, pad, lambdaOff;
     int frameSamples, fieldTotal, strideY, strideC;
-    int borderY, borderC, reserved0, reserved1;
+    int borderY, borderC, padY, reserved;
 };
 layout(std430, set = 0, binding = 20) readonly buffer Levels { Level levels[]; };
 

@@ -25,15 +25,15 @@
 // bilinear resize in mvu, in 64 x 64 tiles, which flow_inter.comp reproduces with the taps zimg
 // computes for each tile (TileTaps).
 //
-// Implemented: all of their arguments, on mvgpu.Super's Gray, 4:2:0 and 4:4:4 supers of 8 to
-// 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors made from
-// such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+// Implemented: all of their arguments, on mvgpu.Super's Gray and YUV supers of any subsampling and 8
+// to 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and paddings, and
+// vectors made from such supers, of any of those bit depths, as mvgpu.Analyse makes them.
 
 namespace {
 
 // FlowParams' flags, flow_common.glsl's: F and B have vectors, FF and BB have, blend the clip's
-// frames where F and B don't serve
-constexpr int kHaveFB = 1, kHaveExtra = 2, kBlend = 4;
+// frames where F and B don't serve, the plane's resize goes down first
+constexpr int kHaveFB = 1, kHaveExtra = 2, kBlend = 4, kVerticalFirst = 8;
 
 void SetFpsDuration(VSFrame *frame, int64_t fpsNum, int64_t fpsDen, const VSAPI *vsapi) {
     VSMap *props = vsapi->getFramePropertiesRW(frame);
@@ -61,8 +61,9 @@ struct FlowData {
     int time256 = 0;       // FlowInter's time
     int64_t fa = 0, fb = 0; // FlowFPS: output frame n lies at input frame n * fa / fb
     int off = 0;           // the frames the vectors span
-    // The vectors' grid: blk x blk blocks, step apart, overlapping by overlap, nbx x nby of them
-    int blk = 0, overlap = 0, step = 0, nbx = 0, nby = 0;
+    // The vectors' grid: blk x blkY blocks, step and stepY apart, overlapping by overlap and overlapY,
+    // nbx x nby of them
+    int blk = 0, blkY = 0, overlap = 0, overlapY = 0, step = 0, stepY = 0, nbx = 0, nby = 0;
     int thscd1 = 0;   // scaled
     int scdLimit = 0; // vectors with more blocks above thscd1 are at a scene change
 
@@ -72,6 +73,7 @@ struct FlowData {
     VSGPUBuffer *taps = nullptr; // the resize's taps (ResizeTaps), also bound where a frame has nothing
     VSVulkanBufferInfo tapsInfo = {};
     int colOff[2] = {}, rowOff[2] = {}; // where luma's and chroma's are in it
+    bool verticalFirst[2] = {};         // whether zimg resizes luma's and chroma's down first
     std::unique_ptr<StageProfiler> profile; // MVGPU_PROFILE
 
     const VSAPI *vsapi;
@@ -303,11 +305,11 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.scdLimit = d->scdLimit;
         // MakeVectorOcclusionMask's, F's at the time, B's at 256 - time
         pc.occnormX = (80.0f * d->mlInv) / static_cast<float>(d->step * L.pel);
-        pc.occnormY = pc.occnormX;
+        pc.occnormY = (80.0f * d->mlInv) / static_cast<float>(d->stepY * L.pel);
         pc.time4096FX = time256 * 16 / (d->step * L.pel);
-        pc.time4096FY = pc.time4096FX;
+        pc.time4096FY = time256 * 16 / (d->stepY * L.pel);
         pc.time4096BX = (256 - time256) * 16 / (d->step * L.pel);
-        pc.time4096BY = pc.time4096BX;
+        pc.time4096BY = (256 - time256) * 16 / (d->stepY * L.pel);
 
         rec.Bind(kFlTaps, d->tapsInfo.buffer);
         if (haveFB) {
@@ -338,6 +340,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
             pc.colOff = d->colOff[p ? 1 : 0];
             pc.rowOff = d->rowOff[p ? 1 : 0];
+            pc.flags = (pc.flags & ~kVerticalFirst) | (d->verticalFirst[p ? 1 : 0] ? kVerticalFirst : 0);
             rec.Bind(kFlClipSrc, clipSrc[p].buffer);
             rec.Bind(kFlClipRef, clipRef[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
@@ -438,9 +441,6 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             if (i == 0 && (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height ||
                            v.hpad != L.pad || v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr))))
                 throw std::runtime_error("wrong source or super clip frame size");
-            if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
-                v.nby != analysed.nby)
-                throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
         }
         const VectorInfo &fw = info[0], &bw = info[1];
         d->fwInfo = fw;
@@ -452,8 +452,11 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             throw std::runtime_error("mvfw and mvbw must be compatible with each other and have opposite sign delta");
         d->off = -fw.delta;
         d->blk = fw.blkX;
+        d->blkY = fw.blkY;
         d->overlap = fw.overlapX;
+        d->overlapY = fw.overlapY;
         d->step = d->blk - d->overlap;
+        d->stepY = d->blkY - d->overlapY;
         d->nbx = fw.nbx;
         d->nby = fw.nby;
 
@@ -494,20 +497,24 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         std::vector<int32_t> tables;
         for (int c = 0; c < (L.format.xr > 1 || L.format.yr > 1 ? 2 : 1); ++c) {
             const int lx = c ? d->vi.format.subSamplingW : 0, ly = c ? d->vi.format.subSamplingH : 0;
-            const int stepX = (d->blk >> lx) - (d->overlap >> lx), stepY = (d->blk >> ly) - (d->overlap >> ly);
+            const int overlapX = d->overlap >> lx, overlapY = d->overlapY >> ly;
+            const int stepX = (d->blk >> lx) - overlapX, stepY = (d->blkY >> ly) - overlapY;
             const int w = d->vi.width >> lx, h = d->vi.height >> ly;
-            if (!TilesHorizontalFirst(d->nbx, w, stepX, d->overlap >> lx, d->nby, h, stepY, d->overlap >> ly))
-                throw std::runtime_error("zimg would resize the masks vertically first, which isn't implemented");
+            const PassOrder order = TilesPassOrder(d->nbx, w, stepX, overlapX, d->nby, h, stepY, overlapY);
+            if (order == PassOrder::Mixed)
+                throw std::runtime_error("zimg would resize some of the masks' tiles horizontally first and others vertically first, which isn't implemented");
+            d->verticalFirst[c] = order == PassOrder::Vertical;
             d->colOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, d->overlap >> lx);
+            const std::vector<int32_t> cols = TileTaps(d->nbx, w, stepX, overlapX);
             tables.insert(tables.end(), cols.begin(), cols.end());
             d->rowOff[c] = static_cast<int>(tables.size());
-            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, d->overlap >> ly);
+            const std::vector<int32_t> rows = TileTaps(d->nby, h, stepY, overlapY);
             tables.insert(tables.end(), rows.begin(), rows.end());
         }
         if (L.format.xr == 1 && L.format.yr == 1) {
             d->colOff[1] = d->colOff[0];
             d->rowOff[1] = d->rowOff[0];
+            d->verticalFirst[1] = d->verticalFirst[0];
         }
         tables.resize(std::max<size_t>(tables.size(), 64)); // a dummy for the bindings a frame doesn't use too
 

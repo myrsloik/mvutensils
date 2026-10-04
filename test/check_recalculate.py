@@ -17,8 +17,9 @@ way, which matches mvgpu's float super exactly at pel 1, where its samples are t
 
     check_recalculate.py --src clip.nv12 --size 1920x1080 --frames 10 [--vectors mvgpu] [--format YUV420P8]
                          [--crop 1914x1074] [--pel 2] [--blksize 16] [--overlap 8] [--pad 16]
-                         [--old-blksize 32 --old-overlap 16] [--delta 1] [--thsad 200] [--smooth 0]
-                         [--search 2] [--searchparam 2] [--mvlambda 1000] [--chroma 0] [--pnew 25]
+                         [--old-blksize 32 --old-overlap 16] [--old-pel 4] [--delta 1] [--thsad 200] [--smooth 0]
+                         [--search 2] [--searchparam 2] [--mvlambda 1000] [--chroma 0] [--pnew 25] [--satd 1]
+                         [--fields 1 --tff 1]
 """
 import argparse
 import os
@@ -28,7 +29,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import format_clip, nv12_clip, random_vectors, scene_limits  # noqa: E402
+from mvtest import format_clip, grid_label, nv12_clip, random_vectors, scene_limits  # noqa: E402
 
 
 def quantized16(core, clip):
@@ -57,6 +58,10 @@ def first_clip(c):
     return c[0] if isinstance(c, list) else c
 
 
+# The arguments both Recalculates take as they come
+RECALC_ARGS = ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew', 'satd', 'fields', 'tff')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
@@ -65,14 +70,17 @@ def main():
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, GRAYS, ...')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu', 'random'], default='mvgpu', help='whose old vectors both sides recalculate')
-    ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
+    ap.add_argument('--overlap', type=int, nargs='+', default=[8], help='the overlap, and the vertical one when it differs')
     ap.add_argument('--pel', type=int, default=2)
-    ap.add_argument('--pad', type=int, default=16)
-    ap.add_argument('--old-blksize', type=int, help="the old vectors' grid (the super's by default)")
-    ap.add_argument('--old-overlap', type=int)
+    ap.add_argument('--pad', type=int, nargs='+', default=[16], help='the padding, and the vertical one when it differs')
+    ap.add_argument('--old-blksize', type=int, nargs='+', help="the old vectors' grid (the super's by default)")
+    ap.add_argument('--old-overlap', type=int, nargs='+')
+    ap.add_argument('--old-pel', type=int, help="the old vectors' pel (the super's by default), rescaled to the super's")
+    ap.add_argument('--new-blksize', type=int, nargs='+', help="the grid both Recalculates make, where it isn't the super's")
+    ap.add_argument('--new-overlap', type=int, nargs='+')
     ap.add_argument('--delta', type=int, default=1)
-    for k in ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew'):
+    for k in RECALC_ARGS:
         ap.add_argument('--' + k, type=int)
     ap.add_argument('--seed', type=int, default=1, help='random: the vectors drawn')
     ap.add_argument('--plugin', help='the MVGPUtensils library to load, unless it autoloads')
@@ -96,7 +104,8 @@ def main():
     gclip = core.std.GPUUpload(clip)
 
     sk = dict(blksize=args.blksize, overlap=args.overlap, pel=args.pel, pad=args.pad)
-    ok_ = dict(sk, blksize=args.old_blksize or args.blksize, overlap=args.old_overlap if args.old_overlap is not None else args.overlap)
+    ok_ = dict(sk, blksize=args.old_blksize or args.blksize, overlap=args.old_overlap if args.old_overlap is not None else args.overlap,
+               pel=args.old_pel or args.pel)
     gsup, csup = core.mvgpu.Super(gclip, **sk), core.mvu.Super(cclip, **sk)
     gsup_old = core.mvgpu.Super(gclip, **ok_) if ok_ != sk else gsup
     csup_old = core.mvu.Super(cclip, **ok_) if ok_ != sk else csup
@@ -109,10 +118,12 @@ def main():
         if args.vectors == 'random':
             th1, scd = scene_limits(cold.get_frame(0).props, 400, 51.0)
             # (vectors past the padding are refused by mvu)
-            cold = random_vectors(core, cold, (args.pad - 1) * args.pel, th1, scd, args.seed)
+            cold = random_vectors(core, cold, (min(args.pad) - 1) * ok_['pel'], th1, scd, args.seed)
         gold = core.std.SetFrameProps(core.mvgpu.FromMVU(cold, gsup_old), MVGPUtensilsAnalysisBitsPerSample=bits_g)
 
-    rk = {k: getattr(args, k) for k in ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew') if getattr(args, k) is not None}
+    rk = {k: getattr(args, k) for k in RECALC_ARGS if getattr(args, k) is not None}
+    if args.new_blksize:
+        rk.update(blksize=args.new_blksize, overlap=args.new_overlap if args.new_overlap is not None else args.overlap)
     gout = first_clip(core.mvgpu.Recalculate(gsup, gold, **rk))
     cout = first_clip(core.mvu.Recalculate(csup, cold, **rk))
 
@@ -150,7 +161,8 @@ def main():
             i = int(np.nonzero(bad)[0][0])
             worst = (n, i % nbx, i // nbx, tuple(int(v) for v in rec[i, :3]), (int(cx[i]), int(cy[i]), int(csad[i])))
     total = frames * nbx * nby
-    print(f'{args.format} pel {args.pel} {args.blksize}/{args.overlap} from {ok_["blksize"]}/{ok_["overlap"]} {args.vectors} vectors delta {args.delta}'
+    print(f'{args.format} pel {args.pel} {grid_label(args.blksize, args.overlap)} from {grid_label(ok_["blksize"], ok_["overlap"])}'
+          + (f' pel {ok_["pel"]}' if ok_['pel'] != args.pel else '') + f' {args.vectors} vectors delta {args.delta}'
           + (f' {rk}' if rk else '') + f', {frames} frames: {differ} of {total} blocks differ'
           + (f'; first at frame {worst[0]} block ({worst[1]}, {worst[2]}): mvgpu {worst[3]}, mvu {worst[4]}' if worst else '')
           + (f'; {desc} description properties differ' if desc else ''))

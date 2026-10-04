@@ -13,7 +13,7 @@ void main() {
         return;
     int b = int(gl_GlobalInvocationID.x);
     uint changed = 0u;
-    if (b < pc.nb)
+    if (b < Blocks())
         changed = Record(r, b % pc.nbx, b / pc.nbx).z > pc.thscd1 ? 1u : 0u;
     uint sum = subgroupAdd(changed);
     if (subgroupElect() && sum != 0u)

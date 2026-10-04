@@ -228,7 +228,8 @@ static void VS_CC toMVUCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
 struct FromMVUData {
     VSNode *node = nullptr; // mvu's vector clip
     VSVideoInfo vi = {};    // the records'
-    SuperLayout layout;     // the super's, its grid the vectors'
+    SuperLayout layout;     // the super's
+    SuperLayout grid;       // the same with the vectors' grid, its own or another (WithGrid)
     SuperRegions regions;   // where its frames keep their parts, for its description (ExportSuper)
     Description first;      // the vector clip's first frame's description
     std::string prefix, mvuprefix;
@@ -258,7 +259,7 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
     } else if (activationReason == arAllFramesReady) {
         const VulkanContext &vc = *d->vc;
         const VSVULKANAPI *vkapi = vc.vkapi;
-        const SuperLayout &L = d->layout;
+        const SuperLayout &L = d->layout, &G = d->grid; // the super's description, the vectors' grid
 
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         VSFrame *dst = nullptr;
@@ -293,14 +294,14 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
         // The output: the records, with the properties of mvu's frame but for mvu's own, which make way
         // for mvgpu's: its analysis description, the vectors' arrays (now the records) and the
         // description of its super, whose planes its frames hold as property frames
-        dst = vkapi->newGPUVideoFrame(&d->gray32, 4 * L.nbx, L.nby, src, core);
+        dst = vkapi->newGPUVideoFrame(&d->gray32, 4 * G.nbx, G.nby, src, core);
         if (!dst)
             return fail("failed to allocate the vector frame");
         VSMap *out = vsapi->getFramePropertiesRW(dst);
         DeleteKeysStartingWith(out, d->mvuprefix + "Analysis", vsapi);
         DeleteKeysStartingWith(out, d->mvuprefix + "Super", vsapi);
         ExportSuper(dst, L, d->regions, d->prefix, vsapi);
-        ExportAnalysis(dst, L, static_cast<int>(desc[key::Delta]), desc[key::Chroma] != 0, has, d->prefix, vsapi);
+        ExportAnalysis(dst, G, static_cast<int>(desc[key::Delta]), desc[key::Chroma] != 0, has, d->prefix, vsapi);
         // As the vectors have them: the levels the search went through, and the bit depth, which may be
         // another than the super's (vectors analysed on an 8-bit copy of a clip serve it, as in mvu)
         vsapi->mapSetInt(out, (d->prefix + "AnalysisLevels").c_str(), desc[key::Levels], maReplace);
@@ -330,12 +331,12 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
         const int logPel = ilog2(L.pel);
         const int64_t paddedW = desc[key::Width] + 2 * desc[key::HPad], paddedH = desc[key::Height] + 2 * desc[key::VPad];
         const int64_t stepX = desc[key::BlkX] - desc[key::OverlapX], stepY = desc[key::BlkY] - desc[key::OverlapY];
-        for (int by = 0; by < L.nby; ++by) {
+        for (int by = 0; by < G.nby; ++by) {
             int32_t *row = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(info.mapped) + by * stride);
             const int64_t y0 = desc[key::VPad] + stepY * by;
             const int64_t dyMin = -(y0 << logPel), dyMax = (paddedH - y0 - desc[key::BlkY]) << logPel;
-            for (int bx = 0; bx < L.nbx; ++bx) {
-                const size_t i = static_cast<size_t>(by) * L.nbx + bx;
+            for (int bx = 0; bx < G.nbx; ++bx) {
+                const size_t i = static_cast<size_t>(by) * G.nbx + bx;
                 const int64_t x0 = desc[key::HPad] + stepX * bx;
                 const int64_t dxMin = -(x0 << logPel), dxMax = (paddedW - x0 - desc[key::BlkX]) << logPel;
                 const int32_t vx = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(vectors[i])));
@@ -349,7 +350,7 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
                 row[4 * bx + 2] = static_cast<int32_t>(sads[i]);
                 row[4 * bx + 3] = 0;
             }
-            std::memset(row + 4 * L.nbx, 0, static_cast<size_t>(stride) - 16 * static_cast<size_t>(L.nbx));
+            std::memset(row + 4 * G.nbx, 0, static_cast<size_t>(stride) - 16 * static_cast<size_t>(G.nbx));
         }
 
         ctx = vkapi->gpuExecAcquire(d->pool, err, sizeof(err));
@@ -426,22 +427,23 @@ static void VS_CC fromMVUCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         const Description &v = d->first;
 
         // The super must be one of the clip the vectors were analysed on, or of the clip at another bit
-        // depth, with their grid: the description mvgpu's filters check vector clips by, as the super
-        // they were analysed on. The grid first, since the block-aligned frame and the default
-        // padding follow from it.
-        auto grid = [](int64_t blkX, int64_t blkY, int64_t overlapX, int64_t overlapY) {
-            return std::to_string(blkX) + "x" + std::to_string(blkY) + " blocks overlapping by " + std::to_string(overlapX) + "x" + std::to_string(overlapY);
-        };
-        if (v[key::BlkX] != L.blk || v[key::BlkY] != L.blkY || v[key::OverlapX] != L.overlap || v[key::OverlapY] != L.overlapY)
-            throw std::runtime_error("the vectors are for " + grid(v[key::BlkX], v[key::BlkY], v[key::OverlapX], v[key::OverlapY]) + " and the super for " +
-                                     grid(L.blk, L.blkY, L.overlap, L.overlapY) + "; super must be made with the vectors' blksize and overlap");
+        // depth: the description mvgpu's filters check vector clips by, as the super they were
+        // analysed on. Their grid is one of mvu's, the super's or another that fits its block-aligned
+        // frame, as mvu.Analyse and mvu.Recalculate take one.
+        if (v[key::BlkX] < 1 || v[key::BlkX] > 128 || v[key::BlkY] < 1 || v[key::BlkY] > 128 || v[key::OverlapX] < 0 || v[key::OverlapY] < 0)
+            throw std::runtime_error("the vector clip's description is invalid");
+        const int blkX = static_cast<int>(v[key::BlkX]), blkY = static_cast<int>(v[key::BlkY]);
+        const int overlapX = static_cast<int>(v[key::OverlapX]), overlapY = static_cast<int>(v[key::OverlapY]);
+        CheckBlockSize(blkX, blkY, overlapX, overlapY, L.format.xr > 1 ? 1 : 0, L.format.yr > 1 ? 1 : 0);
         if (v[key::RealWidth] != L.width || v[key::RealHeight] != L.height || v[key::HPad] != L.pad || v[key::VPad] != L.padY || v[key::Pel] != L.pel)
             throw std::runtime_error("the vectors were analysed on a " + std::to_string(v[key::RealWidth]) + "x" + std::to_string(v[key::RealHeight]) + " clip padded by " +
                                      std::to_string(v[key::HPad]) + "x" + std::to_string(v[key::VPad]) + " at pel " + std::to_string(v[key::Pel]) +
                                      "; super must be mvgpu.Super of that clip with the same pad and pel");
-        if (v[key::Width] != L.aw || v[key::Height] != L.ah || v[key::NBlkX] != L.nbx || v[key::NBlkY] != L.nby)
+        d->grid = L.WithGrid(blkX, blkY, overlapX, overlapY);
+        const SuperLayout &G = d->grid;
+        if (v[key::Width] != L.aw || v[key::Height] != L.ah || v[key::NBlkX] != G.nbx || v[key::NBlkY] != G.nby)
             throw std::runtime_error("the vectors' " + std::to_string(v[key::NBlkX]) + "x" + std::to_string(v[key::NBlkY]) + " blocks covering " +
-                                     std::to_string(v[key::Width]) + "x" + std::to_string(v[key::Height]) + " aren't the super's");
+                                     std::to_string(v[key::Width]) + "x" + std::to_string(v[key::Height]) + " aren't their grid's on the super");
         if (v[key::Chroma] && (!L.format.chroma || v[key::XRatio] != L.format.xr || v[key::YRatio] != L.format.yr))
             throw std::runtime_error("the vectors' SADs count chroma subsampled " + std::to_string(v[key::XRatio]) + "x" + std::to_string(v[key::YRatio]) +
                                      ", which the super clip's format doesn't have");
@@ -452,8 +454,8 @@ static void VS_CC fromMVUCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
             throw std::runtime_error("failed to query the Gray32 format");
         d->vi = *vsapi->getVideoInfo(d->node);
         d->vi.format = d->gray32;
-        d->vi.width = 4 * L.nbx;
-        d->vi.height = L.nby;
+        d->vi.width = 4 * G.nbx;
+        d->vi.height = G.nby;
 
         d->vc = VulkanContext::Get(core, vsapi);
         d->pool = d->vc->vkapi->createGPUExecPool(core, vqCompute, err, sizeof(err));

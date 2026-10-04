@@ -155,7 +155,7 @@ def reduce_plane(s, rfilter):
     return np.where(edge[None, :], h_edge, h_mid).astype(s.dtype)
 
 
-def level_table(w, h, chroma, xr, yr, pad):
+def level_table(w, h, chroma, xr, yr, padx, pady):
     """SuperLayout::Make's coarse levels: (w, h, wc, hc, offY, offU, offV, strideY, strideC, borderY, borderC) per level"""
     def up(v, a):
         return (v + a - 1) // a * a
@@ -168,8 +168,8 @@ def level_table(w, h, chroma, xr, yr, pad):
     wc, hc = (w // xr, h // yr) if chroma else (0, 0)
     for L in range(1, top + 1):
         w, h, wc, hc = (w + 1) // 2, (h + 1) // 2, (wc + 1) // 2, (hc + 1) // 2
-        lp = max(1, pad >> L)
-        by, bc = lp + 3, max((lp + xr - 1) // xr, (lp + yr - 1) // yr) + 4
+        lp, lpy = max(1, padx >> L), max(1, pady >> L)
+        by, bc = max(lp, lpy) + 3, max((lp + xr - 1) // xr, (lpy + yr - 1) // yr) + 4
         sy = up(w + 2 * by, 4)
         offY = offset + by * sy + by
         offset = up(offset + sy * (h + 2 * by), 16)
@@ -330,7 +330,7 @@ def main():
             g_real.append(gsub(0)[ppy:ppy + rh, ppx:ppx + rw])
         if top > 0:
             buf = buf[props['MVGPUtensilsSuperPyramidOffset'] // buf.itemsize:]
-            table = level_table(w, h, chroma, xr, yr, padx)
+            table = level_table(w, h, chroma, xr, yr, padx, pady)
             src = g_real
             for (lw, lh, lwc, lhc, offY, offU, offV, sy, sc, bdy, bdc) in table:
                 nxt = []

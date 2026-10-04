@@ -20,12 +20,15 @@
 // vector, scaled to the time, points at (or kept where its SAD isn't under thsad), the blocks blended
 // through their overlap windows. Two kernels per frame: the scene change test's count of badly matched
 // blocks (mask_blocks.comp), then every pixel of every plane (compensate.comp), which copies the clip's
-// pixel where the vectors are at a scene change, since the host can't see the count. The result is
-// mvu's bit for bit given the same super and vectors.
+// pixel where the vectors are at a scene change, since the host can't see the count. The blocks whose
+// SAD isn't under thsad come from the frame's own super, as in mvu. With fields, every block's position
+// is shifted vertically by the field shift between the frames' parities (mvu's). The result is mvu's
+// bit for bit given the same super and vectors.
 //
-// Implemented: all of mvu.Compensate's arguments but fields, on mvgpu.Super's Gray, 4:2:0 and 4:4:4
-// supers of 8 to 16-bit or float samples at any pel with square blocks of 8, 16 or 32, and vectors
-// made from such supers, of any of those bit depths, as mvgpu.Analyse makes them.
+// Implemented: all of mvu.Compensate's arguments, on mvgpu.Super's Gray and YUV supers of any
+// subsampling and 8 to 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and
+// paddings, and vectors made from such supers, of any of those bit depths, as mvgpu.Analyse makes
+// them.
 
 struct CompensateData {
     VSNode *node = nullptr; // the clip
@@ -39,7 +42,8 @@ struct CompensateData {
     int delta = 0; // the vectors' reference frame is n + delta
     int time256 = 0;
     int thsad = 0; // scaled
-    int nbx = 0, nby = 0, step = 0, overlap = 0;
+    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
+    int nbx = 0, nby = 0, step = 0, stepY = 0, overlap = 0, overlapY = 0;
     SceneChange scd;
 
     std::shared_ptr<VulkanContext> vc;
@@ -77,7 +81,8 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         vsapi->requestFrameFilter(n, d->node, frameCtx);
         if (load) {
             vsapi->requestFrameFilter(n, d->vectors, frameCtx);
-            vsapi->requestFrameFilter(nref, d->super, frameCtx);
+            vsapi->requestFrameFilter(std::min(n, nref), d->super, frameCtx);
+            vsapi->requestFrameFilter(std::max(n, nref), d->super, frameCtx);
         }
     } else if (activationReason == arAllFramesReady) {
         const VulkanContext &vc = *d->vc;
@@ -122,10 +127,27 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return f;
         }
 
+        // The reference frame's super, and the frame's own, which the blocks not under thsad come from
         const VSFrame *ref = hold(vsapi->getFrameFilter(nref, d->super, frameCtx));
-        SuperRegions regions;
+        const VSFrame *own = hold(vsapi->getFrameFilter(n, d->super, frameCtx));
+        SuperRegions regions, ownRegions;
         if (const std::string e = CheckSuperFrame(ref, L, d->prefix, regions, vsapi); !e.empty())
             return fail(e);
+        if (const std::string e = CheckSuperFrame(own, L, d->prefix, ownRegions, vsapi); !e.empty())
+            return fail(e);
+        if (ownRegions.lumaStride != regions.lumaStride || ownRegions.chromaStride != regions.chromaStride)
+            return fail("the super frames' storage strides differ");
+
+        // mvu.Compensate's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the
+        // super frames' parities (their _Field, or tff)
+        int fieldShift = 0;
+        if (d->fields && L.pel > 1 && (nref - n) % 2 != 0) {
+            try {
+                fieldShift = ComputeFieldShift(GetTopField(own, n, d->tffExists, d->tff, true, vsapi), GetTopField(ref, nref, d->tffExists, d->tff, true, vsapi), L.pel);
+            } catch (const std::exception &e) {
+                return fail(e.what());
+            }
+        }
 
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
@@ -133,11 +155,11 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
 
         const int numPlanes = d->vi->format.numPlanes;
         const bool chroma = L.format.chroma;
-        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlane = {}, vecPlane = {};
+        VSVulkanPlaneInfo clipPlanes[3] = {}, outPlanes[3] = {}, superPlane = {}, ownPlane = {}, vecPlane = {};
         for (int p = 0; p < numPlanes; ++p)
             if (vkapi->getGPUPlane(src, p, &clipPlanes[p]) || vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the clip's frames aren't GPU resident");
-        if (vkapi->getGPUPlane(ref, 0, &superPlane))
+        if (vkapi->getGPUPlane(ref, 0, &superPlane) || vkapi->getGPUPlane(own, 0, &ownPlane))
             return fail("the super's frames aren't GPU resident");
         if (vkapi->getGPUPlane(vec, 0, &vecPlane))
             return fail("the vectors aren't GPU resident");
@@ -158,6 +180,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         vkapi->gpuExecUsesBuffer(ctx, scratch);
         vkapi->gpuExecReadsFrame(ctx, src);
         vkapi->gpuExecReadsFrame(ctx, ref);
+        vkapi->gpuExecReadsFrame(ctx, own);
         vkapi->gpuExecReadsFrame(ctx, vec);
         for (int p = 0; p < numPlanes; ++p)
             vkapi->gpuExecWritesPlane(ctx, dst, p);
@@ -195,12 +218,18 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.thscd1 = d->thsad;
         pc.time4096FX = d->step;
         pc.time4096FY = d->overlap;
+        pc.stepY = d->stepY;
+        pc.overlapY = d->overlapY;
         pc.time4096BX = L.format.Float() ? 0 : (1 << L.format.bits) - 1;
+        pc.fieldShift = fieldShift;
 
         rec.Bind(kFlTaps, d->windowsInfo.buffer);
         rec.Bind(kFlRefLuma, superPlane.buffer, regions.luma, regions.lumaBytes);
-        if (chroma)
+        rec.Bind(kFlSrcLuma, ownPlane.buffer, ownRegions.luma, ownRegions.lumaBytes);
+        if (chroma) {
             rec.Bind(kFlRefChroma, superPlane.buffer, regions.chroma, regions.chromaBytes);
+            rec.Bind(kFlSrcChroma, ownPlane.buffer, ownRegions.chroma, ownRegions.chromaBytes);
+        }
         rec.Bind(kFlVecF, vecPlane.buffer);
         rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
         for (int p = 0; p < numPlanes; ++p) {
@@ -243,8 +272,9 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         int64_t thsad = vsapi->mapGetInt(in, "thsad", 0, &err);
         if (err)
             thsad = 10000;
-        if (vsapi->mapGetInt(in, "fields", 0, &err) && !err)
-            throw std::runtime_error("fields=True isn't implemented");
+        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
+        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
+        d->tffExists = !err;
         double time = vsapi->mapGetFloat(in, "time", 0, &err);
         if (err)
             time = 100.0;
@@ -285,15 +315,16 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
             v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
             throw std::runtime_error("wrong source or super clip frame size");
-        if (v.blkX != analysed.blk || v.blkY != analysed.blk || v.overlapX != analysed.overlap || v.overlapY != analysed.overlap || v.nbx != analysed.nbx ||
-            v.nby != analysed.nby)
-            throw std::runtime_error("the vectors' grid isn't their super's; they must come from mvgpu.Analyse");
+        if (d->fields && v.pel < 2)
+            throw std::runtime_error("fields option requires pel > 1");
         d->info = v;
         d->delta = v.delta;
         d->nbx = v.nbx;
         d->nby = v.nby;
         d->step = v.blkX - v.overlapX;
+        d->stepY = v.blkY - v.overlapY;
         d->overlap = v.overlapX;
+        d->overlapY = v.overlapY;
         d->scd = ScaleSceneChange(v, thscd1, thscd2);
         // thsad scaled as thscd1 is, truncated as mvu's int64 is; a SAD is never above int's range, so
         // a larger threshold takes every vector
@@ -312,10 +343,10 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
 
         // The overlap windows, luma's and chroma's (mvu's OverWins and OverWinsUV)
         std::vector<int32_t> tables;
-        if (d->overlap > 0) {
-            const int xr = L.format.xr, yr = L.format.yr, blk = v.blkX;
-            const std::vector<int32_t> lumaWin = MakeOverlapWindows(blk, blk, d->overlap, d->overlap);
-            const std::vector<int32_t> chromaWin = MakeOverlapWindows(blk / xr, blk / yr, d->overlap / xr, d->overlap / yr);
+        if (d->overlap > 0 || d->overlapY > 0) {
+            const int xr = L.format.xr, yr = L.format.yr;
+            const std::vector<int32_t> lumaWin = MakeOverlapWindows(v.blkX, v.blkY, d->overlap, d->overlapY);
+            const std::vector<int32_t> chromaWin = MakeOverlapWindows(v.blkX / xr, v.blkY / yr, d->overlap / xr, d->overlapY / yr);
             d->winOff[0] = static_cast<int>(tables.size());
             tables.insert(tables.end(), lumaWin.begin(), lumaWin.end());
             d->winOff[1] = static_cast<int>(tables.size());

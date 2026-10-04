@@ -33,8 +33,9 @@ layout(push_constant) uniform Params {
 
 // pc.kind: VectorLengthMask, SADMask, OcclusionMask, or only the scene change test's count (SCDetection)
 const int kLength = 0, kSad = 1, kOcclusion = 2, kCount = 3;
-// pc.flags: the frame has no vectors (mask_resize.comp fills it with scval)
-const int kNoVectors = 1;
+// pc.flags: the frame has no vectors (mask_resize.comp fills it with scval); zimg resizes the
+// mask down first
+const int kNoVectors = 1, kVerticalFirst = 2;
 
 // The bindings, MaskBinding in VulkanContext.h: the vector frame, a record (x, y, SAD, 0) per block,
 // pc.recStride per row; the blocks' mask values, nbx * nby, integers or float bits; the count of

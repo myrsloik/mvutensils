@@ -7,14 +7,21 @@ runs it on the frames it gives mvgpu, dumped as raw planar frames, with the same
 compared: x, y and SAD of every block.
 
     check_reference.py --src noisy.nv12 --size 1920x1080 --frames 52 --reference reference.exe
-                       [--format YUV444P8] [--blksize 16] [--overlap 8] [--pel 2] [--pad 16]
+                       [--format YUV444P8] [--blksize 16 [8]] [--overlap 8 [4]] [--pel 2] [--pad 16 [8]]
+                       [--super-blksize 32 [16]] [--super-overlap 16 [8]] [--onelevel] [--stack 5]
                        [--radius 2] [--delta 1] [--standalone] [--chroma 0] [--plevel 2]
                        [--mvlambda 1000] [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2]
-                       [--crop WxH] [--work DIR]
+                       [--satd] [--fields [--tff 1] [--parity 0110...]] [--crop WxH] [--work DIR]
 
 --format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a quarter
-pixel to more than 8 bits). --standalone makes an Analyse per delta, without chained or inverted
-seeds, instead of AnalyseMany. --crop crops the frames first, for grids that end inside a block.
+pixel to more than 8 bits). --blksize, --overlap and --pad take a vertical value after the horizontal
+one, as Super's lists do. --super-blksize and --super-overlap make the super with another grid than
+the one analysed. --onelevel makes it without the coarse levels (as frames narrower than 192 pixels
+are), so the search goes without its coarse search. --stack puts N copies of the frames side by side,
+every other one mirrored, for frames wider than one clip's. --standalone makes an Analyse per delta, without chained or inverted
+seeds, instead of AnalyseMany. --satd makes luma's SAD its SATD. --fields takes the frames for fields,
+of the parity --tff gives, or of the _Field properties --parity sets, a 1 per top field (when both
+are given, tff wins, as in mvu). --crop crops the frames first, for grids that end inside a block.
 --work keeps the dumped frames and the reference's vectors in that directory instead of a
 temporary one.
 """
@@ -58,14 +65,16 @@ def main():
     ap.add_argument('--src', required=True, help='raw 8-bit NV12 frames')
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
-    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name, 4:2:0 or 4:4:4 at 8 to 16 bits: YUV420P8, YUV444P16, ...')
+    ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name, Gray or YUV at 8 to 16 bits or float: YUV420P8, YUV422P10, YUV444PS, ...')
     ref = ap.add_mutually_exclusive_group(required=True)
     ref.add_argument('--reference', help='the reference executable, run with matching arguments')
     ref.add_argument('--ref', help='a vector file the reference wrote')
-    ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--blksize', type=int, nargs='+', default=[16])
+    ap.add_argument('--overlap', type=int, nargs='+', default=[8])
     ap.add_argument('--pel', type=int, default=2)
-    ap.add_argument('--pad', type=int, default=16)
+    ap.add_argument('--pad', type=int, nargs='+', default=[16])
+    ap.add_argument('--super-blksize', type=int, nargs='+', help="the super's grid, where it isn't the one analysed")
+    ap.add_argument('--super-overlap', type=int, nargs='+')
     ap.add_argument('--radius', type=int, default=2)
     ap.add_argument('--delta', type=int, default=1, help="AnalyseMany's delta, the frames between its fields")
     ap.add_argument('--standalone', action='store_true', help='an Analyse per delta: no chained or inverted seeds')
@@ -76,7 +85,13 @@ def main():
     ap.add_argument('--badsad', type=int, default=1000)
     ap.add_argument('--badrange', type=int, default=40)
     ap.add_argument('--badstep', type=int, default=2)
+    ap.add_argument('--satd', action='store_true', help="luma's SAD is its SATD")
+    ap.add_argument('--fields', action='store_true', help='the frames are fields (--tff, --parity)')
+    ap.add_argument('--tff', type=int, help="the fields' parity, mvu's tff")
+    ap.add_argument('--parity', help='the frames\' _Field properties, a 0 or 1 per frame')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first')
+    ap.add_argument('--onelevel', action='store_true', help='a super without the coarse levels')
+    ap.add_argument('--stack', type=int, default=1, help='this many copies side by side, every other one mirrored')
     ap.add_argument('--work', help='a directory to keep the dumped frames and the reference vectors in')
     ap.add_argument('--verbose', action='store_true', help='list every field with differing blocks')
     ap.add_argument('--dump', help="write mvgpu's fields to this file, in the reference's format")
@@ -91,20 +106,43 @@ def main():
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
+    if args.stack > 1:
+        clip = core.std.StackHorizontal([clip if i % 2 == 0 else core.std.FlipHorizontal(clip) for i in range(args.stack)])
+        w *= args.stack
+    if args.parity:
+        def field(n, f):
+            out = f.copy()
+            out.props['_Field'] = int(args.parity[n])
+            return out
+        clip = core.std.ModifyFrame(clip, clip, field)
 
     search = dict(chroma=args.chroma, plevel=args.plevel, mvlambda=args.mvlambda, lsad=args.lsad, badsad=args.badsad, badrange=args.badrange,
                   badstep=args.badstep)
+    # (the reference takes these as flags)
+    extra = dict(satd=1) if args.satd else {}
+    if args.fields:
+        extra['fields'] = 1
+        if args.tff is not None:
+            extra['tff'] = args.tff
+    sb = args.super_blksize or args.blksize
+    so = args.super_overlap if args.super_overlap is not None else args.overlap
     if args.reference:
         work = args.work or tempfile.mkdtemp(prefix='mvgpu_reference_')
         os.makedirs(work, exist_ok=True)
         frames, vectors = os.path.join(work, 'frames.yuv'), os.path.join(work, 'reference.bin')
         cmd = [args.reference, '--src', frames, '--size', f'{w}x{h}', '--frames', str(args.frames), '--out', vectors,
-               '--format', 'gray' if clip.format.color_family == vs.GRAY else '420' if clip.format.subsampling_w else '444',
+               '--format', 'gray' if clip.format.color_family == vs.GRAY else
+               {(1, 1): '420', (1, 0): '422', (0, 1): '440', (0, 0): '444'}[(clip.format.subsampling_w, clip.format.subsampling_h)],
                '--bits', str(clip.format.bits_per_sample),
-               '--blksize', str(args.blksize), '--overlap', str(args.overlap), '--pel', str(args.pel), '--pad', str(args.pad),
+               '--blksize', str(args.blksize[0]), '--blksizev', str(args.blksize[-1]), '--overlap', str(args.overlap[0]),
+               '--overlapv', str(args.overlap[-1]), '--pel', str(args.pel), '--pad', str(args.pad[0]), '--padv', str(args.pad[-1]),
+               '--superblksize', str(sb[0]), '--superblksizev', str(sb[-1]), '--superoverlap', str(so[0]), '--superoverlapv', str(so[-1]),
+               ] + (['--onelevel'] if args.onelevel else []) + [
                '--radius', str(args.radius), '--delta', str(args.delta)] + (['--standalone'] if args.standalone else [])
         for k, v in search.items():
             cmd += [f'--{k}', str(v)]
+        cmd += (['--satd'] if args.satd else []) + (['--fields'] if args.fields else []) + (['--tff', str(args.tff)] if args.tff is not None else []) + (
+            ['--parity', args.parity] if args.parity else [])
         try:
             dump(clip, frames)
             subprocess.run(cmd, check=True)
@@ -118,7 +156,8 @@ def main():
     else:
         expected = load_fields(args.ref)
 
-    sup = core.mvgpu.Super(core.std.GPUUpload(clip), blksize=args.blksize, overlap=args.overlap, pel=args.pel, pad=args.pad)
+    sup = core.mvgpu.Super(core.std.GPUUpload(clip), blksize=sb, overlap=so, pel=args.pel, pad=args.pad, onelevel=args.onelevel)
+    search.update(blksize=args.blksize, overlap=args.overlap, **extra)
     if args.standalone:
         fields = [core.mvgpu.Analyse(sup, delta=s * r * args.delta, **search) for r in range(1, args.radius + 1) for s in (1, -1)]
     else:

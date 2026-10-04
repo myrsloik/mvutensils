@@ -197,16 +197,16 @@ bool ResizeHFirst(double xscale, double yscale) {
 
 } // namespace
 
-bool TilesHorizontalFirst(int srcW, int dstW, int stepX, int overlapX, int srcH, int dstH, int stepY, int overlapY) {
+PassOrder TilesPassOrder(int srcW, int dstW, int stepX, int overlapX, int srcH, int dstH, int stepY, int overlapY) {
     const double sx = static_cast<double>(srcW) / (stepX * srcW + overlapX), sy = static_cast<double>(srcH) / (stepY * srcH + overlapY);
+    int horizontal = 0, vertical = 0;
     for (int w : {std::min(64, dstW), (dstW - 1) % 64 + 1}) {
         for (int h : {std::min(64, dstH), (dstH - 1) % 64 + 1}) {
             const double xscale = static_cast<double>(w) / (w * sx), yscale = static_cast<double>(h) / (h * sy);
-            if (!ResizeHFirst(xscale, yscale))
-                return false;
+            ++(ResizeHFirst(xscale, yscale) ? horizontal : vertical);
         }
     }
-    return true;
+    return !vertical ? PassOrder::Horizontal : !horizontal ? PassOrder::Vertical : PassOrder::Mixed;
 }
 
 bool PlaneHorizontalFirst(int srcW, int dstW, int coverW, int srcH, int dstH, int coverH) {

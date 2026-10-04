@@ -27,7 +27,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
+from mvtest import eight_bit, format_clip, grid_label, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
 
 MASKS = {'length': 'VectorLengthMask', 'sad': 'SADMask', 'occlusion': 'OcclusionMask'}
 SCD_PROPS = ('_SceneChangePrev', '_SceneChangeNext')
@@ -43,10 +43,12 @@ def main():
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--filter', choices=['all', 'length', 'sad', 'occlusion', 'scd'], default='all')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu', 'random'], default='mvgpu', help='whose vectors both sides use')
-    ap.add_argument('--blksize', type=int, default=16)
-    ap.add_argument('--overlap', type=int, default=8)
+    ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
+    ap.add_argument('--overlap', type=int, nargs='+', default=[8], help='the overlap, and the vertical one when it differs')
+    ap.add_argument('--analyse-blksize', type=int, nargs='+', help="the grid both sides analyse, where it isn't the super's")
+    ap.add_argument('--analyse-overlap', type=int, nargs='+')
     ap.add_argument('--pel', type=int, default=2)
-    ap.add_argument('--pad', type=int, default=16)
+    ap.add_argument('--pad', type=int, nargs='+', default=[16], help='the padding, and the vertical one when it differs')
     ap.add_argument('--delta', type=int, default=1)
     ap.add_argument('--ml', type=float)
     ap.add_argument('--gamma', type=float)
@@ -78,14 +80,15 @@ def main():
     casup = core.mvu.Super(aclip, **sk)
     thscd1 = 400 if args.thscd1 is None else args.thscd1
     thscd2 = 51.0 if args.thscd2 is None else args.thscd2
+    ag = dict(blksize=args.analyse_blksize or args.blksize, overlap=args.analyse_overlap if args.analyse_overlap is not None else args.overlap)
     if args.vectors == 'mvgpu':
-        gvec = core.mvgpu.Analyse(gasup, delta=args.delta)
+        gvec = core.mvgpu.Analyse(gasup, delta=args.delta, **ag)
         cvec = core.mvgpu.ToMVU(gvec)
     else:
-        cvec = core.mvu.Analyse(casup, delta=args.delta, blksize=args.blksize, overlap=args.overlap)
+        cvec = core.mvu.Analyse(casup, delta=args.delta, **ag)
         if args.vectors == 'random':
             th1, scd = scene_limits(cvec.get_frame(0).props, thscd1, thscd2)
-            cvec = random_vectors(core, cvec, (args.pad - 1) * args.pel, th1, scd, args.seed)
+            cvec = random_vectors(core, cvec, (min(args.pad) - 1) * args.pel, th1, scd, args.seed)
         gvec = core.mvgpu.FromMVU(cvec, gasup)
 
     sk2 = {k: getattr(args, k) for k in ('thscd1', 'thscd2') if getattr(args, k) is not None}
@@ -140,7 +143,7 @@ def main():
         results.append(f'{name} {differ} of {total} differ ({100 * nonzero / total:.0f}% nonzero)' + (f', largest {worst:g}' if differ else '')
                        + (f', first at frame {first[0]} ({first[1]}, {first[2]}): mvgpu {first[3]}, mvu {first[4]}' if first else '')
                        + (f', {props} _Range differ' if props else ''))
-    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {args.blksize}/{args.overlap} {args.vectors} vectors delta {args.delta}, '
+    print(f'{args.format}{" analysed on 8 bits" if args.analyse8 else ""} pel {args.pel} {grid_label(args.blksize, args.overlap)} {args.vectors} vectors delta {args.delta}, '
           f'{args.frames} frames: ' + '; '.join(results))
     sys.exit(0 if ok else 1)
 
