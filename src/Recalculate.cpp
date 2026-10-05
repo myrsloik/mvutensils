@@ -23,10 +23,7 @@
 // Implemented: all of mvu.Recalculate's arguments, on the supers mvgpu.Analyse takes, for their own
 // grid or another that fits their block-aligned frame (SuperLayout::WithGrid), from old vectors of
 // mvgpu's of the same bit depth, on any grid and at any pel (rescaled to the super's); satd makes
-// luma's SAD mvu's SATD (16x2 blocks refused, as mvu refuses them). fields changes nothing in mvu's
-// recalculation (the shifted zero and global vectors it sets up aren't among its searches'
-// candidates), so here it only takes the frames' parities as mvu takes them, failing where mvu
-// fails.
+// luma's SAD mvu's SATD (16x2 blocks refused, as mvu refuses them).
 
 struct RecalcData {
     VSNode *super = nullptr;
@@ -38,7 +35,6 @@ struct RecalcData {
     std::string prefix;
     int delta = 0;
     bool chroma = true;
-    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
     int nbxOld = 0, nbyOld = 0;
     VectorInfo info;        // the old vectors' first frame's description, which every frame with vectors must have
     RecalcParams base = {}; // the push constants of every frame, but for the records' strides
@@ -123,16 +119,6 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         SuperRegions cur, rf;
         if (const std::string e = CheckSuperFrame(src, L, d->prefix, cur, vsapi); !e.empty())
             return fail(e);
-        // The frames' parities, as mvu takes them (they don't change its vectors)
-        if (d->fields) {
-            try {
-                (void)GetTopField(src, n, d->tffExists, d->tff, true, vsapi);
-                if (hasRef && L.pel > 1 && d->delta % 2 != 0)
-                    (void)GetTopField(hold(vsapi->getFrameFilter(nref, d->super, frameCtx)), nref, d->tffExists, d->tff, true, vsapi);
-            } catch (const std::exception &e) {
-                return fail(e.what());
-            }
-        }
         std::string error;
         const VSFrame *old = hasRef ? hold(GetAnalysisVectors(hold(vsapi->getFrameFilter(n, d->vectors, frameCtx)), d->info, d->prefix, error, vsapi)) : nullptr;
         if (!error.empty())
@@ -270,17 +256,10 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         if (err)
             pnew = 25;
         vsapi->mapGetInt(in, "meander", 0, &err); // the order the CPU took the blocks in; the GPU takes them all at once
-        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-        d->tffExists = !err;
         if (search < 0 || search > 5)
             throw std::runtime_error("search must be between 0 and 5");
         if (pnew < 0 || pnew > 256)
             throw std::runtime_error("pnew must be between 0 and 256");
-
-        // The recalculated vectors take the super's pel (the old ones are rescaled to it)
-        if (d->fields && L.pel < 2)
-            throw std::runtime_error("fields option requires pel > 1");
 
         d->vectors = vsapi->mapGetNode(in, "vectors", 0, nullptr);
         CheckClipLength(d->vectors, "vectors", d->vi->numFrames, "super", vsapi); // the output is as long as super
@@ -402,8 +381,6 @@ void recalculateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                              "pnew:int:opt;"
                              "overlap:int[]:opt;"
                              "meander:int:opt;"
-                             "fields:int:opt;"
-                             "tff:int:opt;"
                              "satd:int:opt;"
                              "prefix:data:opt;",
                              "clip:vnode[]:gpu;", recalculateCreateMany, nullptr, plugin);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The test matrices: each suite runs one of the check scripts over its cases and counts failures.
 
-    matrix.py SUITE [--clips DIR] [--plugin MVGPUtensils.dll] [--reference EXE] [--only TEXT] [--list]
+    matrix.py SUITE [--clips DIR] [--plugin MVGPUtensils.dll] [--mvu MVUtensils.dll] [--reference EXE] [--only TEXT] [--list]
 
   super    check_super.py: mvgpu.Super against mvu.Super over formats, pels, filters, pelclips,
            grids and paddings
@@ -31,11 +31,13 @@
   robustness
            check_robustness.py: the clips both plugins refuse, or treat alike: paddings the
            subsampling doesn't divide, inputs shorter than the clip, spliced supers and vector clips,
-           vector clips of different bit depths together, Recalculate with a short super
+           vector clips of different bit depths together, Recalculate with a short super, satd's
+           block size, the fields and tff arguments neither has
   smoke    a quick cross section of all of them (a few minutes, where all of them take hours)
 
 --clips is the directory of test clips, NAME/noisy.nv12 for the clips in CLIPS below (raw 8-bit
 NV12). --reference (or MVGPU_REFERENCE) is the built CPU reference, for the analyse and smoke suites.
+--mvu is the MVUtensils library the checks compare with, where it isn't the one they load by default.
 --only runs the cases whose label contains TEXT. Each case prints the check's last line.
 """
 import argparse
@@ -335,13 +337,7 @@ def analyse_cases():
         ('satd mvlambda 30000 badsad 100 YUV444P16 32/16', ff, ['--frames', '8', '--satd', '--mvlambda', '30000', '--badsad', '100', '--format',
                                                                  'YUV444P16'] + grid(32, 16)),
         ('satd onelevel 8/4 on a 16/8 super', ff, ['--frames', '10', '--satd', '--onelevel', '--super-blksize', '16', '--super-overlap', '8'] + grid(8, 4)),
-        # fields: zero and the median of a field of an odd delta shifted by the parities' field shift
-        ('fields tff 1 16/8 pel 2', ff, ['--frames', '10', '--fields', '--tff', '1'] + grid(16, 8)),
-        ('fields tff 0 8/4 pel 4 radius 3', ff, ['--frames', '12', '--fields', '--tff', '0', '--radius', '3'] + grid(8, 4, 4)),
-        ('fields parity 1101001011 standalone 32/16', ff, ['--frames', '10', '--fields', '--parity', '1101001011', '--standalone'] + grid(32, 16)),
-        ('fields tff 1 delta 3 radius 1 pel 4', ff, ['--frames', '10', '--fields', '--tff', '1', '--delta', '3', '--radius', '1'] + grid(16, 8, 4)),
-        ('fields tff 1 pel 1', ff, ['--frames', '10', '--fields', '--tff', '1'] + grid(16, 8, 1)),
-        ('fields satd tff 0 onelevel YUV420P10', ff, ['--frames', '10', '--fields', '--tff', '0', '--satd', '--onelevel', '--format', 'YUV420P10'] + grid(16, 8)),
+        ('satd onelevel YUV420P10', ff, ['--frames', '10', '--satd', '--onelevel', '--format', 'YUV420P10'] + grid(16, 8)),
         # 4K
         ('4K 32/16 pel 4', k4, ['--frames', '6'] + grid(32, 16, 4)),
         ('4K YUV420PS 16/8 pel 4', k4, ['--frames', '6', '--format', 'YUV420PS'] + grid(16, 8, 4)),
@@ -354,7 +350,7 @@ def analyse_cases():
         ('4K YUV440P16 32/16 pel 2', k4, ['--frames', '6', '--format', 'YUV440P16'] + grid(32, 16)),
         ('4K 16x8/8x4 pel 4', k4, ['--frames', '6', '--pel', '4'] + rect(16, 8, 8, 4)),
         ('4K 128/64 pel 4', k4, ['--frames', '6'] + grid(128, 64, 4)),
-        ('4K satd fields tff 1 16/8 pel 4', k4, ['--frames', '6', '--satd', '--fields', '--tff', '1'] + grid(16, 8, 4)),
+        ('4K satd 16/8 pel 4', k4, ['--frames', '6', '--satd'] + grid(16, 8, 4)),
     ]
     return cases
 
@@ -828,29 +824,12 @@ def motion_cases():
         ('compensate thsad 400 YUV420PS time 75', ff, ['--frames', '8', '--thsad', '400', '--format', 'YUV420PS', '--time', '75'] + comp),
         ('compensate const delta -3 444 32/16', ff, ['--frames', '15', '--vectors', 'const', '--delta', '-3', '--format', 'YUV444P8', '--blksize', '32',
                                                      '--overlap', '16'] + comp),
-        # fields: every block shifted by the parities' field shift (with mvu's reads above the padded plane
-        # for the top blocks at the padding's edge); Compensate's blocks not under thsad come from the
-        # frame's own super, here one of another clip than the vectors' (--other-super)
-        ('compensate fields tff 1', ff, ['--frames', '8', '--fields', '1', '--tff', '1'] + comp),
-        ('compensate fields tff 0 thsad 300 pel 4', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--thsad', '300', '--pel', '4'] + comp),
-        ('compensate fields parity 00101101 thsad 200 444', ff, ['--frames', '8', '--fields', '1', '--parity', '00101101', '--thsad', '200', '--format',
-                                                                 'YUV444P8'] + comp),
-        ('compensate fields tff 1 thsad 300 pel 4 16/0 YUV420P10', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--pel', '4',
-                                                                        '--overlap', '0', '--format', 'YUV420P10'] + comp),
-        ('compensate fields tff 1 thsad 300 YUV420PS delta -1', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--format', 'YUV420PS',
-                                                                     '--delta', '-1'] + comp),
-        ('compensate fields tff 1 thsad 300 delta 2', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--thsad', '300', '--delta', '2'] + comp),
-        ('compensate fields tff 1 pel 4 const', ff, ['--frames', '15', '--vectors', 'const', '--fields', '1', '--tff', '1', '--pel', '4'] + comp),
+        # Compensate's blocks not under thsad come from the frame's own super, here one of another clip
+        # than the vectors' (--other-super)
         ('compensate other super thsad 300', ff, ['--frames', '8', '--other-super', '--thsad', '300'] + comp),
-        ('compensate other super fields tff 1 thsad 300 YUV420P16 16/0', ff, ['--frames', '8', '--other-super', '--fields', '1', '--tff', '1', '--thsad', '300',
-                                                                              '--format', 'YUV420P16', '--overlap', '0'] + comp),
-        ('flow fields tff 1', ff, ['--frames', '8', '--fields', '1', '--tff', '1'] + flow),
-        ('flow fields parity 10011010 pel 4 422', ff, ['--frames', '8', '--fields', '1', '--parity', '10011010', '--pel', '4', '--format', 'YUV422P8'] + flow),
-        ('flow fields tff 0 pel 4 YUV444PS', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--pel', '4', '--format', 'YUV444PS'] + flow),
-        ('flow other super fields tff 0 delta -1', ff, ['--frames', '8', '--other-super', '--fields', '1', '--tff', '0', '--delta', '-1'] + flow),
-        ('flow fields tff 1 time 50', ff, ['--frames', '8', '--fields', '1', '--tff', '1', '--time', '50'] + flow),
-        ('compensate fields tff 0 time 33.3 pel 4 thsad 300', ff, ['--frames', '8', '--fields', '1', '--tff', '0', '--time', '33.3', '--pel', '4', '--thsad',
-                                                                   '300'] + comp),
+        ('compensate other super thsad 300 YUV420P16 16/0', ff, ['--frames', '8', '--other-super', '--thsad', '300', '--format', 'YUV420P16', '--overlap',
+                                                                 '0'] + comp),
+        ('flow other super delta -1', ff, ['--frames', '8', '--other-super', '--delta', '-1'] + flow),
     ]
     return cases
 
@@ -931,7 +910,7 @@ def recalculate_cases():
         ('YUV422P16 32/16 super, to 16x8/8x4 pel 4', ff, ['--frames', '6', '--format', 'YUV422P16', '--blksize', '32', '--overlap', '16', '--new-blksize', '16',
                                                           '8', '--new-overlap', '8', '4', '--pel', '4'] + t0),
         ('180x100', ff, ['--frames', '6', '--crop', '180x100'] + t0),
-        # satd: luma's SATD; and fields, which changes nothing in mvu's recalculation
+        # satd: luma's SATD
         ('satd', ff, ['--frames', '6', '--satd', '1'] + t0),
         ('satd 8/4 pel 4', ff, ['--frames', '6', '--satd', '1', '--pel', '4'] + grid_args(8, 4) + t0),
         ('satd 4/2 search 3 searchparam 4', ff, ['--frames', '6', '--satd', '1', '--search', '3', '--searchparam', '4'] + grid_args(4, 2) + t0),
@@ -946,8 +925,6 @@ def recalculate_cases():
         ('satd chroma 0 random thsad 300', ff, ['--frames', '6', '--satd', '1', '--chroma', '0', '--vectors', 'random', '--thsad', '300']),
         ('satd to 8/4', ff, ['--frames', '6', '--satd', '1', '--new-blksize', '8', '--new-overlap', '4'] + t0),
         ('satd 440 8/4 pel 4 mvu vectors', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV440P8', '--pel', '4', '--vectors', 'mvu'] + grid_args(8, 4) + t0),
-        ('fields tff 1', ff, ['--frames', '6', '--fields', '1', '--tff', '1'] + t0),
-        ('fields tff 0 satd pel 4', ff, ['--frames', '6', '--fields', '1', '--tff', '0', '--satd', '1', '--pel', '4'] + t0),
     ]
 
 
@@ -986,7 +963,7 @@ SMOKE = {
     'super': ['--pel 4', '--format YUV420PS', '--pel 1 --format YUV444P16', '--pelclip'],
     'analyse': ['16/8 pel 2', '8/4 pel 4', '444 32/16 pel 4', 'YUV420P16 16/8 pel 4', 'YUV420PS 16/8 pel 2', 'GRAY8 16/8 pel 2', 'pel 1 16/8',
                 '422 16/8 pel 4', '440 8/4 pel 4', '16x8/8x4 pel 4', '16x2/8x0 pel 2', '4/2 pel 2', '128/64 pel 2', '8/4 on a 32/16 super pel 4 1914x1074',
-                'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4', 'fields tff 1 16/8 pel 2'],
+                'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4'],
     'degrain': ['YUV420P8 16/8 pel 2 mvgpu vectors', 'radius 3 444 32/16 pel 4', 'YUV420P16 16/8 pel 4 analysed on 8 bits', 'YUV420PS 16/8 pel 2 mvgpu vectors',
                 'thscd1 150 thscd2 20', 'pel 1 16/8', 'YUV440P8 16/8 pel 4 mvgpu vectors', '32x16/16x8 pel 4', '64/32 pel 4',
                 '32/16 super, analysed 32x16/16x8 mvu vectors'],
@@ -994,9 +971,9 @@ SMOKE = {
              'inter YUV422P8 16/8 pel 4 mvgpu vectors', 'fps 8x4/4x2 YUV420PS mvu vectors', 'inter 4/2'],
     'masks': ['16/8 pel 2', 'random vectors delta -1', 'YUV420PS', '422 16x2/8x1'],
     'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4', 'compensate 440 32/16 pel 2',
-               'compensate 16x8/8x4', 'compensate fields tff 0 thsad 300 pel 4', 'flow fields tff 1', 'compensate other super thsad 300'],
+               'compensate 16x8/8x4', 'compensate other super thsad 300'],
     'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1', 'random pel 1 from pel 4', '16x8/8x4 from 32x16/16x8 search 3',
-                    '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4', 'fields tff 1'],
+                    '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4'],
     'convert': ['16/8 pel 2', 'YUV420P16 pel 4 analysed on 8 bits'],
     'robustness': ['1080p'],
 }
@@ -1024,6 +1001,7 @@ def main():
     ap.add_argument('suite', choices=sorted(SUITES))
     ap.add_argument('--clips', default=os.environ.get('MVGPU_TEST_CLIPS', ''), help='the test clips directory (or MVGPU_TEST_CLIPS)')
     ap.add_argument('--plugin', help='the MVGPUtensils library to load, unless it autoloads')
+    ap.add_argument('--mvu', help="the MVUtensils library the checks compare with, instead of their default")
     ap.add_argument('--reference', default=os.environ.get('MVGPU_REFERENCE', ''), help='the CPU reference executable (or MVGPU_REFERENCE), for the analyse suite')
     ap.add_argument('--only', help='run only the cases whose label contains this')
     ap.add_argument('--list', action='store_true', help='list the cases')
@@ -1049,6 +1027,8 @@ def main():
             cmd += ['--plugin', args.plugin]
         if case_script == 'check_reference.py':
             cmd += ['--reference', args.reference]
+        elif args.mvu:
+            cmd += ['--mvu', args.mvu]
         r = subprocess.run(cmd, capture_output=True, text=True)
         lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.strip() and 'API 3' not in ln and 'Version mismatch' not in ln]
         if r.returncode != 0:

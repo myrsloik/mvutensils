@@ -107,9 +107,9 @@ struct Params {
     int32_t stamp, level, flags, topRadius;
     int32_t medianScale, medianSlot, finest, blockRows;
     int32_t colour, recStride, coarseBase, aw;
-    int32_t ah, fieldShift;
+    int32_t ah;
 };
-static_assert(sizeof(Params) == 120, "refine_common.glsl's Params is 30 ints");
+static_assert(sizeof(Params) == 116, "refine_common.glsl's Params is 29 ints");
 
 // Super's push constants (super.comp, super_qpel.comp, pyr_reduce.comp), matching
 // super_common.glsl's Params; they share the Main layout and its push constant range
@@ -152,9 +152,9 @@ struct FlowParams {
     int32_t colOff, rowOff;
     float occnormX, occnormY;
     int32_t time4096FX, time4096FY, time4096BX, time4096BY;
-    int32_t stepY, overlapY, fieldShift;
+    int32_t stepY, overlapY;
 };
-static_assert(sizeof(FlowParams) == 124, "flow_common.glsl's Params is 31 words");
+static_assert(sizeof(FlowParams) == 120, "flow_common.glsl's Params is 30 words");
 
 // The mask kernels' push constants (mask_blocks.comp, mask_resize.comp), matching mask_common.glsl's
 // Params; they share the Main layout

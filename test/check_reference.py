@@ -11,7 +11,7 @@ compared: x, y and SAD of every block.
                        [--super-blksize 32 [16]] [--super-overlap 16 [8]] [--onelevel] [--stack 5]
                        [--radius 2] [--delta 1] [--standalone] [--chroma 0] [--plevel 2]
                        [--mvlambda 1000] [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2]
-                       [--satd] [--fields [--tff 1] [--parity 0110...]] [--crop WxH] [--work DIR]
+                       [--satd] [--crop WxH] [--work DIR]
 
 --format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a quarter
 pixel to more than 8 bits). --blksize, --overlap and --pad take a vertical value after the horizontal
@@ -19,9 +19,8 @@ one, as Super's lists do. --super-blksize and --super-overlap make the super wit
 the one analysed. --onelevel makes it without the coarse levels (as frames narrower than 192 pixels
 are), so the search goes without its coarse search. --stack puts N copies of the frames side by side,
 every other one mirrored, for frames wider than one clip's. --standalone makes an Analyse per delta, without chained or inverted
-seeds, instead of AnalyseMany. --satd makes luma's SAD its SATD. --fields takes the frames for fields,
-of the parity --tff gives, or of the _Field properties --parity sets, a 1 per top field (when both
-are given, tff wins, as in mvu). --crop crops the frames first, for grids that end inside a block.
+seeds, instead of AnalyseMany. --satd makes luma's SAD its SATD. --crop crops the frames first, for
+grids that end inside a block.
 --work keeps the dumped frames and the reference's vectors in that directory instead of a
 temporary one.
 """
@@ -86,9 +85,6 @@ def main():
     ap.add_argument('--badrange', type=int, default=40)
     ap.add_argument('--badstep', type=int, default=2)
     ap.add_argument('--satd', action='store_true', help="luma's SAD is its SATD")
-    ap.add_argument('--fields', action='store_true', help='the frames are fields (--tff, --parity)')
-    ap.add_argument('--tff', type=int, help="the fields' parity, mvu's tff")
-    ap.add_argument('--parity', help='the frames\' _Field properties, a 0 or 1 per frame')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first')
     ap.add_argument('--onelevel', action='store_true', help='a super without the coarse levels')
     ap.add_argument('--stack', type=int, default=1, help='this many copies side by side, every other one mirrored')
@@ -109,21 +105,11 @@ def main():
     if args.stack > 1:
         clip = core.std.StackHorizontal([clip if i % 2 == 0 else core.std.FlipHorizontal(clip) for i in range(args.stack)])
         w *= args.stack
-    if args.parity:
-        def field(n, f):
-            out = f.copy()
-            out.props['_Field'] = int(args.parity[n])
-            return out
-        clip = core.std.ModifyFrame(clip, clip, field)
 
     search = dict(chroma=args.chroma, plevel=args.plevel, mvlambda=args.mvlambda, lsad=args.lsad, badsad=args.badsad, badrange=args.badrange,
                   badstep=args.badstep)
-    # (the reference takes these as flags)
+    # (the reference takes it as a flag)
     extra = dict(satd=1) if args.satd else {}
-    if args.fields:
-        extra['fields'] = 1
-        if args.tff is not None:
-            extra['tff'] = args.tff
     sb = args.super_blksize or args.blksize
     so = args.super_overlap if args.super_overlap is not None else args.overlap
     if args.reference:
@@ -141,8 +127,7 @@ def main():
                '--radius', str(args.radius), '--delta', str(args.delta)] + (['--standalone'] if args.standalone else [])
         for k, v in search.items():
             cmd += [f'--{k}', str(v)]
-        cmd += (['--satd'] if args.satd else []) + (['--fields'] if args.fields else []) + (['--tff', str(args.tff)] if args.tff is not None else []) + (
-            ['--parity', args.parity] if args.parity else [])
+        cmd += ['--satd'] if args.satd else []
         try:
             dump(clip, frames)
             subprocess.run(cmd, check=True)

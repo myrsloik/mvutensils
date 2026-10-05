@@ -19,7 +19,6 @@ way, which matches mvgpu's float super exactly at pel 1, where its samples are t
                          [--crop 1914x1074] [--pel 2] [--blksize 16] [--overlap 8] [--pad 16]
                          [--old-blksize 32 --old-overlap 16] [--old-pel 4] [--delta 1] [--thsad 200] [--smooth 0]
                          [--search 2] [--searchparam 2] [--mvlambda 1000] [--chroma 0] [--pnew 25] [--satd 1]
-                         [--fields 1 --tff 1]
 """
 import argparse
 import os
@@ -59,7 +58,7 @@ def first_clip(c):
 
 
 # The arguments both Recalculates take as they come
-RECALC_ARGS = ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew', 'satd', 'fields', 'tff')
+RECALC_ARGS = ('thsad', 'smooth', 'search', 'searchparam', 'mvlambda', 'chroma', 'pnew', 'satd')
 
 
 def main():

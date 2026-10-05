@@ -16,9 +16,8 @@ mistakes with the same message, or do the same with them.
   reference Recalculate with a super shorter than the vector clip: the frames whose reference frame
             is past the super's end get no vectors, though the vector clip has some for them
   satd      Analyse and Recalculate with satd on 16x2 blocks (refused)
-  fields    Analyse, Compensate, Flow and Recalculate with fields on frames without _Field and without
-            tff (refused at the first frame that needs a parity) and with tff (taken), and at pel 1
-            (Compensate and Recalculate refuse it, Analyse and Flow take it)
+  fields    Analyse, Recalculate, Compensate and Flow given fields or tff, which neither plugin has
+            any more (refused)
 
     check_robustness.py --src clip.nv12 --size 1920x1080 --frames 10
 """
@@ -35,8 +34,6 @@ LENGTH = 'must have at least as many frames as'
 SPLICED_SUPER = 'a super clip frame was made with different Super arguments than its first frame'
 SPLICED_VECTORS = 'a vector clip frame was made with different Analyse/Recalculate arguments than its first frame'
 SATD16X2 = 'satd cannot work with 16x2 blocks'
-NO_FIELD = '_Field property not found in input frame. Therefore, you must pass tff argument'
-FIELDS_PEL = 'fields option requires pel > 1'
 
 
 class Results:
@@ -212,26 +209,15 @@ def main():
     both_refuse(results, 'satd: Recalculate 16x2', lambda: mvu.Recalculate(csup, cvec[0], blksize=[16, 2], overlap=[8, 0], satd=1),
                 lambda: gpu.Recalculate(gsup, gvec[0], blksize=[16, 2], overlap=[8, 0], satd=1), SATD16X2)
 
-    # fields: the frames' parities, from _Field (the clip has none) or tff; delta 1, the first frame with a
-    # reference frame
-    for label, make_mvu, make_gpu in [
-        ('Analyse', lambda **k: mvu.Analyse(csup, fields=1, **k), lambda **k: gpu.Analyse(gsup, fields=1, **k)),
-        ('Compensate', lambda **k: mvu.Compensate(clip, csup, cvec[0], fields=1, **k), lambda **k: gpu.Compensate(gclip, gsup, gvec[0], fields=1, **k)),
-        ('Flow', lambda **k: mvu.Flow(clip, csup, cvec[0], fields=1, **k), lambda **k: gpu.Flow(gclip, gsup, gvec[0], fields=1, **k)),
-        ('Recalculate', lambda **k: mvu.Recalculate(csup, cvec[0], fields=1, **k), lambda **k: gpu.Recalculate(gsup, gvec[0], fields=1, **k)),
-    ]:
-        both_refuse(results, f'fields: {label} without _Field or tff', make_mvu, make_gpu, NO_FIELD, frames=(1,))
-        both_accept(results, f'fields: {label} with tff', lambda m=make_mvu: m(tff=1), lambda g=make_gpu: g(tff=1), frames=(1,))
-    sk1 = dict(sk, pel=1)
-    csup1, gsup1 = core.mvu.Super(clip, **sk1), core.mvgpu.Super(gclip, **sk1)
-    cvec1, gvec1 = core.mvu.Analyse(csup1), core.mvgpu.Analyse(gsup1)
-    both_refuse(results, 'fields: Compensate at pel 1', lambda: mvu.Compensate(clip, csup1, cvec1, fields=1, tff=1),
-                lambda: gpu.Compensate(gclip, gsup1, gvec1, fields=1, tff=1), FIELDS_PEL)
-    both_refuse(results, 'fields: Recalculate at pel 1', lambda: mvu.Recalculate(csup1, cvec1, fields=1, tff=1),
-                lambda: gpu.Recalculate(gsup1, gvec1, fields=1, tff=1), FIELDS_PEL)
-    both_accept(results, 'fields: Analyse at pel 1', lambda: mvu.Analyse(csup1, fields=1, tff=1), lambda: gpu.Analyse(gsup1, fields=1, tff=1), frames=(1,))
-    both_accept(results, 'fields: Flow at pel 1', lambda: mvu.Flow(clip, csup1, cvec1, fields=1, tff=1), lambda: gpu.Flow(gclip, gsup1, gvec1, fields=1, tff=1),
-                frames=(1,))
+    # fields and tff: gone from both plugins
+    for arg in ('fields', 'tff'):
+        for label, make_mvu, make_gpu in [
+            ('Analyse', lambda a=arg: mvu.Analyse(csup, **{a: 1}), lambda a=arg: gpu.Analyse(gsup, **{a: 1})),
+            ('Recalculate', lambda a=arg: mvu.Recalculate(csup, cvec[0], **{a: 1}), lambda a=arg: gpu.Recalculate(gsup, gvec[0], **{a: 1})),
+            ('Compensate', lambda a=arg: mvu.Compensate(clip, csup, cvec[0], **{a: 1}), lambda a=arg: gpu.Compensate(gclip, gsup, gvec[0], **{a: 1})),
+            ('Flow', lambda a=arg: mvu.Flow(clip, csup, cvec[0], **{a: 1}), lambda a=arg: gpu.Flow(gclip, gsup, gvec[0], **{a: 1})),
+        ]:
+            both_refuse(results, f'{arg}: {label} takes none', make_mvu, make_gpu, arg)
 
     print(f'{frames} frames: {results.cases} cases, {results.problems} problems')
     sys.exit(0 if results.problems == 0 else 1)

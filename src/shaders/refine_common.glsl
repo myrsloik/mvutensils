@@ -104,7 +104,6 @@ layout(push_constant) uniform Params {
     int recStride;   // fields stored as records (x, y, SAD, 0) per block: records per row
     int coarseBase;  // seed building: where the field's coarse result starts in Coarse, in vectors
     int aw, ah;      // the super's block-aligned frame (the grid's own but on another grid than the super's)
-    int fieldShift;  // seed building: the field shift zero and the median take (Analyse's fields)
 } pc;
 
 // The target grid's block size (specialization constants 3 and 7), mvu's 8x4, 8x8, 16x2, 16x8,

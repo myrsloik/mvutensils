@@ -21,9 +21,8 @@
 // through their overlap windows. Two kernels per frame: the scene change test's count of badly matched
 // blocks (mask_blocks.comp), then every pixel of every plane (compensate.comp), which copies the clip's
 // pixel where the vectors are at a scene change, since the host can't see the count. The blocks whose
-// SAD isn't under thsad come from the frame's own super, as in mvu. With fields, every block's position
-// is shifted vertically by the field shift between the frames' parities (mvu's). The result is mvu's
-// bit for bit given the same super and vectors.
+// SAD isn't under thsad come from the frame's own super, as in mvu. The result is mvu's bit for bit
+// given the same super and vectors.
 //
 // Implemented: all of mvu.Compensate's arguments, on mvgpu.Super's Gray and YUV supers of any
 // subsampling and 8 to 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and
@@ -42,7 +41,6 @@ struct CompensateData {
     int delta = 0; // the vectors' reference frame is n + delta
     int time256 = 0;
     int thsad = 0; // scaled
-    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
     int nbx = 0, nby = 0, step = 0, stepY = 0, overlap = 0, overlapY = 0;
     SceneChange scd;
 
@@ -138,17 +136,6 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         if (ownRegions.lumaStride != regions.lumaStride || ownRegions.chromaStride != regions.chromaStride)
             return fail("the super frames' storage strides differ");
 
-        // mvu.Compensate's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the
-        // super frames' parities (their _Field, or tff)
-        int fieldShift = 0;
-        if (d->fields && L.pel > 1 && (nref - n) % 2 != 0) {
-            try {
-                fieldShift = ComputeFieldShift(GetTopField(own, n, d->tffExists, d->tff, true, vsapi), GetTopField(ref, nref, d->tffExists, d->tff, true, vsapi), L.pel);
-            } catch (const std::exception &e) {
-                return fail(e.what());
-            }
-        }
-
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
             return fail("failed to allocate the output frame");
@@ -221,7 +208,6 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.stepY = d->stepY;
         pc.overlapY = d->overlapY;
         pc.time4096BX = L.format.Float() ? 0 : (1 << L.format.bits) - 1;
-        pc.fieldShift = fieldShift;
 
         rec.Bind(kFlTaps, d->windowsInfo.buffer);
         rec.Bind(kFlRefLuma, superPlane.buffer, regions.luma, regions.lumaBytes);
@@ -269,12 +255,9 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
 
     try {
         int err;
-        int64_t thsad = vsapi->mapGetInt(in, "thsad", 0, &err);
+        int64_t thsad = vsapi->mapGetIntSaturated(in, "thsad", 0, &err); // saturated so the scaling below can't overflow int64
         if (err)
             thsad = 10000;
-        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-        d->tffExists = !err;
         double time = vsapi->mapGetFloat(in, "time", 0, &err);
         if (err)
             time = 100.0;
@@ -315,8 +298,6 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         if (!SameGeometry(analysed, L) || v.width != L.aw || v.height != L.ah || v.realWidth != L.width || v.realHeight != L.height || v.hpad != L.pad ||
             v.vpad != L.padY || v.pel != L.pel || (v.chroma && (v.xRatio != L.format.xr || v.yRatio != L.format.yr)))
             throw std::runtime_error("wrong source or super clip frame size");
-        if (d->fields && v.pel < 2)
-            throw std::runtime_error("fields option requires pel > 1");
         d->info = v;
         d->delta = v.delta;
         d->nbx = v.nbx;
@@ -381,11 +362,9 @@ void compensateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                              "super:vnode:gpu;"
                              "vectors:vnode:gpu;"
                              "thsad:int:opt;"
-                             "fields:int:opt;"
                              "time:float:opt;"
                              "thscd1:int:opt;"
                              "thscd2:float:opt;"
-                             "tff:int:opt;"
                              "prefix:data:opt;",
                              "clip:vnode:gpu;", compensateCreate, nullptr, plugin);
 }

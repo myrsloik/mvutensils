@@ -41,9 +41,7 @@ ivec2 HalfGrid(ivec2 v) {
 // the finest level's block covering the block's centre and its four neighbours, scaled to
 // half-pels at full size. The median and the finest level come from the field's coarse result
 // (binding 28, from pc.coarseBase on); with pc.flags & 4, a super without coarse levels, there is
-// none, and neither are seeds. Zero and the median are shifted vertically by pc.fieldShift, as
-// mvu.Analyse shifts its zero and global predictors at the finest level (fields). One lane per
-// block; dispatched as ((nbx * nby + 63) / 64, 1).
+// none, and neither are seeds. One lane per block; dispatched as ((nbx * nby + 63) / 64, 1).
 void main() {
     int b = int(gl_GlobalInvocationID.x);
     if (b >= pc.nbx * pc.nby)
@@ -51,11 +49,10 @@ void main() {
     gX = (b % pc.nbx) * pc.step;
     gY = (b / pc.nbx) * pc.stepY;
     gCount = 0;
-    ivec2 shift = ivec2(0, pc.fieldShift);
-    Add(shift);
+    Add(ivec2(0));
     bool coarseSearch = (pc.flags & 4) == 0;
     if (coarseSearch)
-        Add(coarse[pc.coarseBase] + shift);
+        Add(coarse[pc.coarseBase]);
     if ((pc.flags & 1) != 0) {
         ivec2 v1 = stepRec[RecIndex(b)].xy;
         int tx = clamp(RoundDiv(kPel * gX + v1.x, kPel * pc.step), 0, pc.nbx - 1);

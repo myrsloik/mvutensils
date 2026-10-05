@@ -21,9 +21,8 @@
 // resize in 64 x 64 tiles as mvu does it (TileTaps, as for FlowInter). Two kernels per frame: the scene
 // change test's count of badly matched blocks per vector frame (mask_blocks.comp), then every pixel of
 // every plane (flow_fetch.comp, flow_blur.comp), which copies the clip's pixel where the vectors are at
-// a scene change, since the host can't see the count. With Flow's fields, the vectors are shifted
-// vertically by the field shift between the frames' parities, as mvu's MakeSmallVectorMasks shifts
-// them. The result is mvu's bit for bit given the same super and vectors.
+// a scene change, since the host can't see the count. The result is mvu's bit for bit given the same
+// super and vectors.
 //
 // Implemented: all of their arguments, on mvgpu.Super's Gray and YUV supers of any subsampling and 8 to
 // 16-bit or float samples at any pel with any of mvu's block sizes, overlaps and paddings, and vectors
@@ -46,7 +45,6 @@ struct FlowFetchData {
     std::string prefix, name;
 
     bool blur = false; // FlowBlur, else Flow
-    bool fields = false, tff = false, tffExists = false; // Flow: the frames are fields, of these parities (GetTopField)
     int delta = 0;     // Flow: the vectors' reference frame is n + delta; FlowBlur: mvfw's delta, -off
     int time256 = 0;   // Flow's time, FlowBlur's blur256
     int prec = 1;      // FlowBlur
@@ -93,16 +91,11 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
     const bool load = d->blur ? n + d->delta >= 0 && n - d->delta < frames : superFrame >= 0 && superFrame < frames;
     const int vectorClips = d->blur ? 2 : 1;
 
-    // Flow's field shift reads the parity of frame n's super too
-    const bool parities = d->fields && d->layout.pel > 1 && d->delta % 2 != 0;
-
     if (activationReason == arInitial) {
         if (load) {
             for (int i = 0; i < vectorClips; ++i)
                 vsapi->requestFrameFilter(vecFrame[i], d->vectors[i], frameCtx);
-            if (parities)
-                vsapi->requestFrameFilter(std::min(n, superFrame), d->super, frameCtx);
-            vsapi->requestFrameFilter(parities ? std::max(n, superFrame) : superFrame, d->super, frameCtx);
+            vsapi->requestFrameFilter(superFrame, d->super, frameCtx);
         }
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
@@ -158,18 +151,6 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         SuperRegions regions;
         if (const std::string e = CheckSuperFrame(sup, L, d->prefix, regions, vsapi); !e.empty())
             return fail(e);
-
-        // mvu.Flow's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the super
-        // frames' parities (their _Field, or tff)
-        int fieldShift = 0;
-        if (parities) {
-            const VSFrame *own = hold(vsapi->getFrameFilter(n, d->super, frameCtx));
-            try {
-                fieldShift = ComputeFieldShift(GetTopField(own, n, d->tffExists, d->tff, true, vsapi), GetTopField(sup, superFrame, d->tffExists, d->tff, true, vsapi), L.pel);
-            } catch (const std::exception &e) {
-                return fail(e.what());
-            }
-        }
 
         dst = vkapi->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core);
         if (!dst)
@@ -243,7 +224,6 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
         pc.time4096FX = d->prec; // flow_blur.comp's prec
-        pc.fieldShift = fieldShift;
 
         // Flow reads the reference frame's super as ref, FlowBlur its own frame's as src
         const int lumaBinding = d->blur ? kFlSrcLuma : kFlRefLuma, chromaBinding = d->blur ? kFlSrcChroma : kFlRefChroma;
@@ -317,9 +297,6 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
             double time = vsapi->mapGetFloat(in, "time", 0, &err);
             if (err)
                 time = 100.0;
-            d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-            d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-            d->tffExists = !err;
             if (!std::isfinite(time) || time < 0.0 || time > 100.0)
                 throw std::runtime_error("time must be between 0 and 100%");
             d->time256 = static_cast<int>(time * 256.0 / 100.0);
@@ -437,10 +414,8 @@ void flowFetchRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                              "super:vnode:gpu;"
                              "vectors:vnode:gpu;"
                              "time:float:opt;"
-                             "fields:int:opt;"
                              "thscd1:int:opt;"
                              "thscd2:float:opt;"
-                             "tff:int:opt;"
                              "prefix:data:opt;",
                              "clip:vnode:gpu;", flowCreate, nullptr, plugin);
     vspapi->registerFunction("FlowBlur",

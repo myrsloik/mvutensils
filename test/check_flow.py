@@ -17,12 +17,11 @@ Every pixel of every output frame and plane is compared, and FlowFPS's frame dur
                   [--vectors mvgpu] [--pel 2] [--blksize 16 [8]] [--overlap 8 [4]] [--format YUV444P8]
                   [--crop 1914x1074] [--delta 1] [--time 50] [--num 60 --den 1] [--extramask 0]
                   [--ml 100] [--blend 0] [--blur 50] [--prec 1] [--thsad 10000] [--thscd1 400] [--thscd2 51]
-                  [--fps 30000/1001] [--fields 1 [--tff 1] [--parity 0110...]] [--other-super]
+                  [--fps 30000/1001] [--other-super]
 
 --format converts the 8-bit 4:2:0 source first (resize.Bicubic). --fps sets the clip's frame rate
 (24 by default), which with --num and --den decides FlowFPS's times. Flow and Compensate take the
-vectors of --delta (either sign), the others those of --delta and -delta. Flow and Compensate take
---fields and --tff as they come; --parity sets the frames' _Field properties, a 0 or 1 per frame.
+vectors of --delta (either sign), the others those of --delta and -delta.
 --other-super gives Flow and Compensate the super of another clip (the clip inverted) than the one
 the vectors come from: Compensate's blocks not under thsad come from it too.
 """
@@ -65,9 +64,6 @@ def main():
     ap.add_argument('--blur', type=float, help='FlowBlur')
     ap.add_argument('--prec', type=int, help='FlowBlur')
     ap.add_argument('--thsad', type=int, help='Compensate')
-    ap.add_argument('--fields', type=int, help='Flow, Compensate')
-    ap.add_argument('--tff', type=int, help='Flow, Compensate')
-    ap.add_argument('--parity', help="the frames' _Field properties, a 0 or 1 per frame")
     ap.add_argument('--other-super', action='store_true', help="Flow and Compensate: the super of the clip inverted")
     ap.add_argument('--thscd1', type=int)
     ap.add_argument('--thscd2', type=float)
@@ -90,12 +86,6 @@ def main():
     if args.fps:
         num, den = (int(v) for v in args.fps.split('/'))
         clip = core.std.AssumeFPS(clip, fpsnum=num, fpsden=den)
-    if args.parity:
-        def field(n, f):
-            out = f.copy()
-            out.props['_Field'] = int(args.parity[n])
-            return out
-        clip = core.std.ModifyFrame(clip, clip, field)
     gclip = core.std.GPUUpload(clip)
 
     sk = dict(blksize=args.blksize, overlap=args.overlap, pel=args.pel, pad=args.pad)
@@ -126,11 +116,11 @@ def main():
     if args.filter in ('inter', 'fps'):
         fk.update({k: getattr(args, k) for k in ('ml', 'blend') if getattr(args, k) is not None})
     if args.filter == 'flow':
-        fk.update({k: getattr(args, k) for k in ('time', 'fields', 'tff') if getattr(args, k) is not None})
+        fk.update({k: getattr(args, k) for k in ('time',) if getattr(args, k) is not None})
         gout = core.mvgpu.Flow(gclip, gsup, gvec[0], **fk)
         cout = core.mvu.Flow(clip, csup, cvec[0], **fk)
     elif args.filter == 'compensate':
-        fk.update({k: getattr(args, k) for k in ('time', 'thsad', 'fields', 'tff') if getattr(args, k) is not None})
+        fk.update({k: getattr(args, k) for k in ('time', 'thsad') if getattr(args, k) is not None})
         gout = core.mvgpu.Compensate(gclip, gsup, gvec[0], **fk)
         cout = core.mvu.Compensate(clip, csup, cvec[0], **fk)
     elif args.filter == 'blur':

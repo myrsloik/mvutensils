@@ -33,16 +33,13 @@
 //                   [--padv 16] [--superblksize 16] [--superblksizev 16] [--superoverlap 8]
 //                   [--superoverlapv 8] [--onelevel] [--pel 2] [--radius 2] [--delta 1] [--standalone] [--chroma 1]
 //                   [--plevel 1] [--mvlambda 1000] [--lsad 400] [--badsad 1000] [--badrange 40]
-//                   [--badstep 2] [--satd] [--fields --tff 0|1 | --fields --parity 0110...] [--threads 16]
+//                   [--badstep 2] [--satd] [--threads 16]
 //
 // The arguments are mvgpu.Super's and mvgpu.AnalyseMany's (--blksizev, --overlapv and --padv the
 // vertical ones, the horizontal ones by default; --superblksize and --superoverlap, and their
 // vertical ones, the super's grid where it isn't the grid analysed; --onelevel: a super without the
 // coarse levels, which a frame narrower than 192 pixels doesn't have either, so no coarse search, no
-// median and no coarse seeds; --standalone: an Analyse per delta, without chained or inverted seeds;
-// --fields: the frames are fields, of the parity --tff gives as mvu takes it, top = tff ^ (n odd),
-// or --parity, a 1 per top field (the _Field properties), so that a field of an odd delta at pel 2 or
-// 4 seeds from zero and the median shifted by mvu's field shift, +-pel / 2 vertically (FieldShift));
+// median and no coarse seeds; --standalone: an Analyse per delta, without chained or inverted seeds);
 // badsad is per 8x8 block, as mvgpu takes it. The frames are
 // raw planar Y, U, V, at 4:2:0, 4:2:2, 4:4:0 or 4:4:4, or Y alone for gray (whose SADs are luma's
 // alone, as with --chroma 0), bytes at 8 bits, 16-bit little-endian samples at 9 to 16 and 32-bit
@@ -462,11 +459,6 @@ int BlockMetric(const T *a, ptrdiff_t pa, const T *b, ptrdiff_t pb, int bw, int 
     return satd ? BlockSatd(a, pa, b, pb, bw, bh) : BlockSad(a, pa, b, pb, bw, bh);
 }
 
-// mvu's ComputeFieldShift: the vertical shift, 1 / pel pixels, of a field of the other parity
-int ComputeFieldShift(bool srcTop, bool refTop, int pel) {
-    return srcTop && !refTop ? pel / 2 : (refTop && !srcTop ? -(pel / 2) : 0);
-}
-
 using Key = std::pair<int, int>; // field (n, d)
 
 struct Vec {
@@ -497,8 +489,6 @@ struct Search {
     bool standalone = false; // no chained or inverted seeds
     bool chroma = true;      // the SAD counts U and V
     bool satd = false;       // luma's SAD is its SATD (BlockSatd), at the full-size grid
-    bool fields = false;     // the frames are fields, top ones where topField has them (FieldShift)
-    std::vector<bool> topField;
     int plevel = 1;          // lambda * 2^(plevel * L) at coarse level L
     int64_t lambda0 = 0;     // mvlambda scaled to the block size and divided by pel squared, the full-size grid's
     int64_t lambdaBlock = 0; // mvlambda scaled to the block size, the coarse levels' before plevel
@@ -515,12 +505,6 @@ struct Search {
         const int64_t half = static_cast<int64_t>(worst >> (1 + depthShift + shift)) << (depthShift + shift);
         const double sc = static_cast<double>(lsad) / std::max<int64_t>(lsad + half, 1);
         return static_cast<int64_t>(lambda * sc * sc);
-    }
-
-    // mvu.Analyse's field shift of field (n, d): with fields, at pel 2 or 4 and an odd delta, the
-    // shift between the parities, which the field's zero and median seeds take (BuildSeeds)
-    int FieldShift(int n, int d) const {
-        return fields && pel > 1 && d % 2 != 0 ? ComputeFieldShift(topField[n], topField[n + d], pel) : 0;
     }
 
     // Block b's position in the frame
@@ -795,8 +779,7 @@ struct Pyramid {
 
 // The seeds of every block of field (n, d): zero, the field's median, the chained and inverted
 // vectors of the fields already refined, the finest coarse level's vectors around the block;
-// clamped, on the half-pel grid, without duplicates. Zero and the median take the field shift
-// (FieldShift), as mvu.Analyse's zero and global predictors do at the finest level.
+// clamped, on the half-pel grid, without duplicates
 template <typename T>
 std::vector<std::vector<Vec>> BuildSeeds(const Search<T> &s, int n, int d, const LevelField &co, const std::map<Key, Field> &done) {
     const int nb = s.nbx * s.nby;
@@ -848,11 +831,10 @@ std::vector<std::vector<Vec>> BuildSeeds(const Search<T> &s, int n, int d, const
             }
         }
     }
-    const int shift = s.FieldShift(n, d);
     for (int b = 0; b < nb; ++b) {
         const int x = s.BX(b), y = s.BY(b);
-        add(b, Vec{0, shift});
-        add(b, Vec{global.x, global.y + shift});
+        add(b, Vec{});
+        add(b, global);
         if (stepF) {
             const Vec v1 = stepF->v[b];
             const double unit = s.pel;
@@ -1095,9 +1077,7 @@ struct Options {
     int blkY = -1, overlapY = -1, padY = -1; // the vertical ones, the horizontal ones unless given
     int superBlk = -1, superBlkY = -1, superOverlap = -1, superOverlapY = -1; // the super's grid, the one analysed unless given
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
-    bool standalone = false, chroma = true, onelevel = false, satd = false, fields = false;
-    int tff = -1;       // --tff, or -1
-    std::string parity; // --parity, a 0 or 1 per frame
+    bool standalone = false, chroma = true, onelevel = false, satd = false;
 };
 
 // The search over samples of type T: bytes at 8 bits, 16 bits at 9 to 16
@@ -1151,15 +1131,6 @@ int Run(const Options &o) {
     s.standalone = o.standalone;
     s.chroma = o.chroma && !gray;
     s.satd = o.satd;
-    s.fields = o.fields;
-    if (o.fields) {
-        // mvu's GetTopField: --tff wins over the frames' parities, as mvu's tff over _Field
-        if (o.tff < 0 && static_cast<int>(o.parity.size()) < frames)
-            Die("--fields takes --tff, or --parity with a 0 or 1 per frame (mvu: \"_Field property not found in input frame. Therefore, you must pass tff argument\")");
-        s.topField.resize(frames);
-        for (int n = 0; n < frames; ++n)
-            s.topField[n] = o.tff >= 0 ? ((o.tff != 0) != (n % 2 != 0)) : o.parity[n] == '1';
-    }
     s.plevel = o.plevel;
     // mvu.Analyse's scaling: to the bit depth (floats searched as 16-bit samples), rounded, then to
     // the block size; lambda divided by pel squared at full size
@@ -1369,9 +1340,6 @@ int main(int argc, char **argv) {
         else if (a == "--badrange") o.badrange = atoi(next().c_str());
         else if (a == "--badstep") o.badstep = atoi(next().c_str());
         else if (a == "--satd") o.satd = true;
-        else if (a == "--fields") o.fields = true;
-        else if (a == "--tff") o.tff = atoi(next().c_str()) != 0 ? 1 : 0;
-        else if (a == "--parity") o.parity = next();
         else if (a == "--threads") gThreads = std::max(1, atoi(next().c_str()));
         else Die("unknown option " + a);
     }

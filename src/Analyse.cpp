@@ -51,11 +51,9 @@
 // search, searchparam, pelsearch, levels, pnew, pzero, pglobal, globalmv, meander and trymany tune
 // mvu's search, which this one doesn't use; they are checked and otherwise ignored. satd makes luma's
 // SAD its SATD, mvu's, at the full-size grid (the coarse search keeps the SAD; 16x2 blocks are refused,
-// as mvu refuses them). fields and tff shift the zero and median seeds of a field of an odd delta at
-// pel 2 or 4 by mvu's field shift, as mvu shifts its zero and global predictors. Blocks whose SAD can
-// pass 2^31 (128x128 with chroma at 16 bits or float) are refused. blksize and overlap may be other
-// than the super's, as in mvu: the grid then has to fit the super's block-aligned frame
-// (SuperLayout::WithGrid).
+// as mvu refuses them). Blocks whose SAD can pass 2^31 (128x128 with chroma at 16 bits or float) are
+// refused. blksize and overlap may be other than the super's, as in mvu: the grid then has to fit the
+// super's block-aligned frame (SuperLayout::WithGrid).
 
 namespace {
 
@@ -413,7 +411,6 @@ struct AnalyseData {
     int deltaFrame = 1;
     bool chroma = true; // the SADs count chroma
     bool satd = false;  // luma's SAD is its SATD
-    bool fields = false, tff = false, tffExists = false; // the frames are fields, of these parities (GetTopField)
     int split = 1;      // RefineSplit
     int badSad = 0;
     int fallbackRadius = 0;
@@ -503,13 +500,11 @@ public:
         return q;
     }
 
-    // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is;
-    // fieldShift: the field shift of zero and the median
-    void SeedLists(int flags, int fieldShift) {
+    // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is
+    void SeedLists(int flags) {
         const uint32_t groups = static_cast<uint32_t>((static_cast<int64_t>(L.nbx) * L.nby + 63) / 64);
         Params q = MakeParams(0, 0);
         q.flags = flags;
-        q.fieldShift = fieldShift;
         if (flags & 2) {
             rec.Dispatch(d.seedScatter, q, groups, 1);
             rec.ComputeBarrier();
@@ -612,17 +607,9 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
 
         if (!hasRef) {
             // No vectors: a frame of records that don't count, with the description. The super frame
-            // is checked all the same, as mvu checks it, its parity too with fields.
+            // is checked all the same, as mvu checks it.
             SuperRegions regions;
-            std::string e = CheckSuperFrame(src, L, d->prefix, regions, vsapi);
-            if (e.empty() && d->fields) {
-                try {
-                    (void)GetTopField(src, n, d->tffExists, d->tff, true, vsapi);
-                } catch (const std::exception &x) {
-                    e = x.what();
-                }
-            }
-            if (!e.empty()) {
+            if (const std::string e = CheckSuperFrame(src, L, d->prefix, regions, vsapi); !e.empty()) {
                 vsapi->freeFrame(src);
                 vsapi->setFilterError(("Analyse: " + e).c_str(), frameCtx);
                 return nullptr;
@@ -669,19 +656,6 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             return fail(e);
         if (const std::string e = CheckSuperFrame(ref, L, d->prefix, rf, vsapi); !e.empty())
             return fail(e);
-
-        // mvu.Analyse's field shift: with fields, at pel 2 or 4 and an odd delta, the shift between the
-        // frames' parities (their _Field, or tff), which zero and the median take (seed_build.comp)
-        int fieldShift = 0;
-        if (d->fields) {
-            try {
-                const bool srcTop = GetTopField(src, n, d->tffExists, d->tff, true, vsapi), refTop = GetTopField(ref, nref, d->tffExists, d->tff, true, vsapi);
-                if (L.pel > 1 && d->deltaFrame % 2 != 0)
-                    fieldShift = ComputeFieldShift(srcTop, refTop, L.pel);
-            } catch (const std::exception &e) {
-                return fail(e.what());
-            }
-        }
 
         // The fields the seeds chain and invert, refined by the other nodes AnalyseMany made
         const VSFrame *stepVec = nullptr, *restVec = nullptr, *invVec = nullptr;
@@ -782,7 +756,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
         FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / bytes), static_cast<int>(recBytes / 16),
                             static_cast<int>(d->coarseRow * coarseRowBytes / 8), std::move(stamp));
-        field.SeedLists(flags, fieldShift);
+        field.SeedLists(flags);
         field.Refinement();
 
         uint64_t signaled = 0;
@@ -816,7 +790,6 @@ struct AnalyseArgs {
     int deltaFrame = 1;
     bool chroma = true;
     bool satd = false;
-    bool fields = false, tff = false, tffExists = false;
     int plevel = 1;
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
     int badrange = 40, badstep = 2;
@@ -932,11 +905,6 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (tryMany < 0 || tryMany > 2)
             throw std::runtime_error("trymany must be between 0 and 2");
 
-        a.fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
-        a.tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-        a.tffExists = !err;
-
         if (searchType < 0 || searchType > 5)
             throw std::runtime_error("search must be between 0 and 5");
 
@@ -1049,9 +1017,6 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     d->deltaFrame = delta;
     d->chroma = a.chroma;
     d->satd = a.satd;
-    d->fields = a.fields;
-    d->tff = a.tff;
-    d->tffExists = a.tffExists;
     if (stepNode && restNode) {
         d->stepNode = vsapi->addNodeRef(stepNode);
         d->restNode = vsapi->addNodeRef(restNode);
@@ -1255,8 +1220,6 @@ void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "badrange:int:opt;"
                  "meander:int:opt;"
                  "trymany:int:opt;"
-                 "fields:int:opt;"
-                 "tff:int:opt;"
                  "satd:int:opt;"
                  "prefix:data:opt;"
                  "badstep:int:opt;",
@@ -1283,8 +1246,6 @@ void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "badrange:int:opt;"
                  "meander:int:opt;"
                  "trymany:int:opt;"
-                 "fields:int:opt;"
-                 "tff:int:opt;"
                  "satd:int:opt;"
                  "radius:int:opt;"
                  "prefix:data:opt;"

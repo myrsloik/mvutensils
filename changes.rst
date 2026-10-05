@@ -49,6 +49,8 @@ Changes
 
     * Greatly reduced memory usage
 
+    * With pel=4 the last row and column of the quarter-pel planes are computed like the rest, as if the padding went on, instead of being left with whatever the frame's memory held
+
 * Analyse/Recalculate:    
     * Motion vectors are now exported in MVUAnalysisVectors where the upper 32 bits contain y and the lower 32 bits contain x, the corresponding block sad values are exported in MVUAnalysisSAD
 
@@ -79,12 +81,16 @@ Changes
     * Recalculate can now be passed an array of vectors to be recalculated at once with the same settings
     
     * Speedups due to no longer testing the same motion vector predictors multiple times
+
+    * Removed the fields and tff arguments: on separated fields the search finds the half-line offset between fields of opposite parity by itself. Analyse only used the arguments to move two starting points of its search, which made no measurable difference, and Recalculate never used them
     
 * AnalyseMany:
     * A helper function to generate multiple analysis clips quickly to pass to DegrainN and friends, takes the same arguments as Analyse except that delta is a positive number controlling the step size backward and forward. The radius argument determines how many vectors are produced and defaults to 1. For example radius=2 will return [Analyse(delta=1), Analyse(delta=-1), Analyse(delta=2), Analyse(delta=-2)]
     
 * Compensate:
     * Removed scbehavior argument, its only function was to decide which source frame to copy the unprocessed parts of the frame from around scene changes
+
+    * Removed the fields and tff arguments: vectors between fields of opposite parity already contain the half-line offset, which they added a second time
     
 * DegrainN:
     * All the cryptically named forward and backward vector clip arguments is now passed as an array in vectors
@@ -124,6 +130,8 @@ Changes
     * Greatly reduced memory usage
     
     * Mode=1 was dropped since nobody used it, since only mode=0 remains the mode argument was removed
+
+    * Removed the fields and tff arguments: vectors between fields of opposite parity already contain the half-line offset, which they added a second time
 
 * FlowBlur
     * Improved internal mask resizing quality

@@ -9,8 +9,7 @@ properties give.
 At pel 4, where mvgpu keeps only luma's half-pel planes (and 4:4:4 chroma's), its quarter planes are
 computed from them the way the kernels read them and compared with mvu's, and subsampled chroma's
 sixteen are read out of its quarter-pel image (every fourth sample of every fourth row from the phase
-on); the quarter samples mvu leaves unset
-(the last column of x + 3/4, the last row of y + 3/4) are skipped. mvgpu's coarse levels, which mvu
+on), every sample, the last column's and row's too. mvgpu's coarse levels, which mvu
 doesn't have, are compared with a numpy model of their reduction (rfilter's filter on clamped reads,
 SuperLayout.h's level table).
 
@@ -80,16 +79,6 @@ def quarters(p0, p2, p8, p10):
     q[3], q[11], q[7] = avg(nx(p0), p2), avg(nx(p8), p10), avg(d4x, d6)
     q[12], q[14], q[13], q[15] = d12, d14, avg(d12, d14), avg(d12x, d14)
     return q
-
-
-def unset_mask(k, h, w):
-    """The samples of quarter plane k mvu leaves unset"""
-    m = np.ones((h, w), bool)
-    if k in (3, 7, 11, 15):
-        m[:, -1] = False
-    if k in (12, 13, 14, 15):
-        m[-1, :] = False
-    return m
 
 
 def reduce_plane(s, rfilter):
@@ -314,10 +303,7 @@ def main():
                     got = gsub(k)
                 else:
                     got = computed[k]
-                if pel == 4:
-                    mask = unset_mask(k, H, W)
-                else:
-                    mask = np.ones((H, W), bool)
+                mask = np.ones((H, W), bool)
                 bad = (bits_of(expected) != bits_of(got)) & mask
                 compared += int(mask.sum())
                 if bad.any():
