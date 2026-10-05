@@ -61,6 +61,7 @@ MVUtensils is API-compatible in spirit but not verbatim. The main differences:
 | `limit` + `limitc` | `limit=[luma, chroma]` (float; non-finite or > max = no limit) |
 | `Degrain` centre frame taken from `clip` | taken from `super`; if the render super is built from a different clip (MCDegrainSharp, SMDegrain `mfilter`, MLDegrain `soft`), also pass `centersuper=Super(clip, …, onelevel=True)` — see [the centre frame](#the-centre-frame) |
 | `Flow(mode=...)`, `BlockFPS`, `Finest`, `search_coarse`, `divide`, `scbehavior`, `truemotion` | removed |
+| `fields`, `tff` (`Analyse`, `Recalculate`, `Compensate`, `Flow`) | removed: process `SeparateFields` output as is; vectors between fields of opposite parity already contain the half-line offset |
 | `FlowFPS(mask=1/2)` | `FlowFPS(extramask=False/True)` |
 | `Mask(kind=0/1/2)` | `VectorLengthMask` / `SADMask` / `OcclusionMask` |
 | `thscd2` (0–256 int, default 130) | `thscd2` (0–100 float percentage, default 51) |
@@ -177,7 +178,7 @@ core.mvu.Super(vnode clip, int[] blksize, int[] overlap[, int[] pad=[16, 16], in
 Estimates a field of motion vectors for one temporal direction/distance.
 
 ```py
-core.mvu.Analyse(vnode super[, int[] blksize=<from super>, int[] overlap=<from super>, int levels=0, int search=2, int searchparam=2, int pelsearch=<pel>, int mvlambda=1000, bint chroma=True, int delta=1, int lsad=400, int plevel=1, bint globalmv=True, int pnew=25, int pzero=<pnew>, int pglobal=0, int badsad=10000, int badrange=24, bint meander=True, int trymany=0, bint fields=False, bint tff=False, bint satd=False, str prefix="MVUtensils"])
+core.mvu.Analyse(vnode super[, int[] blksize=<from super>, int[] overlap=<from super>, int levels=0, int search=2, int searchparam=2, int pelsearch=<pel>, int mvlambda=1000, bint chroma=True, int delta=1, int lsad=400, int plevel=1, bint globalmv=True, int pnew=25, int pzero=<pnew>, int pglobal=0, int badsad=10000, int badrange=24, bint meander=True, int trymany=0, bint satd=False, str prefix="MVUtensils"])
 ```
 
 | Parameter | Type | Options (Default) | Description |
@@ -202,8 +203,6 @@ core.mvu.Analyse(vnode super[, int[] blksize=<from super>, int[] overlap=<from s
 | badrange | int | (24) | Radius of that wider search. |
 | meander | bint | (True) | Scan block rows alternately left-to-right / right-to-left for better predictor reuse. |
 | trymany | int | 0–2 (0) | Try multiple motion-vector candidates per block instead of only the single best predictor (slower, occasionally better). `0` = off; `1` = on every pyramid level **except** the finest; `2` = on **all** levels including the finest. |
-| fields | bint | (False) | Treat the clip as field-based. |
-| tff | bint | (False) | Top field first (only relevant with `fields=True`). |
 | satd | bint | (False) | Use SATD instead of plain SAD as the block metric. Equivalent to mvtools `dct=5`. |
 
 ### Motion-coherence tuning: mvlambda, lsad, plevel
@@ -244,7 +243,8 @@ photometric match. The three parameters shape that trade-off:
 > `dct` became the boolean `satd` (`dct=0`→`satd=False`, `dct=5`→`satd=True`). `search`
 > modes lost the old 0 and 1, so subtract 2 from your old value (`pelsearch` is a radius and stays as it was). `lambda`→`mvlambda`,
 > `global`→`globalmv`. `trymany` is now a 0–2 int instead of a bool — the old `False`/`True` map to
-> `0`/`1`, and the new `2` also tries multiple candidates on the finest level.
+> `0`/`1`, and the new `2` also tries multiple candidates on the finest level. `fields`/`tff` were removed:
+> process `SeparateFields` output as is, vectors between fields of opposite parity already contain the half-line offset.
 > The `truemotion` preset was removed in favour of fixed defaults: `mvlambda=1000`
 > (per 8×8 block, scaled by block area), `lsad=400`, `plevel=1`, `globalmv=True`, `pnew=25`. These are mostly the old
 > `truemotion=True` values, except `lsad` (now 400, the old `truemotion=False` value — it was 1200
@@ -277,7 +277,7 @@ Re-estimates an existing vector field at (typically) a finer block size, refinin
 already have instead of searching from scratch. Pair it with a halved `blksize`/`overlap`.
 
 ```py
-core.mvu.Recalculate(vnode super, vnode[] vectors[, int thsad=200, bint smooth=True, int[] blksize=<from super>, int search=2, int searchparam=2, int mvlambda=1000, bint chroma=True, int pnew=25, int[] overlap=<from super>, bint meander=True, bint fields=False, bint tff=False, bint satd=False, str prefix="MVUtensils"])
+core.mvu.Recalculate(vnode super, vnode[] vectors[, int thsad=200, bint smooth=True, int[] blksize=<from super>, int search=2, int searchparam=2, int mvlambda=1000, bint chroma=True, int pnew=25, int[] overlap=<from super>, bint meander=True, bint satd=False, str prefix="MVUtensils"])
 ```
 
 `vectors` takes a single vector clip or a whole list, and the result is the list of refined clips in
@@ -301,8 +301,8 @@ out = core.mvu.Degrain(clip, super, vectors)
 
 `search` picks the algorithm as in [Analyse](#analyse), but since `Recalculate` works on a single level,
 `searchparam` is directly that algorithm's radius, in sub-pixel units (the role `pelsearch` plays in
-`Analyse`). Other parameters (`mvlambda`, `chroma`, `pnew`, `meander`, `fields`, `tff`, `satd`) behave
-exactly as in [Analyse](#analyse).
+`Analyse`). Other parameters (`mvlambda`, `chroma`, `pnew`, `meander`, `satd`) behave exactly as in
+[Analyse](#analyse).
 
 `Recalculate` deliberately has **no `lsad`** (nor `plevel`, `globalmv`, `pzero`, `pglobal`,
 `badsad`/`badrange` or `trymany`). It is not a from-scratch hierarchical search: it works on a single
@@ -317,7 +317,7 @@ started from.
 > `AnalyseMany` set is refined in one call instead of recalculating each clip separately. It will also
 > raise an error if the chosen `blksize`/`overlap` can't cover the whole frame (unlike `Super`, which
 > pads). Halving `blksize`+`overlap` and reusing the existing super usually works, unusual splits may
-> need a new super clip.
+> need a new super clip. `fields`/`tff` were removed; they never changed its vectors.
 
 ### Recalculate and bit depth
 
@@ -410,7 +410,7 @@ Builds a single motion-compensated frame: each block is copied from the referenc
 motion vector.
 
 ```py
-core.mvu.Compensate(vnode clip, vnode super, vnode vectors[, int thsad=10000, bint fields=False, float time=100.0, int thscd1=400, float thscd2=51, bint tff=False, str prefix="MVUtensils"])
+core.mvu.Compensate(vnode clip, vnode super, vnode vectors[, int thsad=10000, float time=100.0, int thscd1=400, float thscd2=51, str prefix="MVUtensils"])
 ```
 
 | Parameter | Type | Options (Default) | Description |
@@ -420,10 +420,9 @@ core.mvu.Compensate(vnode clip, vnode super, vnode vectors[, int thsad=10000, bi
 | vectors | vnode | (required) | A single vector clip (one direction). |
 | thsad | int | (10000) | Blocks whose SAD exceeds this are taken from the source instead of the compensated reference. |
 | time | float | 0–100 (100.0) | Temporal position of the compensation, as a percentage toward the reference frame. |
-| fields | bint | (False) | Field-based processing. |
-| tff | bint | (False) | Top field first (only relevant with `fields=True`). |
 
-> **Porting:** the `scbehavior` argument was removed.
+> **Porting:** the `scbehavior`, `fields` and `tff` arguments were removed; vectors between fields of opposite parity already contain the half-line offset,
+> which `fields=True` added a second time.
 
 ## Flow
 
@@ -431,7 +430,7 @@ Pixel-accurate motion compensation: instead of copying whole blocks it warps the
 using a per-pixel vector field interpolated from the block vectors.
 
 ```py
-core.mvu.Flow(vnode clip, vnode super, vnode vectors[, float time=100.0, bint fields=False, int thscd1=400, float thscd2=51, bint tff=False, str prefix="MVUtensils"])
+core.mvu.Flow(vnode clip, vnode super, vnode vectors[, float time=100.0, int thscd1=400, float thscd2=51, str prefix="MVUtensils"])
 ```
 
 | Parameter | Type | Options (Default) | Description |
@@ -440,10 +439,9 @@ core.mvu.Flow(vnode clip, vnode super, vnode vectors[, float time=100.0, bint fi
 | super | vnode | (required) | Super clip. |
 | vectors | vnode | (required) | A single vector clip. |
 | time | float | 0–100 (100.0) | How far toward the reference frame to warp, in percent. |
-| fields | bint | (False) | Field-based processing. |
-| tff | bint | (False) | Top field first (only relevant with `fields=True`). |
 
-> **Porting:** the `mode` argument was removed (only the former `mode=0` remains).
+> **Porting:** the `mode` argument was removed (only the former `mode=0` remains), and so were `fields` and
+> `tff`: vectors between fields of opposite parity already contain the half-line offset, which `fields=True` added a second time.
 
 ## FlowInter
 

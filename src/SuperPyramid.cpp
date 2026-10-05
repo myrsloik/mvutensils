@@ -535,6 +535,10 @@ static void GeneratePelQuarters(uint8_t *MVU_RESTRICT const P[16], ptrdiff_t nPi
     const ptrdiff_t pp = nPitch / static_cast<ptrdiff_t>(sizeof(PixelType));
     auto row = [&](int i, int y) { return reinterpret_cast<PixelType *>(P[i] + static_cast<size_t>(y) * nPitch); };
 
+    // The samples 3/4 of a pixel right (down) take the next column's (row's) full-pel samples, which the
+    // last column (row) repeats, as the padding would go on. No vector the search allows reaches them;
+    // they are filled so that no sample of the planes is left undefined
+    const int last = nWidth - 1;
     for (int y = 0; y < nHeight; y++) {
         const PixelType *p0 = row(0, y), *p2 = row(2, y), *p8 = row(8, y), *p10 = row(10, y);
         PixelType *d1 = row(1, y), *d9 = row(9, y), *d4 = row(4, y), *d6 = row(6, y);
@@ -549,22 +553,24 @@ static void GeneratePelQuarters(uint8_t *MVU_RESTRICT const P[16], ptrdiff_t nPi
         }
         for (int x = 0; x < nWidth; x++)
             d5[x] = AveragePixels(d4[x], d6[x]);
-        for (int x = 0; x < nWidth - 1; x++) {
+        for (int x = 0; x < last; x++) {
             d3[x] = AveragePixels(p0[x + 1], p2[x]);
             d11[x] = AveragePixels(p8[x + 1], p10[x]);
             d7[x] = AveragePixels(d4[x + 1], d6[x]);
         }
-        if (y < nHeight - 1) {
-            const PixelType *p0n = p0 + pp, *p2n = p2 + pp;
-            for (int x = 0; x < nWidth; x++) {
-                d12[x] = AveragePixels(p0n[x], p8[x]);
-                d14[x] = AveragePixels(p2n[x], p10[x]);
-            }
+        d3[last] = AveragePixels(p0[last], p2[last]);
+        d11[last] = AveragePixels(p8[last], p10[last]);
+        d7[last] = AveragePixels(d4[last], d6[last]);
+        const PixelType *p0n = y < nHeight - 1 ? p0 + pp : p0, *p2n = y < nHeight - 1 ? p2 + pp : p2;
+        for (int x = 0; x < nWidth; x++) {
+            d12[x] = AveragePixels(p0n[x], p8[x]);
+            d14[x] = AveragePixels(p2n[x], p10[x]);
         }
         for (int x = 0; x < nWidth; x++)
             d13[x] = AveragePixels(d12[x], d14[x]);
-        for (int x = 0; x < nWidth - 1; x++)
+        for (int x = 0; x < last; x++)
             d15[x] = AveragePixels(d12[x + 1], d14[x]);
+        d15[last] = AveragePixels(d12[last], d14[last]);
     }
 }
 

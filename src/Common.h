@@ -124,14 +124,6 @@ inline void CheckClipLength(VSNode *node, const char *name, int minFrames, const
         throw std::runtime_error(std::string(name) + " must have at least as many frames as " + reference);
 }
 
-// Compute the sub-pixel vertical field shift between src and ref frames.
-// Returns nPel/2 if src is top-field and ref is bottom-field,
-//        -nPel/2 if ref is top-field and src is bottom-field,
-//         0      if both fields have the same parity.
-[[nodiscard]] inline int ComputeFieldShift(bool src_top_field, bool ref_top_field, int nPel) noexcept {
-    return (src_top_field && !ref_top_field) ? nPel / 2 : ((ref_top_field && !src_top_field) ? -(nPel / 2) : 0);
-}
-
 template <typename PixelType>
 [[nodiscard]] static constexpr PixelType AveragePixels(PixelType p1, PixelType p2) noexcept {
     if constexpr (std::is_integral_v<PixelType>)

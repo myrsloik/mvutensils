@@ -39,11 +39,8 @@ struct FlowData {
     
     int deltaFrame;
     int time256;
-    int fields;
     int64_t thscd1;
     float thscd2;
-    bool tff;
-    bool tff_exists;
 
     MaskResizer maskResizerFull;
     MaskResizer maskResizerSubSampled;
@@ -76,15 +73,8 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         vsapi->requestFrameFilter(n, d->clip, frameCtx);
         vsapi->requestFrameFilter(n, d->vectors, frameCtx);
 
-        if (nref >= 0 && nref < d->vi->numFrames) {
-            if (n < nref) {
-                vsapi->requestFrameFilter(n, d->super, frameCtx);
-                vsapi->requestFrameFilter(nref, d->super, frameCtx);
-            } else {
-                vsapi->requestFrameFilter(nref, d->super, frameCtx);
-                vsapi->requestFrameFilter(n, d->super, frameCtx);
-            }
-        }
+        if (nref >= 0 && nref < d->vi->numFrames)
+            vsapi->requestFrameFilter(nref, d->super, frameCtx);
     } else if (activationReason == arAllFramesReady) {
         VSFrame *dst = nullptr;
 
@@ -99,23 +89,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
                 FramePyramid refGOF(ref, 1, d->prefix, vsapi, d->superGeometry);
 
-                int fieldShift = 0;
-                if (d->fields && vectors.nPel > 1 && ((nref - n) % 2 != 0)) {
-                    const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
-                    try {
-                        bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, true, vsapi);
-
-                        bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, true, vsapi);
-                        fieldShift = ComputeFieldShift(src_top_field, ref_top_field, vectors.nPel);
-
-                        vsapi->freeFrame(src);
-                    } catch (const std::exception &) {
-                        vsapi->freeFrame(src);
-                        throw;
-                    }
-                }
-
-                auto smallMasks = vectors.MakeSmallVectorMasks(fieldShift);
+                auto smallMasks = vectors.MakeSmallVectorMasks();
 
                 auto tmp = MaskResizer::GetTmpBuffer(std::max(d->maskResizerFull.tmpSize, d->maskResizerSubSampled.tmpSize));
 
@@ -180,8 +154,6 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void 
     if (err)
         time = 100.0;
 
-    d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
     d->thscd1 = vsapi->mapGetInt(in, "thscd1", 0, &err);
     if (err)
         d->thscd1 = MV_DEFAULT_SCD1;
@@ -189,9 +161,6 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void 
     d->thscd2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
     if (err)
         d->thscd2 = MV_DEFAULT_SCD2;
-
-    d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-    d->tff_exists = !err;
 
     try {
 
@@ -261,10 +230,8 @@ void flowRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "super:vnode;"
                  "vectors:vnode;"
                  "time:float:opt;"
-                 "fields:int:opt;"
                  "thscd1:int:opt;"
                  "thscd2:float:opt;"
-                 "tff:int:opt;"
                  "prefix:data:opt;",
                  "clip:vnode;",
                  flowCreate, nullptr, plugin);

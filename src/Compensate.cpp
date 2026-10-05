@@ -39,12 +39,9 @@ struct CompensateData {
     const VSVideoInfo *supervi = nullptr;
 
     int64_t thSAD;
-    bool fields;
     int time256;
     int64_t nSCD1;
     float nSCD2;
-    int tff;
-    int tff_exists;
     int deltaFrame;
 
     bool chroma;
@@ -146,13 +143,6 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
                     nDstPitches[i] = vsapi->getStride(dst, i);
                 }
 
-                int fieldShift = 0;
-                if (d->fields && nPel > 1 && ((nref - n) % 2 != 0)) {
-                    bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, true, vsapi);
-                    bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, true, vsapi);
-                    fieldShift = ComputeFieldShift(src_top_field, ref_top_field, nPel);
-                }
-
                 if (nOverlapX[0] == 0 && nOverlapY[0] == 0) {
                     // The vector grid covers the block-aligned frame (its own blksize, which needn't be the super's), so the
                     // last block row and column are clipped to the frame
@@ -173,10 +163,10 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
 
                             if (block.vector.sad < thSAD) {
                                 blx[0] = block.x * nPel + block.vector.x * time256 / 256;
-                                bly[0] = block.y * nPel + block.vector.y * time256 / 256 + fieldShift;
+                                bly[0] = block.y * nPel + block.vector.y * time256 / 256;
                             } else {
                                 blx[0] = bx * nBlkSizeX[0] * nPel;
-                                bly[0] = by * nBlkSizeY[0] * nPel + fieldShift;
+                                bly[0] = by * nBlkSizeY[0] * nPel;
                             }
 
                             const auto &pPlanes = (block.vector.sad < thSAD) ? pRefPlanes : pSrcPlanes;
@@ -235,10 +225,10 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
 
                             if (block.vector.sad < thSAD) {
                                 blx[0] = block.x * nPel + block.vector.x * time256 / 256;
-                                bly[0] = block.y * nPel + block.vector.y * time256 / 256 + fieldShift;
+                                bly[0] = block.y * nPel + block.vector.y * time256 / 256;
                             } else {
                                 blx[0] = bx * (nBlkSizeX[0] - nOverlapX[0]) * nPel;
-                                bly[0] = by * (nBlkSizeY[0] - nOverlapY[0]) * nPel + fieldShift;
+                                bly[0] = by * (nBlkSizeY[0] - nOverlapY[0]) * nPel;
                             }
 
                             const auto &pPlanes = (block.vector.sad < thSAD) ? pRefPlanes : pSrcPlanes;
@@ -298,11 +288,9 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
     std::unique_ptr<CompensateData> d = std::make_unique<CompensateData>(vsapi);
     int err;
 
-    d->thSAD = vsapi->mapGetInt(in, "thsad", 0, &err);
+    d->thSAD = vsapi->mapGetIntSaturated(in, "thsad", 0, &err); // saturated so the scaling below can't overflow int64
     if (err)
         d->thSAD = 10000;
-
-    d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
 
     double time = vsapi->mapGetFloat(in, "time", 0, &err);
     if (err)
@@ -315,9 +303,6 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
     d->nSCD2 = vsapi->mapGetFloatSaturated(in, "thscd2", 0, &err);
     if (err)
         d->nSCD2 = MV_DEFAULT_SCD2;
-
-    d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-    d->tff_exists = !err;
 
     try {
         if (!std::isfinite(time) || time < 0.0 || time > 100.0)
@@ -352,9 +337,6 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         vectors.ScaleThSCD(d->nSCD1, d->nSCD2, vectors.bitsPerSample);
 
         d->deltaFrame = vectors.nDeltaFrame;
-
-        if (d->fields && vectors.nPel < 2)
-            throw std::runtime_error("fields option requires pel > 1");
 
         d->thSAD = (int64_t)(d->thSAD * vectors.GetThSCDScaleFactor(vectors.bitsPerSample) + 0.5);
 
@@ -411,11 +393,9 @@ void compensateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "super:vnode;"
                  "vectors:vnode;"
                  "thsad:int:opt;"
-                 "fields:int:opt;"
                  "time:float:opt;"
                  "thscd1:int:opt;"
                  "thscd2:float:opt;"
-                 "tff:int:opt;"
                  "prefix:data:opt;",
                  "clip:vnode;",
                  compensateCreate, nullptr, plugin);

@@ -141,9 +141,6 @@ private:
     // unknown
     VECTOR globalMVPredictor;  // predictor of global motion vector
 
-    // always constant? constant for the whole frame?
-    VECTOR zeroMVfieldShifted; // zero motion vector for fieldbased video at finest level pel2
-
     // Set for each block
     int nSrcPitch_temp[3];
     uint8_t *pSrc_temp[3] = {}; //for easy WRITE access to temp block
@@ -200,12 +197,12 @@ private:
     void DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
         int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, bool chroma,
         SearchType st, int stp, int64_t lambda, int pnew,
-        int fieldShift, int64_t thSAD, bool smooth, bool meander, bool useSatd);
+        int64_t thSAD, bool smooth, bool meander, bool useSatd);
 
     template <int nLogPel, typename PixelType>
     void DoSearchMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
         SearchType st, int stp, int64_t lambda, int64_t lsad, int pnew,
-        int plevel, VECTOR *globalMVec, int fieldShift,
+        int plevel, VECTOR *globalMVec,
         int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, bool tryMany, bool chroma) noexcept;
 
     bool IsVectorOK(int vx, int vy) const noexcept;
@@ -217,13 +214,13 @@ private:
 public:
     void SearchMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
         SearchType st, int stp, int64_t lambda, int64_t lsad, int pnew,
-        int plevel, VECTOR *globalMVec, int fieldShift, bool useSatd,
+        int plevel, VECTOR *globalMVec, bool useSatd,
         int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, bool tryMany, bool chroma, int bytesPerSample);
 
     void RecalculateMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
         int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, bool chroma,
         SearchType st, int stp, int64_t lambda, int pnew,
-        int fieldShift, int64_t thSAD, bool useSatd, bool smooth, bool meander, int bytesPerSample);
+        int64_t thSAD, bool useSatd, bool smooth, bool meander, int bytesPerSample);
 
     void EstimateGlobalMVDoubled(VECTOR &globalMVec) const noexcept;
     void InterpolatePredictorsFromParent(const MotionBlockLevel &parentLevel) noexcept;
@@ -309,7 +306,7 @@ public:
 
     void SearchMVs(const FramePyramid &pSrcGOF, const FramePyramid &pRefGOF,
         SearchType searchType, int nSearchParam, int nPelSearch, int64_t nLambda,
-        int64_t lsad, int pnew, int plevel, bool global, int fieldShift, bool useSatd,
+        int64_t lsad, int pnew, int plevel, bool global, bool useSatd,
         int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, TryManyLevels tryMany,
         bool chroma);
 
@@ -318,7 +315,7 @@ public:
     void RecalculateMVs(const FramePyramid &pSrcGOF, const FramePyramid &pRefGOF,
         int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, bool chroma,
         SearchType searchType, int nSearchParam, int64_t nLambda, int pnew,
-        int fieldShift, int64_t thSAD, bool useSatd, bool smooth, bool meander, int deltaFrame);
+        int64_t thSAD, bool useSatd, bool smooth, bool meander, int deltaFrame);
 
     [[nodiscard]] bool IsUsable(int64_t thscd1, float thscd2) const noexcept;
     [[nodiscard]] BlockData GetBlock(int nBlk) const noexcept;
@@ -340,5 +337,5 @@ public:
     template<typename PixelType>
     [[nodiscard]] std::unique_ptr<BlockMask<PixelType>> MakeVectorOcclusionMask(float dMaskNormDivider, float fGamma, int time256, bool force8bitRange) const noexcept;
 
-    [[nodiscard]] std::unique_ptr<SmallVectorMasks> MakeSmallVectorMasks(int fieldOffset = 0) const noexcept;
+    [[nodiscard]] std::unique_ptr<SmallVectorMasks> MakeSmallVectorMasks() const noexcept;
 };

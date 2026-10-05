@@ -7,6 +7,7 @@
 #include <cmath>
 #include "Common.h"
 
+static constexpr VECTOR zeroMVCandidate = { 0, 0, 0 };
 
 ///////////////////////////////////
 
@@ -337,14 +338,14 @@ void MotionBlockLevel::CheckMV_Slow(int vx, int vy, int64_t cost, int *dir, int 
 
 /* check if the vector (vx, vy) is better than the best vector found so far without penalty new - renamed in v.2.11*/
 template <int nLogPel, typename PixelType>
-void MotionBlockLevel::CheckMV0(int vx, int vy) noexcept { //here the chance for default values are high especially for zeroMVfieldShifted (on left/top border)
+void MotionBlockLevel::CheckMV0(int vx, int vy) noexcept { //here the chance for default values are high especially for zeroMVCandidate (on left/top border)
     CheckMV_Template<nLogPel, CHECKMV_UPDATEBESTMV, PixelType>(vx, vy, 0, 0);
 }
 
 
 /* check if the vector (vx, vy) is better than the best vector found so far */
 template <int nLogPel, typename PixelType>
-void MotionBlockLevel::CheckMV(int vx, int vy) noexcept { //here the chance for default values are high especially for zeroMVfieldShifted (on left/top border)
+void MotionBlockLevel::CheckMV(int vx, int vy) noexcept { //here the chance for default values are high especially for zeroMVCandidate (on left/top border)
     CheckMV_Template<nLogPel, CHECKMV_PENALTYNEW | CHECKMV_UPDATEBESTMV, PixelType>(vx, vy, 0, 0);
 }
 
@@ -420,13 +421,13 @@ void MotionBlockLevel::FetchPredictors(int blkidx, int blkx, int blky, int blkSc
     if ((blkScanDir == 1 && blkx > 0) || (blkScanDir == -1 && blkx < nBlkX - 1))
         predictors[1] = ClipMV(vectors[blkidx - blkScanDir]);
     else
-        predictors[1] = ClipMV(zeroMVfieldShifted); // v1.11.1 - values instead of pointer
+        predictors[1] = ClipMV(zeroMVCandidate); // v1.11.1 - values instead of pointer
 
     // Up predictor
     if (blky > 0)
         predictors[2] = ClipMV(vectors[blkidx - nBlkX]);
     else
-        predictors[2] = ClipMV(zeroMVfieldShifted);
+        predictors[2] = ClipMV(zeroMVCandidate);
 
     // bottom-right pridictor (from coarse level)
     if ((blky < nBlkY - 1) && ((blkScanDir == 1 && blkx < nBlkX - 1) || (blkScanDir == -1 && blkx > 0)))
@@ -436,7 +437,7 @@ void MotionBlockLevel::FetchPredictors(int blkidx, int blkx, int blky, int blkSc
         if ((blky > 0) && ((blkScanDir == 1 && blkx < nBlkX - 1) || (blkScanDir == -1 && blkx > 0)))
             predictors[3] = ClipMV(vectors[blkidx - nBlkX + blkScanDir]);
         else
-            predictors[3] = ClipMV(zeroMVfieldShifted);
+            predictors[3] = ClipMV(zeroMVCandidate);
 
     // Median predictor
     if (blky > 0) {
@@ -772,8 +773,8 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
 
     // We treat zero alone
     // Do we bias zero with not taking into account distorsion ?
-    bestMV.x = zeroMVfieldShifted.x;
-    bestMV.y = zeroMVfieldShifted.y;
+    bestMV.x = zeroMVCandidate.x;
+    bestMV.y = zeroMVCandidate.y;
 
     auto rawSad = [&](int mvx, int mvy) noexcept -> int64_t {
         int64_t s = SAD(pSrc_temp[0], nSrcPitch_temp[0], GetRefBlock<nLogPel, PixelType>(mvx, mvy), nRefPitch[0]);
@@ -785,7 +786,7 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
     };
 
     // Zero vector
-    int64_t sadZero = rawSad(zeroMVfieldShifted.x, zeroMVfieldShifted.y);
+    int64_t sadZero = rawSad(zeroMVCandidate.x, zeroMVCandidate.y);
     bestMV.sad = sadZero;
     nMinCost = sadZero + ((penaltyZero * sadZero) >> 8); // v.1.11.0.2
 
@@ -801,7 +802,7 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
 
     // Global MV predictor (reuse zero's SAD if it clips to the same position)
     globalMVPredictor = ClipMV(globalMVPredictor);
-    int64_t sadGlobal = (globalMVPredictor.x == zeroMVfieldShifted.x && globalMVPredictor.y == zeroMVfieldShifted.y)
+    int64_t sadGlobal = (globalMVPredictor.x == zeroMVCandidate.x && globalMVPredictor.y == zeroMVCandidate.y)
         ? sadZero
         : rawSad(globalMVPredictor.x, globalMVPredictor.y);
     int64_t cost = sadGlobal + ((pglobal * sadGlobal) >> 8);
@@ -822,7 +823,7 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
     VECTOR predictors[4]; /* set of predictors for the current block */
     FetchPredictors(blkIdx, blkx, blky, blkScanDir, predictors);
     // Median/parent predictor (reuse zero's or global's SAD when it coincides with either)
-    int64_t sadPred = (predictor.x == zeroMVfieldShifted.x && predictor.y == zeroMVfieldShifted.y) ? sadZero
+    int64_t sadPred = (predictor.x == zeroMVCandidate.x && predictor.y == zeroMVCandidate.y) ? sadZero
         : (predictor.x == globalMVPredictor.x && predictor.y == globalMVPredictor.y) ? sadGlobal
         : rawSad(predictor.x, predictor.y);
     cost = sadPred;
@@ -844,7 +845,7 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
     int npred = 4;
 
     for (auto &p : predictors) {
-        if ((p.x == zeroMVfieldShifted.x && p.y == zeroMVfieldShifted.y) ||
+        if ((p.x == zeroMVCandidate.x && p.y == zeroMVCandidate.y) ||
             (p.x == globalMVPredictor.x && p.y == globalMVPredictor.y) ||
             (p.x == predictor.x && p.y == predictor.y))
             p.x = std::numeric_limits<int>::min();
@@ -921,14 +922,11 @@ void MotionBlockLevel::PseudoEPZSearch(int blkIdx, int blkx, int blky, int blkSc
 template <int nLogPel, typename PixelType>
 void MotionBlockLevel::DoSearchMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
     SearchType st, int stp, int64_t lambda, int64_t lsad, int pnew,
-    int plevel, VECTOR *globalMVec, int fieldShift,
+    int plevel, VECTOR *globalMVec,
     int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, bool tryMany, bool chroma) noexcept {
 
-    zeroMVfieldShifted.x = 0;
-    zeroMVfieldShifted.y = fieldShift;
-    zeroMVfieldShifted.sad = 0;
     globalMVPredictor.x = (1 << nLogPel) * globalMVec->x; // v1.8.2
-    globalMVPredictor.y = (1 << nLogPel) * globalMVec->y + fieldShift;
+    globalMVPredictor.y = (1 << nLogPel) * globalMVec->y;
     globalMVPredictor.sad = globalMVec->sad;
     penaltyNew = pnew; // penalty for new vector
     LSAD = lsad;       // SAD limit for lambda using
@@ -1036,32 +1034,32 @@ void MotionBlockLevel::DoSearchMVs(const FramePyramidLevel &pSrcFrame, const Fra
 
 void MotionBlockLevel::SearchMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
     SearchType st, int stp, int64_t lambda, int64_t lsad, int pnew,
-    int plevel, VECTOR *globalMVec, int fieldShift, bool useSatd,
+    int plevel, VECTOR *globalMVec, bool useSatd,
     int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, bool tryMany, bool chroma, int bytesPerSample) {
 
     InitMotionEstimationFields(useSatd, chroma, bytesPerSample);
 
     if (bytesPerSample == 1) {
         if (nLogPel == 0)
-            DoSearchMVs<0, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<0, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else if (nLogPel == 1)
-            DoSearchMVs<1, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<1, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else
-            DoSearchMVs<2, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<2, uint8_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
     } else if (bytesPerSample == 2) {
         if (nLogPel == 0)
-            DoSearchMVs<0, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<0, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else if (nLogPel == 1)
-            DoSearchMVs<1, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<1, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else
-            DoSearchMVs<2, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<2, uint16_t>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
     } else {
         if (nLogPel == 0)
-            DoSearchMVs<0, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<0, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else if (nLogPel == 1)
-            DoSearchMVs<1, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<1, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
         else
-            DoSearchMVs<2, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, fieldShift, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
+            DoSearchMVs<2, float>(pSrcFrame, pRefFrame, st, stp, lambda, lsad, pnew, plevel, globalMVec, pzero, pglobal, badSAD, badrange, meander, tryMany, chroma);
     }
 }
 
@@ -1081,14 +1079,8 @@ template <int nLogPel, typename PixelType>
 void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
     int nBlkSizeX_, int nBlkSizeY_, int nOverlapX_, int nOverlapY_, bool chroma_,
     SearchType st, int stp, int64_t lambda, int pnew,
-    int fieldShift, int64_t thSAD, bool smooth, bool meander, bool useSatd) {
-                                    
-    zeroMVfieldShifted.x = 0;
-    zeroMVfieldShifted.y = fieldShift;
-    zeroMVfieldShifted.sad = 0;
-    globalMVPredictor.x = 0;          
-    globalMVPredictor.y = fieldShift;
-    globalMVPredictor.sad = 9999999;
+    int64_t thSAD, bool smooth, bool meander, bool useSatd) {
+
     penaltyNew = pnew;
 
     int nBlkXold = nBlkX;
@@ -1336,32 +1328,32 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
 void MotionBlockLevel::RecalculateMVs(const FramePyramidLevel &pSrcFrame, const FramePyramidLevel &pRefFrame,
     int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, bool chroma,
     SearchType st, int stp, int64_t lambda, int pnew,
-    int fieldShift, int64_t thSAD, bool useSatd, bool smooth, bool meander, int bytesPerSample) {
+    int64_t thSAD, bool useSatd, bool smooth, bool meander, int bytesPerSample) {
 
     // The search runs at the super clip's pel, not the old vectors' (which DoRecalculateMVs rescales)
     const int nLogPel = ilog2(pSrcFrame.planes[0].nPel);
 
     if (bytesPerSample == 1) {
         if (nLogPel == 0)
-            DoRecalculateMVs<0, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<0, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else if (nLogPel == 1)
-            DoRecalculateMVs<1, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<1, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else
-            DoRecalculateMVs<2, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<2, uint8_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
     } else if (bytesPerSample == 2) {
         if (nLogPel == 0)
-            DoRecalculateMVs<0, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<0, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else if (nLogPel == 1)
-            DoRecalculateMVs<1, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<1, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else
-            DoRecalculateMVs<2, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<2, uint16_t>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
     } else {
         if (nLogPel == 0)
-            DoRecalculateMVs<0, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<0, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else if (nLogPel == 1)
-            DoRecalculateMVs<1, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<1, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
         else
-            DoRecalculateMVs<2, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, fieldShift, thSAD, smooth, meander, useSatd);
+            DoRecalculateMVs<2, float>(pSrcFrame, pRefFrame, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma, st, stp, lambda, pnew, thSAD, smooth, meander, useSatd);
     }
 }
 
@@ -1595,7 +1587,7 @@ MotionBlockPyramid::~MotionBlockPyramid() {
 
 void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyramid &pRefGOF,
     SearchType searchType, int nSearchParam, int nPelSearch, int64_t nLambda,
-    int64_t lsad, int pnew, int plevel, bool global, int fieldShift, bool useSatd,
+    int64_t lsad, int pnew, int plevel, bool global, bool useSatd,
     int pzero, int pglobal, int64_t badSAD, int badrange, bool meander, TryManyLevels tryMany,
     bool chroma) {
 
@@ -1611,8 +1603,6 @@ void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyram
     // IsCompatible doesn't compare level counts and GetLevel only asserts, so a spliced super clip could index past them
     if (pSrcGOF.nLevels < nLevelCount || pRefGOF.nLevels < nLevelCount)
         throw MotionBlockPyramidError("the super clip frames have different level counts, every frame must be made with the same Super arguments");
-
-    int fieldShiftCur = (nLevelCount - 1 == 0) ? fieldShift : 0; // may be non zero for finest level only
 
     VECTOR globalMV = zeroMV; // create and init global motion vector as zero
 
@@ -1632,7 +1622,7 @@ void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyram
         pSrcGOF.GetLevel(nLevelCount - 1),
         pRefGOF.GetLevel(nLevelCount - 1),
         searchTypeSmallest, nSearchParamSmallest, nLambda, lsad, pnew, plevel,
-        &globalMV, fieldShiftCur, useSatd,
+        &globalMV, useSatd,
         pzero, pglobal, badSAD, badrange, meander, tryManyLevel(nLevelCount == 1), chroma, bytesPerSample);
     // Refining the search until we reach the highest detail interpolation.
 
@@ -1643,10 +1633,9 @@ void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyram
             pyramidLevels[i + 1].EstimateGlobalMVDoubled(globalMV); // get updated global MV (doubled)
         }
         pyramidLevels[i].InterpolatePredictorsFromParent(pyramidLevels[i + 1]);
-        fieldShiftCur = (i == 0) ? fieldShift : 0; // may be non zero for finest level only
         pyramidLevels[i].SearchMVs(pSrcGOF.GetLevel(i), pRefGOF.GetLevel(i),
             searchTypeLevel, nSearchParamLevel, nLambda, lsad, pnew, plevel,
-            &globalMV, fieldShiftCur, useSatd,
+            &globalMV, useSatd,
             pzero, pglobal, badSAD, badrange, meander, tryManyLevel(i == 0), chroma, bytesPerSample);
     }
 
@@ -1657,7 +1646,7 @@ void MotionBlockPyramid::SearchMVs(const FramePyramid &pSrcGOF, const FramePyram
 void MotionBlockPyramid::RecalculateMVs(const FramePyramid &pSrcGOF, const FramePyramid &pRefGOF,
     int nBlkSizeX, int nBlkSizeY, int nOverlapX, int nOverlapY, bool chroma,
     SearchType searchType, int nSearchParam, int64_t nLambda, int pnew,
-    int fieldShift, int64_t thSAD, bool useSatd, bool smooth, bool meander, int deltaFrame) {
+    int64_t thSAD, bool useSatd, bool smooth, bool meander, int deltaFrame) {
 
     if (!IsCompatibleForRecalc(pSrcGOF) || !IsCompatibleForRecalc(pRefGOF))
         throw MotionBlockPyramidError("Incompatible frame format for motion vector recalculation, bitdepth must match");
@@ -1682,7 +1671,7 @@ void MotionBlockPyramid::RecalculateMVs(const FramePyramid &pSrcGOF, const Frame
     pyramidLevels[0].RecalculateMVs(pSrcGOF.GetLevel(0), pRefGOF.GetLevel(0),
         nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, chroma,
         searchType, nSearchParam, nLambda, pnew,
-        fieldShift, thSAD, useSatd, smooth, meander, bytesPerSample);
+        thSAD, useSatd, smooth, meander, bytesPerSample);
 
     // Update from level 0 plane properties afterwards for proper export
     this->nBlkSizeX = pyramidLevels[0].nBlkSizeX;
@@ -1983,7 +1972,7 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeVectorOcclusionMas
     return RetMask;
 }
 
-std::unique_ptr<SmallVectorMasks> MotionBlockPyramid::MakeSmallVectorMasks(int fieldOffset) const noexcept {
+std::unique_ptr<SmallVectorMasks> MotionBlockPyramid::MakeSmallVectorMasks() const noexcept {
     std::unique_ptr<SmallVectorMasks> masks = std::make_unique<SmallVectorMasks>(nBlkX, nBlkY);
     ptrdiff_t pitchVSmallY = masks->pitchVSmallY / sizeof(uint16_t);
 
@@ -1997,7 +1986,7 @@ std::unique_ptr<SmallVectorMasks> MotionBlockPyramid::MakeSmallVectorMasks(int f
             // fit the biased range clamps to the farthest representable offset instead of wrapping to a
             // bogus (possibly out-of-bounds) one on large frames / high pel.
             masks->VXSmallY[bx + by * pitchVSmallY] = static_cast<uint16_t>(std::clamp(vx + (1 << 15), 0, 0xFFFF));
-            masks->VYSmallY[bx + by * pitchVSmallY] = static_cast<uint16_t>(std::clamp(vy + (1 << 15) + fieldOffset, 0, 0xFFFF));
+            masks->VYSmallY[bx + by * pitchVSmallY] = static_cast<uint16_t>(std::clamp(vy + (1 << 15), 0, 0xFFFF));
         }
     }
 

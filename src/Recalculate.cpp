@@ -24,7 +24,6 @@ struct RecalculateData {
 
     SearchType searchType;
 
-    int nPel;
     int pnew;  
     bool meander;
 
@@ -34,10 +33,6 @@ struct RecalculateData {
     bool chroma;
     bool smooth;
     int64_t thSAD;
-
-    bool fields;
-    bool tff;
-    bool tff_exists;
 
     std::string prefix;
     AnalysisGeometry geometry;
@@ -74,22 +69,15 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
             const VSFrame *src = vsapi->getFrameFilter(n, d->super, frameCtx);
             FramePyramid pSrcGOF(src, 1, d->prefix, vsapi, d->superGeometry);
 
-            bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, d->fields, vsapi);
-
             MotionBlockPyramid fgop(vsapi->getFrameFilter(n, d->vectors, frameCtx), hasRef, d->prefix, vsapi, d->geometry);
 
             std::optional<FramePyramid> pRefGOF;
-            int fieldShift = 0;
-            if (hasRef) {
-                const VSFrame *ref = vsapi->getFrameFilter(nref, d->super, frameCtx);
-                pRefGOF.emplace(ref, 1, d->prefix, vsapi, d->superGeometry);
-                if (d->fields && d->nPel > 1 && (d->deltaFrame % 2))
-                    fieldShift = ComputeFieldShift(src_top_field, GetTopField(ref, nref, d->tff_exists, d->tff, d->fields, vsapi), d->nPel);
-            }
+            if (hasRef)
+                pRefGOF.emplace(vsapi->getFrameFilter(nref, d->super, frameCtx), 1, d->prefix, vsapi, d->superGeometry);
 
             // without a reference the old vectors weren't loaded, and recalculating only the metadata never reads it
             fgop.RecalculateMVs(pSrcGOF, pRefGOF ? *pRefGOF : pSrcGOF, d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->chroma,
-                d->searchType, d->searchparam, d->nLambda, d->pnew, fieldShift, d->thSAD, d->useSatd, d->smooth, d->meander, d->deltaFrame);
+                d->searchType, d->searchparam, d->nLambda, d->pnew, d->thSAD, d->useSatd, d->smooth, d->meander, d->deltaFrame);
 
             VSFrame *dst = vsapi->copyFrame(src, core);
             fgop.ExportFrameData(dst, d->prefix, vsapi);
@@ -167,11 +155,6 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         if (err)
             d->meander = true;
 
-        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
-        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-        d->tff_exists = !err;
-
         if (d->searchType != SearchType::Logarithmic && d->searchType != SearchType::Exhaustive && d->searchType != SearchType::Hex2 && d->searchType != SearchType::UnevenMultiHexagon && d->searchType != SearchType::Horizontal && d->searchType != SearchType::Vertical)
             throw std::runtime_error("search must be between 0 and 5");
 
@@ -186,10 +169,6 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         d->deltaFrame = vectors.nDeltaFrame;
         d->geometry = vectors.Geometry();
 
-        // The recalculated vectors take the super clip's pel (the old ones are rescaled to it)
-        if (d->fields && super.nPel < 2)
-            throw std::runtime_error("fields option requires pel > 1");
-
         int pixelMax = (1 << std::min(16, d->vi->format.bitsPerSample)) - 1; // float SAD uses the 16-bit scale
         d->thSAD = (int64_t)((double)d->thSAD * pixelMax / 255.0 + 0.5);
         d->nLambda = (int64_t)((double)d->nLambda * pixelMax / 255.0 + 0.5);
@@ -198,8 +177,6 @@ static void recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         d->thSAD = d->thSAD * (d->nBlkSizeX * d->nBlkSizeY) / referenceBlockSize;
         if (d->chroma)
             d->thSAD += d->thSAD / (super.xRatioUV * super.yRatioUV) * 2;
-
-        d->nPel = super.nPel;
 
         if (!vectors.IsCompatibleForRecalc(super))
             throw std::runtime_error("wrong source or super clip frame size");
@@ -256,8 +233,6 @@ void recalculateRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "pnew:int:opt;"
                  "overlap:int[]:opt;"
                  "meander:int:opt;"
-                 "fields:int:opt;"
-                 "tff:int:opt;"
                  "satd:int:opt;"
                  "prefix:data:opt;",
                  "clip:vnode[];",

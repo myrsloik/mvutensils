@@ -45,10 +45,6 @@ struct AnalyseData {
     int levels;
     bool chroma;
 
-    bool fields;
-    bool tff;
-    bool tff_exists;
-
     std::string prefix;
     SuperGeometry superGeometry;
 
@@ -79,21 +75,13 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
             const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
             FramePyramid srcFramePyramid(src, -1, d->prefix, vsapi, d->superGeometry);
 
-            bool src_top_field = GetTopField(src, n, d->tff_exists, d->tff, d->fields, vsapi);
-
             MotionBlockPyramid vectorFields(srcFramePyramid, d->nBlkSizeX, d->nBlkSizeY, d->nOverlapX, d->nOverlapY, d->levels, d->chroma, d->deltaFrame);
 
             if (nref >= 0 && nref < d->vi->numFrames) {
                 const VSFrame *ref = vsapi->getFrameFilter(nref, d->node, frameCtx);
                 FramePyramid refFramePyramid(ref, -1, d->prefix, vsapi, d->superGeometry);
 
-                bool ref_top_field = GetTopField(ref, nref, d->tff_exists, d->tff, d->fields, vsapi);
-
-                int fieldShift = 0;
-                if (d->fields && srcFramePyramid.nPel > 1 && (d->deltaFrame % 2))
-                    fieldShift = ComputeFieldShift(src_top_field, ref_top_field, srcFramePyramid.nPel);
-
-                vectorFields.SearchMVs(srcFramePyramid, refFramePyramid, d->searchType, d->nSearchParam, d->nPelSearch, d->nLambda, d->lsad, d->pnew, d->plevel, d->global, fieldShift, d->useSatd, d->pzero, d->pglobal, d->badSAD, d->badrange, d->meander, d->tryMany, d->chroma);
+                vectorFields.SearchMVs(srcFramePyramid, refFramePyramid, d->searchType, d->nSearchParam, d->nPelSearch, d->nLambda, d->lsad, d->pnew, d->plevel, d->global, d->useSatd, d->pzero, d->pglobal, d->badSAD, d->badrange, d->meander, d->tryMany, d->chroma);
             }
 
             VSFrame *dst = vsapi->copyFrame(src, core);
@@ -207,11 +195,6 @@ static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
         d->tryMany = static_cast<TryManyLevels>(vsapi->mapGetIntSaturated(in, "trymany", 0, &err));
         if (d->tryMany != TryManyLevels::None && d->tryMany != TryManyLevels::All && d->tryMany != TryManyLevels::AllExceptFinest)
             throw std::runtime_error("trymany must be between 0 and 2");
-
-        d->fields = !!vsapi->mapGetInt(in, "fields", 0, &err);
-
-        d->tff = !!vsapi->mapGetInt(in, "tff", 0, &err);
-        d->tff_exists = !err;
 
         if (d->searchType != SearchType::Logarithmic && d->searchType != SearchType::Exhaustive && d->searchType != SearchType::Hex2 && d->searchType != SearchType::UnevenMultiHexagon && d->searchType != SearchType::Horizontal && d->searchType != SearchType::Vertical)
             throw std::runtime_error("search must be between 0 and 5");
@@ -332,8 +315,6 @@ void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "badrange:int:opt;"
                  "meander:int:opt;"
                  "trymany:int:opt;"
-                 "fields:int:opt;"
-                 "tff:int:opt;"
                  "satd:int:opt;"
                  "prefix:data:opt;",
                  "clip:vnode;",
@@ -359,8 +340,6 @@ void analyseRegister(VSPlugin *plugin, const VSPLUGINAPI *vspapi) noexcept {
                  "badrange:int:opt;"
                  "meander:int:opt;"
                  "trymany:int:opt;"
-                 "fields:int:opt;"
-                 "tff:int:opt;"
                  "satd:int:opt;"
                  "radius:int:opt;"
                  "prefix:data:opt;",

@@ -568,7 +568,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
 
         d->superGeometry = super.Geometry();
 
-        int64_t thsadRaw[3], thsad2Raw[3];
+        int thsadRaw[3], thsad2Raw[3]; // read saturated, so the scaling below stays in int64 for the range check
         GetHVPairArgument(thsadRaw[0], thsadRaw[1], "thsad", 400, 400, in, vsapi);
         thsadRaw[2] = thsadRaw[1];
         GetHVPairArgument(thsad2Raw[0], thsad2Raw[1], "thsad2", thsadRaw[0], thsadRaw[1], in, vsapi);
