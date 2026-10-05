@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -152,8 +153,8 @@ uint SrcSample(int c, int x, int y) {
 // holds (kKeep; with kSatd luma's tiles', kKeepT)
 int gX, gY, gXc, gYc;
 
-// Float supers: mvu's float SADs, its float operations in its order (sadf_common.glsl), every lane
-// measuring the whole block alike; the samples read as they are, the quarter ones as mvu.Super's float
+// Float supers: mvu's float SADs, its float operations in its order (sadf_common.glsl), spread over the
+// subgroup (SadParF, SatdParF); the samples read as they are, the quarter ones as mvu.Super's float
 // quarter planes hold them, (a + b) * 0.5 of two vertical averages. gSadV is the vector measured.
 ivec2 gSadV;
 
@@ -206,6 +207,110 @@ uint gSrcY[kKeep ? kLumaPer : 1], gSrcU[kKeep ? kChromaPer : 1], gSrcV[kKeep ? k
 uint gSrcT[kSatd ? (kKeepT ? 16 * kTilesPer : 1) : 1];
 int gLane;
 
+// sadf_common.glsl's SadRawF, the raw float SAD of plane p's w x h block, spread over the subgroup and the
+// same in every lane, which must all call it: the searches inline it wherever they check a vector, so it
+// has to be small, and a lane measuring the whole block would leave the others idle. Blocks 8 or more
+// wide: each lane takes whole chains of mvu's additions, the accumulator of the rows k modulo 4 of mvu's
+// lane l (chain k L + l), the lanes then gather (a0 + a1) + (a2 + a3) in lane l, and halve as mvu's do.
+// Blocks 4 or 2 wide: lane 8x + i takes row ColumnRow(i) of column x, and the lanes pair up as the rows
+// and columns do.
+float SadParF(int p, int w, int h) {
+    if (w <= 4) {
+        int x = gLane >> 3, i = gLane & 7;
+        float v = x < w && i < h ? AbsDiffF(p, x, ColumnRow(i, h)) : 0.0;
+        for (int n = 1; n < h; n <<= 1) {
+            precise float s = v + subgroupShuffleXor(v, uint(n));
+            v = s;
+        }
+        if (w == 2) {
+            precise float s = v + subgroupShuffleXor(v, 8u);
+            v = s;
+        } else {
+            precise float s = v + subgroupShuffleXor(v, 16u);
+            precise float t = s + subgroupShuffleXor(s, 8u);
+            v = t;
+        }
+        return subgroupShuffle(v, 0u);
+    }
+    int L = w == 8 ? 8 : 16, K = h < 4 ? 1 : 4, chains = L * K;
+    float a[2] = float[2](0.0, 0.0);
+    for (int m = 0; m * kSubgroup < chains; ++m) {
+        int c = gLane + m * kSubgroup;
+        precise float s = 0.0;
+        if (c < chains) {
+            int l = c % L, k = c / L;
+            [[dont_unroll]] for (int y = k; y < h; y += K)
+                for (int x = l; x < w; x += L)
+                    s += AbsDiffF(p, x, y);
+        }
+        a[m] = s;
+    }
+    float ak[4];
+    for (int k = 0; k < K; ++k) {
+        int c = k * L + gLane % L;
+        float v0 = subgroupShuffle(a[0], uint(c % kSubgroup)), v1 = subgroupShuffle(a[1], uint(c % kSubgroup));
+        ak[k] = c < kSubgroup ? v0 : v1;
+    }
+    precise float t = ak[0];
+    if (K == 4) {
+        precise float s01 = ak[0] + ak[1];
+        precise float s23 = ak[2] + ak[3];
+        t = s01 + s23;
+    }
+    for (int n = L >> 1; n >= 1; n >>= 1) {
+        precise float s = t + subgroupShuffleXor(t, uint(n));
+        t = s;
+    }
+    return subgroupShuffle(t, 0u);
+}
+
+// sadf_common.glsl's SatdRawF, the raw float SATD of luma's w x h block, likewise: a row of tiles at a
+// time, lane tx transforming tile tx (TileF); up to 8 wide the tiles' sums (T4F) added in order, wider
+// lane m folding tiles m, m + 4, ... into its running sum as T16F does, from each tile's partial sums
+// P1 .. P6: acc = P6 + (P5 + (P4 + (P3 + (P2 + (P1 + acc))))), lane 0's from the rows before
+float SatdParF(int w, int h) {
+    int nt = w / 4; // tiles in a row, at most 32
+    precise float total = 0.0;
+    [[dont_unroll]] for (int ty = 0; ty < h / 4; ++ty) {
+        float c[16];
+        for (int i = 0; i < 16; ++i)
+            c[i] = 0.0;
+        if (gLane < nt)
+            TileF(gLane, ty, c);
+        if (w <= 8) {
+            float t4 = T4F(c);
+            for (int tx = 0; tx < nt; ++tx) {
+                precise float s = total + subgroupShuffle(t4, uint(tx));
+                total = s;
+            }
+        } else {
+            precise float p2 = c[2] + c[0];
+            precise float q3 = c[5] + c[3];
+            precise float p3 = c[4] + q3;
+            precise float q4 = c[6] + c[7];
+            precise float r4 = c[9] + q4;
+            precise float p4 = c[8] + r4;
+            precise float q5 = c[10] + c[11];
+            precise float r5 = c[13] + q5;
+            precise float s5 = c[12] + r5;
+            precise float p5 = c[14] + s5;
+            float part[6] = float[6](c[1], p2, p3, p4, p5, c[15]);
+            precise float acc = gLane == 0 ? total : 0.0;
+            for (int j = 0; j < nt / 4; ++j) {
+                uint src = uint(4 * j + (gLane & 3));
+                for (int k = 0; k < 6; ++k) {
+                    precise float s = subgroupShuffle(part[k], src) + acc;
+                    acc = s;
+                }
+            }
+            precise float a = subgroupShuffle(acc, 0u) + subgroupShuffle(acc, 2u);
+            precise float b = subgroupShuffle(acc, 1u) + subgroupShuffle(acc, 3u);
+            total = a + b;
+        }
+    }
+    return total;
+}
+
 uint AbsDiff(uint a, uint b) {
     return a > b ? a - b : b - a;
 }
@@ -246,8 +351,11 @@ u64vec2 Sads(int vx, int vy) {
     if (kFloat) {
         // luma's SAD or SATD, and U's and V's added, each plane's scaled alone, as mvu adds them
         gSadV = ivec2(vx, vy);
-        uint64_t c = kChromaSad ? uint64_t(SadF(1, kBlkCX, kBlkCY)) + uint64_t(SadF(2, kBlkCX, kBlkCY)) : 0ul;
-        return u64vec2(uint64_t(kSatd ? SatdF(kBlkX, kBlkY) : SadF(0, kBlkX, kBlkY)), c);
+        uint64_t c = 0ul;
+        if (kChromaSad)
+            c = uint64_t(ScaledF(SadParF(1, kBlkCX, kBlkCY), 65535.0)) + uint64_t(ScaledF(SadParF(2, kBlkCX, kBlkCY), 65535.0));
+        uint l = kSatd ? ScaledF(SatdParF(kBlkX, kBlkY), 32767.5) : ScaledF(SadParF(0, kBlkX, kBlkY), 65535.0);
+        return u64vec2(uint64_t(l), c);
     }
     uint sl = 0u, sc = 0u;
     int X0 = gX * kPel + vx, Y0 = gY * kPel + vy;
