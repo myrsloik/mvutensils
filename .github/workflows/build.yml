@@ -22,19 +22,19 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    # The plugin needs the Vulkan 1.4 headers and nothing else; the build images' packages are older
+    - uses: actions/checkout@v6
+      with:
+        repository: KhronosGroup/Vulkan-Headers
+        ref: vulkan-sdk-1.4.357.0
+        path: vulkan-headers
+
     - uses: pypa/cibuildwheel@v3.4.0
       env:
         CIBW_BUILD: cp314-*
         CIBW_BUILD_FRONTEND: uv
+        CIBW_CONFIG_SETTINGS: setup-args=-Dvulkan_include=vulkan-headers/include
         CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=15
-        CIBW_BEFORE_ALL_LINUX: >
-          if command -v dnf >/dev/null 2>&1; then
-            dnf -y install fftw-devel
-          else
-            apk add --no-cache fftw-dev
-          fi
-        CIBW_BEFORE_ALL_MACOS: >
-          brew install fftw
       with:
         output-dir: dist
         extras: uv
@@ -45,7 +45,7 @@ jobs:
 
     - uses: actions/upload-artifact@v7
       with:
-        name: mvutensils-${{ matrix.arch }}
+        name: mvgputensils-${{ matrix.arch }}
         path: dist
 
   build-windows-wheel:
@@ -63,12 +63,12 @@ jobs:
         msystem: CLANG64
         update: true
         install: >-
-          mingw-w64-clang-x86_64-fftw
           mingw-w64-clang-x86_64-git
           mingw-w64-clang-x86_64-ninja
           mingw-w64-clang-x86_64-python-wheel
           mingw-w64-clang-x86_64-toolchain
           mingw-w64-clang-x86_64-uv
+          mingw-w64-clang-x86_64-vulkan-headers
 
     - name: Build
       run: |
@@ -85,12 +85,12 @@ jobs:
 
     - uses: actions/upload-artifact@v7
       with:
-        name: mvutensils-sdist
+        name: mvgputensils-sdist
         path: dist/*.tar.gz
 
     - uses: actions/upload-artifact@v7
       with:
-        name: mvutensils-win_amd64
+        name: mvgputensils-win_amd64
         path: dist/*.whl
 
   publish:
