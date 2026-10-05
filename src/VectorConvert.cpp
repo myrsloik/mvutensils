@@ -164,7 +164,7 @@ static const VSFrame *VS_CC toMVUGetFrame(int n, int activationReason, void *ins
                     const size_t i = static_cast<size_t>(y * nbx + x);
                     packed[i] = std::bit_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(row[4 * x])) |
                                                        static_cast<uint64_t>(static_cast<uint32_t>(row[4 * x + 1])) << 32);
-                    sads[i] = row[4 * x + 2];
+                    sads[i] = static_cast<uint32_t>(row[4 * x + 2]); // unsigned, as mvu's SADs are
                 }
             }
             vsapi->mapSetIntArray(out, vectorsKey.c_str(), packed.data(), static_cast<int>(blocks));
@@ -324,7 +324,7 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
 
         // The records, each vector checked as mvu checks the vectors it loads (ValidateVectors): every
         // block read at its vector stays inside the padded planes, and the SADs aren't negative, nor
-        // too large for the records' 32 bits
+        // too large for the records' unsigned 32 bits
         const int64_t *vectors = vsapi->mapGetIntArray(props, vectorsKey.c_str(), nullptr);
         const int64_t *sads = vsapi->mapGetIntArray(props, sadKey.c_str(), nullptr);
         const ptrdiff_t stride = vsapi->getStride(dst, 0);
@@ -343,11 +343,11 @@ static const VSFrame *VS_CC fromMVUGetFrame(int n, int activationReason, void *i
                 const int32_t vy = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(vectors[i]) >> 32));
                 if (vx < dxMin || vx >= dxMax || vy < dyMin || vy >= dyMax)
                     return fail("the vector of block (" + std::to_string(bx) + ", " + std::to_string(by) + ") would read outside the padded frame");
-                if (sads[i] < 0 || sads[i] > std::numeric_limits<int32_t>::max())
+                if (sads[i] < 0 || sads[i] > std::numeric_limits<uint32_t>::max())
                     return fail("the SAD of block (" + std::to_string(bx) + ", " + std::to_string(by) + ") is negative or doesn't fit 32 bits");
                 row[4 * bx] = vx;
                 row[4 * bx + 1] = vy;
-                row[4 * bx + 2] = static_cast<int32_t>(sads[i]);
+                row[4 * bx + 2] = static_cast<int32_t>(static_cast<uint32_t>(sads[i]));
                 row[4 * bx + 3] = 0;
             }
             std::memset(row + 4 * G.nbx, 0, static_cast<size_t>(stride) - 16 * static_cast<size_t>(G.nbx));

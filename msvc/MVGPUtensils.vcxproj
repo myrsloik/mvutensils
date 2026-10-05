@@ -154,6 +154,7 @@
     <None Include="..\src\shaders\refine_init.comp" />
     <None Include="..\src\shaders\refine_pass.comp" />
     <None Include="..\src\shaders\refine_qpel.comp" />
+    <None Include="..\src\shaders\sadf_common.glsl" />
     <None Include="..\src\shaders\seed_build.comp" />
     <None Include="..\src\shaders\seed_scatter.comp" />
     <None Include="..\src\shaders\super.comp" />

@@ -7,9 +7,9 @@ layout(local_size_x = 64) in;
 // The fallback's list of blocks (refine_flag.comp), emptied here for the field's fallback
 layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
 
-// Every seed of every block: its SAD, kept for the passes, and the lowest as the block's starting
-// vector, ties to the earlier seed, by one minimum over the group (the SAD in CandidateKey's cost
-// place). kGroupBlocks blocks per workgroup in a row, kGroupLanes lanes per block, lane i of each 8
+// Every seed of every block: its SAD, kept for the passes, and the seed of the lowest cost (its SAD
+// with its penalty, SeedPenalty) as the block's starting vector, ties to the earlier seed, by one
+// minimum over the group. kGroupBlocks blocks per workgroup in a row, kGroupLanes lanes per block, lane i of each 8
 // measuring seeds i, i + 8, ... (kSplit). Dispatched as ((nbx + kGroupBlocks - 1) / kGroupBlocks,
 // nby) workgroups.
 void main() {
@@ -31,13 +31,13 @@ void main() {
     int count = live ? seedCount[b] : 0;
     uint64_t mine = kNoKey;
     ivec2 myV = ivec2(0);
-    int myS = 0;
+    uint myS = 0u;
     for (int k = sub; k < count; k += 8) {
         ivec2 v = seeds[b * pc.maxSeeds + k];
-        int s = LaneSad(v);
+        uint s = LaneSad(v);
         if (gHalf == 0)
             seedSad[b * pc.maxSeeds + k] = s;
-        uint64_t key = CandidateKey(int64_t(s), k);
+        uint64_t key = CandidateKey(int64_t(s) + Penalty(s, SeedPenalty(k)), k);
         if (key < mine) {
             mine = key;
             myV = v;
@@ -47,10 +47,10 @@ void main() {
     uint64_t win = subgroupClusteredMin(mine, 8u);
     int owner = KeyLane(win);
     ivec2 best = ivec2(FromLane(myV.x, owner, 8), FromLane(myV.y, owner, 8));
-    int bestSad = FromLane(myS, owner, 8);
+    uint bestSad = uint(FromLane(int(myS), owner, 8));
     if (win == kNoKey) {
         best = ivec2(0);
-        bestSad = 0x7FFFFFFF;
+        bestSad = 0xFFFFFFFFu;
     }
     if (live && inGroup == 0) {
         vecA[b] = best;

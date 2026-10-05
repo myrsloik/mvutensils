@@ -18,6 +18,7 @@ library's in the last bits: --tolerance is the largest difference allowed.
                    [--vectors mvgpu] [--format YUV420P8] [--analyse8] [--crop 1914x1074] [--pel 2]
                    [--blksize 16] [--overlap 8] [--pad 16] [--delta 1] [--ml 100] [--gamma 1]
                    [--time 100] [--scval 0] [--thscd1 400] [--thscd2 51] [--tolerance 0]
+--extreme makes every other frame dark and the others bright first (mvtest.extreme), for SADs past 2^31.
 """
 import argparse
 import os
@@ -27,7 +28,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, grid_label, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
+from mvtest import eight_bit, extreme, format_clip, grid_label, nv12_clip, plane_pair, random_vectors, scene_limits  # noqa: E402
 
 MASKS = {'length': 'VectorLengthMask', 'sad': 'SADMask', 'occlusion': 'OcclusionMask'}
 SCD_PROPS = ('_SceneChangePrev', '_SceneChangeNext')
@@ -39,6 +40,7 @@ def main():
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, GRAYS, ...')
+    ap.add_argument('--extreme', action='store_true', help='every other frame dark, the others bright (mvtest.extreme)')
     ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--filter', choices=['all', 'length', 'sad', 'occlusion', 'scd'], default='all')
@@ -69,6 +71,8 @@ def main():
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
     clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
+    if args.extreme:
+        clip = extreme(core, clip)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)

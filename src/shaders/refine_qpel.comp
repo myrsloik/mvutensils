@@ -19,7 +19,9 @@ layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; 
 // are.
 // With kSplit 2 the lane measures every other row, and SadOf adds the other lane's; with kSatd luma's
 // SATD, every other band of 4 rows.
-int LaneSadQuarter(ivec2 v) {
+uint LaneSadQuarter(ivec2 v) {
+    if (kFloatS)
+        return LaneSadF(v, true);
     int cur = kNoCache ? 0 : gGroup * kBlockWords;
     uint sa = 0u, sm = 0u;
     int X = 4 * (gX + pc.pad) + v.x, Y = 4 * (gY + pc.padY) + v.y;
@@ -92,8 +94,8 @@ int LaneSadQuarter(ivec2 v) {
     return SadOf(sa, sm);
 }
 
-// pel 4: the 8 quarter-pel positions around each block's vector, against its neighbours as the
-// half-pel step left them: Analyse.cpp binds the half-pel step's field (B) as field A here. Like
+// pel 4: the 8 quarter-pel positions around each block's vector, pnew's penalty on their SADs, against
+// its neighbours as the half-pel step left them: Analyse.cpp binds the half-pel step's field (B) as field A here. Like
 // refine_halfpel.comp, kGroupBlocks blocks per workgroup in a row, lane i of each 8 of a block's
 // group measuring position i, the best by one minimum of CandidateKey over the group, anywhere in
 // the range ValidateVectors accepts; writes the output. Dispatched as
@@ -114,18 +116,18 @@ void main() {
     Context(b, p, lambda);
     ivec2 c0 = vecA[b];
     ivec2 best = c0;
-    int bestSad = sadA[b];
+    uint bestSad = sadA[b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
     ivec2 v = ClampVec(c0 + Around(sub, 1));
-    int s = live ? LaneSadQuarter(v) : 0;
-    uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
+    uint s = live ? LaneSadQuarter(v) : 0u;
+    uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda) + Penalty(s, PNew()), sub) : kNoKey, 8u);
     int owner = KeyLane(win);
     ivec2 wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
-    int ws = FromLane(s, owner, 8);
+    uint ws = uint(FromLane(int(s), owner, 8));
     if (win != kNoKey && KeyCost(win) < bestCost) {
         best = wv;
         bestSad = ws;
     }
     if (live && inGroup == 0)
-        outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
+        outRec[by * pc.recStride + bx] = ivec4(best, int(bestSad), 0);
 }

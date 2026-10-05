@@ -71,6 +71,7 @@ shader_sources = files(
     'src/shaders/refine_init.comp',
     'src/shaders/refine_pass.comp',
     'src/shaders/refine_qpel.comp',
+    'src/shaders/sadf_common.glsl',
     'src/shaders/seed_build.comp',
     'src/shaders/seed_scatter.comp',
     'src/shaders/super.comp',

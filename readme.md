@@ -27,9 +27,9 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
 * The other filters so far take Gray and YUV supers of every subsampling (4:2:0, 4:2:2, 4:4:0 and
   4:4:4) and 8 to 16-bit or float samples at any `pel` (1, 2 or 4) with every block size mvu takes
   (4×4 to 128×128), any overlap and padding, horizontal and vertical apart, MVUtensils' extended
-  grids included; but `Analyse` and `Recalculate` refuse the blocks whose SADs can pass 2^31:
-  128×128 blocks with 4:4:4 chroma at 16 bits or float, and with `satd`, whose SATD can reach twice
-  the SAD, 128×128 blocks with chroma of any subsampling at 16 bits or float.
+  grids included. A SAD is an unsigned 32-bit sum, as mvu's is: the largest blocks' pass 2^31
+  (128×128 with 4:4:4 chroma at 16 bits or float, or with `satd`), and every filter takes them as
+  mvu does.
   `Analyse` and `Recalculate` take a grid other than the super's, as in mvu, where it fits the
   super's block-aligned frame; the other filters take vectors of any such grid with the super's
   planes. As in mvu, vectors analysed
@@ -68,8 +68,18 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   transform added up, halved) wherever the full-size grid's vectors are measured, chroma's staying
   SADs, so the vectors and their SADs are chosen and scored as mvu's are; the coarse search, mvgpu's
   own, keeps the SAD. As in mvu, `satd` refuses 16×2 blocks.
-  `search`, `searchparam`, `pelsearch`, `levels`, `pnew`, `pzero`, `pglobal`, `globalmv`,
-  `meander` and `trymany` tune mvu's search; they are checked and otherwise ignored.
+  mvu's search arguments are taken as this search has room for them, with mvu's defaults: `levels`,
+  the pyramid levels searched, counted as mvu counts them (0 all, less than 0 all but that many),
+  mvgpu.Super's levels being the frame halved while at least 96 pixels wide, and the full-size grid;
+  `globalmv=False` leaves out the field's median, mvu's global vector, as a seed at every level;
+  `pzero`, `pglobal` and `pnew` are mvu's penalties in 256ths of the SAD, which a candidate's cost
+  takes on: `pzero` the zero seed's, `pglobal` the median's, `pnew` every position a search steps to
+  (the passes' positions around each block's winner, the top level's window but zero, the
+  fallback's, the sub-pel steps'), the predictors (the coarse vectors, the chained and inverted
+  ones, the neighbours', the block's own) none; `pelsearch` is the full-size passes' reach, the
+  positions within `pelsearch`/`pel` pixels around each block's winner (`pel`, mvu's default, the 8
+  one pixel around). `search`, `searchparam`, `meander` and `trymany` order mvu's search, one block
+  after another, which this one doesn't do; they are checked and otherwise ignored.
   The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
   mvu's `badsad=10000` (which it would almost never reach) and `badrange=24`.
 * `AnalyseMany` also seeds each field from the fields refined before it (chained and inverted

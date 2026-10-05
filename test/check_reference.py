@@ -11,6 +11,7 @@ compared: x, y and SAD of every block.
                        [--super-blksize 32 [16]] [--super-overlap 16 [8]] [--onelevel] [--stack 5]
                        [--radius 2] [--delta 1] [--standalone] [--chroma 0] [--plevel 2]
                        [--mvlambda 1000] [--lsad 400] [--badsad 1000] [--badrange 40] [--badstep 2]
+                       [--levels 0] [--globalmv 1] [--pnew 25] [--pzero 25] [--pglobal 0] [--pelsearch 2]
                        [--satd] [--crop WxH] [--work DIR]
 
 --format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a quarter
@@ -23,6 +24,9 @@ seeds, instead of AnalyseMany. --satd makes luma's SAD its SATD. --crop crops th
 grids that end inside a block.
 --work keeps the dumped frames and the reference's vectors in that directory instead of a
 temporary one.
+--extreme makes every other frame dark and the others bright first (mvtest.extreme), for SADs past 2^31;
+--overrange multiplies a float clip's frames by 32 and -32 by turns (mvtest.overrange), for float SADs past
+what integer samples make (the lambda tables' last entries), and past 2^32, saturated.
 """
 import argparse
 import os
@@ -34,7 +38,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import format_clip, nv12_clip  # noqa: E402
+from mvtest import extreme, format_clip, nv12_clip, overrange  # noqa: E402
 
 
 def load_fields(path):
@@ -65,6 +69,8 @@ def main():
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name, Gray or YUV at 8 to 16 bits or float: YUV420P8, YUV422P10, YUV444PS, ...')
+    ap.add_argument('--extreme', action='store_true', help='every other frame dark, the others bright (mvtest.extreme)')
+    ap.add_argument('--overrange', action='store_true', help="a float clip's frames multiplied by 32 and -32 by turns (mvtest.overrange)")
     ref = ap.add_mutually_exclusive_group(required=True)
     ref.add_argument('--reference', help='the reference executable, run with matching arguments')
     ref.add_argument('--ref', help='a vector file the reference wrote')
@@ -85,6 +91,8 @@ def main():
     ap.add_argument('--badrange', type=int, default=40)
     ap.add_argument('--badstep', type=int, default=2)
     ap.add_argument('--satd', action='store_true', help="luma's SAD is its SATD")
+    for k in ('levels', 'globalmv', 'pnew', 'pzero', 'pglobal', 'pelsearch'):
+        ap.add_argument('--' + k, type=int, help="mvu's, as mvgpu.Analyse takes it (its default when left out)")
     ap.add_argument('--crop', help='WxH: crop the frames to this size first')
     ap.add_argument('--onelevel', action='store_true', help='a super without the coarse levels')
     ap.add_argument('--stack', type=int, default=1, help='this many copies side by side, every other one mirrored')
@@ -99,6 +107,10 @@ def main():
         core.std.LoadPlugin(args.plugin)
     w, h = (int(v) for v in args.size.split('x'))
     clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
+    if args.extreme:
+        clip = extreme(core, clip)
+    if args.overrange:
+        clip = overrange(core, clip)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -108,6 +120,7 @@ def main():
 
     search = dict(chroma=args.chroma, plevel=args.plevel, mvlambda=args.mvlambda, lsad=args.lsad, badsad=args.badsad, badrange=args.badrange,
                   badstep=args.badstep)
+    search.update({k: getattr(args, k) for k in ('levels', 'globalmv', 'pnew', 'pzero', 'pglobal', 'pelsearch') if getattr(args, k) is not None})
     # (the reference takes it as a flag)
     extra = dict(satd=1) if args.satd else {}
     sb = args.super_blksize or args.blksize

@@ -16,9 +16,9 @@
 // the horizontal and vertical ones), which take the same candidates in the same order and keep the
 // first of equal costs, so the vectors are mvu's given the same supers and old vectors. The blocks
 // don't depend on each other: one subgroup takes a block, each lane a share of its pixels, every SAD
-// the subgroup's sum, so that all lanes follow the search together. Float supers are searched as the
-// 16-bit samples they stand for, as mvgpu.Analyse searches them (mvu sums float differences in an
-// order its CPU kernels decide). Dispatched as (nbx, nby) workgroups of one subgroup.
+// the subgroup's sum, so that all lanes follow the search together. Float supers take mvu's float
+// SADs, its float operations in the order its AVX-512 build takes them (sadf_common.glsl), every lane
+// measuring the whole block alike. Dispatched as (nbx, nby) workgroups of one subgroup.
 
 layout(local_size_x_id = 1) in;
 
@@ -43,13 +43,14 @@ const int kBlkCX = kBlkX >> kLogX, kBlkCY = kBlkY >> kLogY;
 const int kLumaPer = (kBlkX * kBlkY + kSubgroup - 1) / kSubgroup;  // luma pixels a lane holds
 const int kChromaPer = (kBlkCX * kBlkCY + kSubgroup - 1) / kSubgroup; // and of each chroma plane
 // Blocks with more than 32 pixels per lane (wider than 32x32) don't keep them in registers: Sads
-// reads them from the super each time
-const bool kKeep = kLumaPer <= 32;
+// reads them from the super each time; nor do float blocks, whose SADs read every sample as it is
+// (selects, as kImage)
+const bool kKeep = (kFloat ? 0 : (kLumaPer <= 32 ? 1 : 0)) != 0;
 // With kSatd the lanes take luma's 4x4 tiles, kTilesPer each, keeping their pixels where those are
 // 32 or fewer (kKeepT)
 const int kTilesX = kBlkX / 4, kTiles = kTilesX * (kBlkY / 4);
 const int kTilesPer = (kTiles + kSubgroup - 1) / kSubgroup;
-const bool kKeepT = kTilesPer <= 2;
+const bool kKeepT = (kFloat ? 0 : (kTilesPer <= 2 ? 1 : 0)) != 0;
 
 // Matches RecalcParams in VulkanContext.h
 layout(push_constant) uniform Params {
@@ -62,11 +63,12 @@ layout(push_constant) uniform Params {
     int smoothing;                              // interpolate the old vectors (smooth), else take the nearest
     int oldPelShift;                            // log2 of the super's pel less log2 of the old vectors'
     int stepY, blkOldY, stepOldY;               // the grids vertically: the new one's step, the old one's block and step
+    int thsadHi;                                // thsad's high 32 bits (Thsad)
 } pc;
 
 // The bindings: the supers' storage of the frame (src) and of its reference frame (ref), luma and
-// chroma, bytes, 16 bits each for 9 to 16-bit supers (kWide) or floats; the old vectors and the new
-// ones, a record (x, y, SAD, 0) per block
+// chroma, bytes, 16 bits each for 9 to 16-bit supers (kWide) or floats (read by SrcF and RefF); the old
+// vectors and the new ones, a record (x, y, SAD, 0) per block
 layout(std430, set = 0, binding = 0) readonly buffer SrcLuma { uint8_t srcY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer SrcChroma { uint8_t srcC[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma { uint8_t refY[]; };
@@ -82,26 +84,19 @@ layout(std430, set = 0, binding = 3) readonly buffer RefChromaF { float refCF[];
 layout(std430, set = 0, binding = 4) readonly buffer OldVectors { ivec4 oldRec[]; };
 layout(std430, set = 0, binding = 5) writeonly buffer NewVectors { ivec4 outRec[]; };
 
-// A float sample as the 16-bit sample it stands for: luma's 0 .. 1 and chroma's -0.5 .. 0.5 scaled to
-// 0 .. 65535, rounded, clamped (refine_common.glsl's)
-uint Quantize(float x, bool chroma) {
-    precise float v = chroma ? x + 0.5 : x;
-    v = v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
-    precise float s = v * 65535.0 + 0.5;
-    return uint(s);
+// thsad, unsigned and 64 bits wide: float SADs, each plane's up to 2^32 - 1, add up past 32 bits
+uint64_t Thsad() {
+    return uint64_t(uint(pc.thsad)) | (uint64_t(uint(pc.thsadHi)) << 32u);
 }
 
+// Integer samples (floats take SrcF and RefF)
 uint LumaAt(bool ref, uint i) {
-    if (kFloat)
-        return Quantize(ref ? refYF[i] : srcYF[i], false);
     if (kWide)
         return ref ? uint(refY16[i]) : uint(srcY16[i]);
     return ref ? uint(refY[i]) : uint(srcY[i]);
 }
 
 uint ChromaAt(bool ref, uint i) {
-    if (kFloat)
-        return Quantize(ref ? refCF[i] : srcCF[i], true);
     if (kWide)
         return ref ? uint(refC16[i]) : uint(srcC16[i]);
     return ref ? uint(refC[i]) : uint(srcC[i]);
@@ -156,6 +151,57 @@ uint SrcSample(int c, int x, int y) {
 // The block: its top left pixel in the padded planes, luma's and chroma's, and the pixels this lane
 // holds (kKeep; with kSatd luma's tiles', kKeepT)
 int gX, gY, gXc, gYc;
+
+// Float supers: mvu's float SADs, its float operations in its order (sadf_common.glsl), every lane
+// measuring the whole block alike; the samples read as they are, the quarter ones as mvu.Super's float
+// quarter planes hold them, (a + b) * 0.5 of two vertical averages. gSadV is the vector measured.
+ivec2 gSadV;
+
+float AvgF(float a, float b) {
+    precise float s = (a + b) * 0.5;
+    return s;
+}
+
+float SrcF(int c, int x, int y) {
+    if (c == 0)
+        return srcYF[y * pc.wp + x];
+    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
+    return srcCF[base + (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x))];
+}
+
+float RefF(int c, int X, int Y) {
+    bool luma = c == 0;
+    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
+    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
+    if (!luma && kImage)
+        return refCF[base + uint(Y * 4 * stride + X)];
+    if (kPel == 1)
+        return luma ? refYF[Y * stride + X] : refCF[base + uint(Y * stride + X)];
+    if (kPel == 2)
+        return luma ? refYF[HalfAddr(X, Y, stride, rows)] : refCF[base + HalfAddr(X, Y, stride, rows)];
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    uint aa = base + HalfAddr(Xa, Ya, stride, rows), ab = base + HalfAddr(Xa, Yb, stride, rows);
+    uint ba = base + HalfAddr(Xb, Ya, stride, rows), bb = base + HalfAddr(Xb, Yb, stride, rows);
+    if (luma)
+        return AvgF(AvgF(refYF[aa], refYF[ab]), AvgF(refYF[ba], refYF[bb]));
+    return AvgF(AvgF(refCF[aa], refCF[ab]), AvgF(refCF[ba], refCF[bb]));
+}
+
+float DiffF(int p, int x, int y) {
+    float cur, ref;
+    if (p == 0) {
+        cur = SrcF(0, gX + x, gY + y);
+        ref = RefF(0, gX * kPel + gSadV.x + x * kPel, gY * kPel + gSadV.y + y * kPel);
+    } else {
+        int cvx = (gSadV.x + (gSadV.x < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (gSadV.y + (gSadV.y < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
+        cur = SrcF(p, gXc + x, gYc + y);
+        ref = RefF(p, gXc * kPel + cvx + x * kPel, gYc * kPel + cvy + y * kPel);
+    }
+    precise float d = cur - ref;
+    return d;
+}
+
+#include "sadf_common.glsl"
 uint gSrcY[kKeep ? kLumaPer : 1], gSrcU[kKeep ? kChromaPer : 1], gSrcV[kKeep ? kChromaPer : 1];
 uint gSrcT[kSatd ? (kKeepT ? 16 * kTilesPer : 1) : 1];
 int gLane;
@@ -195,8 +241,14 @@ uint TileSatdAt(int t, int k, int X0, int Y0) {
 
 // The block's luma SAD (with kSatd its SATD) and chroma SAD (U's and V's together) at vector (vx, vy),
 // 1 / pel pixels; chroma at the vector divided by the subsampling, rounded toward zero (mvu's
-// GetRefBlockU)
-uvec2 Sads(int vx, int vy) {
+// GetRefBlockU). In 64 bits, as mvu adds them: float SADs, each plane's up to 2^32 - 1, pass 32 bits.
+u64vec2 Sads(int vx, int vy) {
+    if (kFloat) {
+        // luma's SAD or SATD, and U's and V's added, each plane's scaled alone, as mvu adds them
+        gSadV = ivec2(vx, vy);
+        uint64_t c = kChromaSad ? uint64_t(SadF(1, kBlkCX, kBlkCY)) + uint64_t(SadF(2, kBlkCX, kBlkCY)) : 0ul;
+        return u64vec2(uint64_t(kSatd ? SatdF(kBlkX, kBlkY) : SadF(0, kBlkX, kBlkY)), c);
+    }
     uint sl = 0u, sc = 0u;
     int X0 = gX * kPel + vx, Y0 = gY * kPel + vy;
     if (kSatd) {
@@ -238,14 +290,14 @@ uvec2 Sads(int vx, int vy) {
             }
         }
     }
-    return subgroupAdd(uvec2(sl, sc));
+    return u64vec2(subgroupAdd(uvec2(sl, sc)));
 }
 
 // The search's state, the same in every lane: the best vector, its SAD and cost; the predictor and
 // lambda the cost measures from; the vectors the planes hold the block for (mvu's nDxMin, nDyMin,
 // nDxMax, nDyMax); CheckMV2's direction
 ivec2 gBest;
-int gBestSad;
+uint64_t gBestSad;
 int64_t gMinCost;
 ivec2 gPred;
 int64_t gLambda;
@@ -268,7 +320,7 @@ void Check(int vx, int vy, int flags, int val) {
     int64_t cost = (gLambda * (dx * dx + dy * dy)) >> 8;
     if (cost >= gMinCost)
         return;
-    uvec2 s = Sads(vx, vy);
+    u64vec2 s = Sads(vx, vy);
     bool penalty = (flags & kPenalty) != 0;
     cost += int64_t(s.x) + (penalty ? (int64_t(pc.pnew) * int64_t(s.x)) >> 8 : 0l);
     if (cost >= gMinCost)
@@ -281,7 +333,7 @@ void Check(int vx, int vy, int flags, int val) {
     if ((flags & kUpdateBest) != 0)
         gBest = ivec2(vx, vy);
     gMinCost = cost;
-    gBestSad = int(s.x + s.y);
+    gBestSad = s.x + s.y;
     if ((flags & kUpdateDir) != 0)
         gDir = val;
 }
@@ -521,11 +573,11 @@ void main() {
     gPred = Predictor(bx, by);
     gLambda = by == 0 ? 0l : int64_t(pc.lambda);
 
-    uvec2 s = Sads(gPred.x, gPred.y);
+    u64vec2 s = Sads(gPred.x, gPred.y);
     gBest = gPred;
-    gBestSad = int(s.x + s.y);
+    gBestSad = s.x + s.y;
     gMinCost = int64_t(gBestSad);
-    if (gBestSad > pc.thsad) {
+    if (gBestSad > Thsad()) {
         if (pc.search == 0) {
             for (int i = pc.searchParam; i > 0; i /= 2)
                 DiamondSearch(i);
@@ -551,6 +603,7 @@ void main() {
             }
         }
     }
+    // (the record's SAD is 32 bits: a float SAD past them, of samples far outside their range, saturates)
     if (subgroupElect())
-        outRec[by * pc.recStride + bx] = ivec4(gBest, gBestSad, 0);
+        outRec[by * pc.recStride + bx] = ivec4(gBest, int(uint(min(gBestSad, 0xFFFFFFFFul))), 0);
 }

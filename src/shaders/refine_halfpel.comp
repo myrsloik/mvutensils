@@ -8,8 +8,8 @@ layout(local_size_x = 64) in;
 // block, rows pc.recStride records apart
 layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; };
 
-// The 8 half-pel positions around each block's vector, against its final neighbours (at pel 1 none,
-// the passes' vectors written out): kGroupBlocks blocks per workgroup in a row, lane i of each 8 of a
+// The 8 half-pel positions around each block's vector, pnew's penalty on their SADs, against its final
+// neighbours (at pel 1 none, the passes' vectors written out): kGroupBlocks blocks per workgroup in a row, lane i of each 8 of a
 // block's group measuring position i (kSplit), the best by one minimum of CandidateKey over the
 // group. Reads field A and writes the output, so every block sees its neighbours as the passes left
 // them; at pel 4 it writes field B instead, for the quarter-pel step (refine_qpel.comp). Dispatched
@@ -30,16 +30,16 @@ void main() {
     Context(b, p, lambda);
     ivec2 c0 = vecA[b];
     ivec2 best = c0;
-    int bestSad = sadA[b];
+    uint bestSad = sadA[b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
     // (at pel 1 there are no half pels: every position is c0 itself, and the block's vector goes out
     // as the passes left it)
     ivec2 v = ClampHalf(c0 + Around(sub, kPel / 2));
-    int s = live && kPel > 1 ? LaneSad(v) : 0;
-    uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
+    uint s = live && kPel > 1 ? LaneSad(v) : 0u;
+    uint64_t win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda) + Penalty(s, PNew()), sub) : kNoKey, 8u);
     int owner = KeyLane(win);
     ivec2 wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
-    int ws = FromLane(s, owner, 8);
+    uint ws = uint(FromLane(int(s), owner, 8));
     if (win != kNoKey && KeyCost(win) < bestCost) {
         best = wv;
         bestSad = ws;
@@ -49,7 +49,7 @@ void main() {
             vecB[b] = best;
             sadB[b] = bestSad;
         } else {
-            outRec[by * pc.recStride + bx] = ivec4(best, bestSad, 0);
+            outRec[by * pc.recStride + bx] = ivec4(best, int(bestSad), 0);
         }
     }
 }

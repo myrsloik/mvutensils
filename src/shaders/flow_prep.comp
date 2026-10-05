@@ -48,14 +48,14 @@ void main() {
     int bx = b % pc.nbx, by = b / pc.nbx;
     int at = by * pc.recStride + bx;
     ivec4 f = vecF[at], bw = vecB[at];
-    if (f.z > pc.thscd1)
+    if (uint(f.z) > uint(pc.thscd1))
         atomicAdd(counts[0], 1u);
-    if (bw.z > pc.thscd1)
+    if (uint(bw.z) > uint(pc.thscd1))
         atomicAdd(counts[1], 1u);
     if ((pc.flags & kHaveExtra) != 0) {
-        if (vecFF[at].z > pc.thscd1)
+        if (uint(vecFF[at].z) > uint(pc.thscd1))
             atomicAdd(counts[2], 1u);
-        if (vecBB[at].z > pc.thscd1)
+        if (uint(vecBB[at].z) > uint(pc.thscd1))
             atomicAdd(counts[3], 1u);
     }
     int right = bx < pc.nbx - 1 ? at + 1 : at, below = by < pc.nby - 1 ? at + pc.recStride : at;

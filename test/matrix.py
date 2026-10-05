@@ -351,6 +351,31 @@ def analyse_cases():
         ('4K 16x8/8x4 pel 4', k4, ['--frames', '6', '--pel', '4'] + rect(16, 8, 8, 4)),
         ('4K 128/64 pel 4', k4, ['--frames', '6'] + grid(128, 64, 4)),
         ('4K satd 16/8 pel 4', k4, ['--frames', '6', '--satd'] + grid(16, 8, 4)),
+        # mvu's search arguments as this search takes them: levels, globalmv, the penalties pzero, pglobal
+        # and pnew, pelsearch (the passes' reach)
+        ('levels 2', ff, ['--frames', '10', '--levels', '2'] + grid(16, 8)),
+        ('levels -1 pel 4', ff, ['--frames', '10', '--levels', '-1'] + grid(16, 8, 4)),
+        ('levels 1 radius 3', ff, ['--frames', '10', '--levels', '1', '--radius', '3'] + grid(16, 8)),
+        ('levels 3 YUV444P10 32/16', ob, ['--frames', '10', '--levels', '3', '--format', 'YUV444P10'] + grid(32, 16)),
+        ('globalmv 0', ff, ['--frames', '10', '--globalmv', '0'] + grid(16, 8)),
+        ('globalmv 0 standalone pel 4', ff, ['--frames', '10', '--globalmv', '0', '--standalone'] + grid(8, 4, 4)),
+        ('pnew 0 pzero 0', ff, ['--frames', '10', '--pnew', '0', '--pzero', '0'] + grid(16, 8)),
+        ('pzero 100 pglobal 50 pnew 10 444', ff, ['--frames', '10', '--pzero', '100', '--pglobal', '50', '--pnew', '10', '--format', 'YUV444P8'] + grid(16, 8)),
+        ('pnew 256 pzero 0 pglobal 256 YUV420P16', ff, ['--frames', '10', '--pnew', '256', '--pzero', '0', '--pglobal', '256', '--format', 'YUV420P16']
+         + grid(16, 8)),
+        ('pglobal 26 pzero 0 pel 1', ob, ['--frames', '10', '--pglobal', '26', '--pzero', '0'] + grid(16, 8, 1)),
+        ('pelsearch 4', ff, ['--frames', '10', '--pelsearch', '4'] + grid(16, 8)),
+        ('pelsearch 1', ff, ['--frames', '10', '--pelsearch', '1'] + grid(16, 8)),
+        ('pelsearch 7 8/4 pel 4', ff, ['--frames', '10', '--pelsearch', '7'] + grid(8, 4, 4)),
+        ('pelsearch 3 pel 1 GRAY8', ff, ['--frames', '10', '--pelsearch', '3', '--format', 'GRAY8'] + grid(16, 8, 1)),
+        ('pelsearch 6 satd pnew 60 YUV420P10', ff, ['--frames', '10', '--pelsearch', '6', '--satd', '--pnew', '60', '--format', 'YUV420P10'] + grid(16, 8)),
+        ('levels -2 globalmv 0 pzero 0 pnew 40 pelsearch 5 badstep 1', ff, ['--frames', '10', '--levels', '-2', '--globalmv', '0', '--pzero', '0', '--pnew',
+                                                                           '40', '--pelsearch', '5', '--badrange', '24', '--badstep', '1'] + grid(16, 8)),
+        # SADs past 2^31, unsigned as mvu's are: 128x128 blocks with 4:4:4 chroma at 16 bits, on the clip
+        # whose frames alternate dark and bright (--extreme)
+        ('YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--radius', '1'] + grid(128, 64)),
+        ('extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--radius', '1'] + grid(128, 64)),
+        ('extreme satd YUV420P16 128/64 pel 4', ff, ['--frames', '6', '--format', 'YUV420P16', '--extreme', '--satd', '--radius', '1'] + grid(128, 64, 4)),
     ]
     return cases
 
@@ -541,6 +566,11 @@ def degrain_cases():
                                                             '--analyse-blksize', '16', '--analyse-overlap', '8']),
         # A frame too small for the coarse search
         ('180x100 mvgpu vectors', ff, ['--frames', '8', '--crop', '180x100']),
+        # SADs past 2^31 (every reference's of an odd distance) against thsad
+        ('extreme YUV444P16 128/64 thsad 10000', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64', '--thsad',
+                                                      '10000']),
+        ('extreme YUV444P16 128/64 thsad 10000 mvu vectors', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64',
+                                                                  '--thsad', '10000', '--vectors', 'mvu']),
     ]
     return cases
 
@@ -713,6 +743,9 @@ def flow_cases():
         ('inter 180x100 mvgpu vectors', ff, ['--frames', '8', '--crop', '180x100'] + inter),
         ('fps 444 182x102 32/16 pel 4 mvgpu vectors', ff, ['--frames', '8', '--crop', '182x102', '--format', 'YUV444P8', '--blksize', '32', '--overlap', '16',
                                                            '--pel', '4', '--num', '60', '--den', '1'] + fps),
+        # SADs past 2^31, scene changes off
+        ('fps extreme YUV444P16 128/64 thscd2 100', ff, ['--frames', '8', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64',
+                                                         '--thscd2', '100', '--num', '60', '--den', '1'] + fps),
     ]
     return cases
 
@@ -762,6 +795,8 @@ def masks_cases():
         ('16/8 super, analysed 8/4', ff, ['--frames', '8', '--analyse-blksize', '8', '--analyse-overlap', '4']),
         ('180x100', ff, ['--frames', '8', '--crop', '180x100']),
         ('4K 16/8 pel 4', k4, ['--frames', '6', '--pel', '4']),
+        ('extreme YUV444P16 128/64 thscd2 100', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64', '--thscd2',
+                                                     '100']),
     ]
 
 
@@ -830,6 +865,13 @@ def motion_cases():
         ('compensate other super thsad 300 YUV420P16 16/0', ff, ['--frames', '8', '--other-super', '--thsad', '300', '--format', 'YUV420P16', '--overlap',
                                                                  '0'] + comp),
         ('flow other super delta -1', ff, ['--frames', '8', '--other-super', '--delta', '-1'] + flow),
+        # SADs past 2^31, scene changes off: thsad 42000 between them
+        ('compensate extreme YUV444P16 128/64 thsad 42000', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64',
+                                                                 '--thsad', '42000', '--thscd2', '100'] + comp),
+        ('flow extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64', '--thscd2',
+                                               '100'] + flow),
+        ('blur extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64', '--thscd2',
+                                               '100'] + blur),
     ]
     return cases
 
@@ -925,6 +967,9 @@ def recalculate_cases():
         ('satd chroma 0 random thsad 300', ff, ['--frames', '6', '--satd', '1', '--chroma', '0', '--vectors', 'random', '--thsad', '300']),
         ('satd to 8/4', ff, ['--frames', '6', '--satd', '1', '--new-blksize', '8', '--new-overlap', '4'] + t0),
         ('satd 440 8/4 pel 4 mvu vectors', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV440P8', '--pel', '4', '--vectors', 'mvu'] + grid_args(8, 4) + t0),
+        # SADs past 2^31
+        ('extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme'] + grid_args(128, 64) + t0),
+        ('extreme satd YUV420P16 128/64', ff, ['--frames', '6', '--format', 'YUV420P16', '--extreme', '--satd', '1'] + grid_args(128, 64) + t0),
     ]
 
 
@@ -949,6 +994,7 @@ def convert_cases():
         ('YUV420P10 128x64/32x32 pel 4', ff, ['--frames', '8', '--format', 'YUV420P10', '--pel', '4'] + rect(128, 64, 32, 32)),
         ('8/4 1910x1076', ff, ['--frames', '8', '--blksize', '8', '--overlap', '4', '--crop', '1910x1076']),
         ('180x100', ff, ['--frames', '8', '--crop', '180x100']),
+        ('extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--blksize', '128', '--overlap', '64']),
     ]
 
 
@@ -963,7 +1009,8 @@ SMOKE = {
     'super': ['--pel 4', '--format YUV420PS', '--pel 1 --format YUV444P16', '--pelclip'],
     'analyse': ['16/8 pel 2', '8/4 pel 4', '444 32/16 pel 4', 'YUV420P16 16/8 pel 4', 'YUV420PS 16/8 pel 2', 'GRAY8 16/8 pel 2', 'pel 1 16/8',
                 '422 16/8 pel 4', '440 8/4 pel 4', '16x8/8x4 pel 4', '16x2/8x0 pel 2', '4/2 pel 2', '128/64 pel 2', '8/4 on a 32/16 super pel 4 1914x1074',
-                'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4'],
+                'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4', 'extreme YUV444P16 128/64',
+                'pzero 100 pglobal 50 pnew 10 444', 'levels -2 globalmv 0 pzero 0 pnew 40 pelsearch 5 badstep 1'],
     'degrain': ['YUV420P8 16/8 pel 2 mvgpu vectors', 'radius 3 444 32/16 pel 4', 'YUV420P16 16/8 pel 4 analysed on 8 bits', 'YUV420PS 16/8 pel 2 mvgpu vectors',
                 'thscd1 150 thscd2 20', 'pel 1 16/8', 'YUV440P8 16/8 pel 4 mvgpu vectors', '32x16/16x8 pel 4', '64/32 pel 4',
                 '32/16 super, analysed 32x16/16x8 mvu vectors'],
@@ -971,7 +1018,7 @@ SMOKE = {
              'inter YUV422P8 16/8 pel 4 mvgpu vectors', 'fps 8x4/4x2 YUV420PS mvu vectors', 'inter 4/2'],
     'masks': ['16/8 pel 2', 'random vectors delta -1', 'YUV420PS', '422 16x2/8x1'],
     'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4', 'compensate 440 32/16 pel 2',
-               'compensate 16x8/8x4', 'compensate other super thsad 300'],
+               'compensate 16x8/8x4', 'compensate other super thsad 300', 'compensate extreme YUV444P16 128/64 thsad 42000'],
     'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1', 'random pel 1 from pel 4', '16x8/8x4 from 32x16/16x8 search 3',
                     '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4'],
     'convert': ['16/8 pel 2', 'YUV420P16 pel 4 analysed on 8 bits'],

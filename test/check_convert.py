@@ -10,8 +10,9 @@
                 and mvu's gone (its super's planes among them); then back through ToMVU, which must
                 give mvu's description and arrays again.
   errors        either plugin's vectors where the other's belong, a super of another block-aligned frame, vectors
-                that would read outside the padded frame, negative SADs, a vector clip without the
-                description of its super.
+                that would read outside the padded frame, negative SADs and SADs of 2^32 or more, a vector clip
+                without the description of its super; and a SAD past 2^31 taken both ways, as mvu's SADs
+                are unsigned.
 
 Both filters only move the vectors and SADs, so the filters of both plugins make the same frames from
 them (check_degrain, check_flow, check_masks and check_recalculate run mvu's filters on mvgpu's
@@ -22,6 +23,7 @@ serve it, as in mvu.
     check_convert.py --src clip.nv12 --size 1920x1080 --frames 10 [--format YUV420P8] [--crop 1914x1074]
                      [--pel 2] [--blksize 16] [--overlap 8] [--radius 2] [--recalculate 8 4]
                      [--analyse8] [--mvuprefix Other]
+--extreme makes every other frame dark and the others bright first (mvtest.extreme), for SADs past 2^31.
 """
 import argparse
 import os
@@ -31,12 +33,13 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, grid_label, nv12_clip  # noqa: E402
+from mvtest import eight_bit, extreme, format_clip, grid_label, nv12_clip  # noqa: E402
 
 GPU = 'MVGPUtensils'
 DESCRIPTION = ['Width', 'Height', 'RealWidth', 'RealHeight', 'HPad', 'VPad', 'Pel', 'Levels', 'Chroma', 'XRatioUV', 'YRatioUV',
                'BlkSizeX', 'BlkSizeY', 'OverlapX', 'OverlapY', 'NBlkX', 'NBlkY', 'DeltaFrame', 'BitsPerSample']
 SOURCE_KEY = 'ConvertCheckSource'  # a property of the source's frames, which the vector frames carry on both sides
+BIG_SAD = (1 << 31) + 5  # past int's range: the records hold it unsigned, as mvu's SADs are
 
 
 class Problems:
@@ -51,8 +54,13 @@ class Problems:
 
 
 def records(frame, nbx, nby):
-    """A frame of records as (blocks, 4) int32"""
+    """A frame of records as (blocks, 4) int32 (the SAD unsigned: sad_of)"""
     return np.asarray(frame[0]).view(np.int32)[:, :4 * nbx].reshape(nby * nbx, 4)
+
+
+def sad_of(rec):
+    """The records' SADs, unsigned as mvu's are"""
+    return rec[:, 2].astype(np.uint32)
 
 
 def unpack(props, prefix):
@@ -96,7 +104,7 @@ def check_to_mvu(core, field, frames, mvuprefix, label, problems):
             nbx, nby = gp[GPU + 'AnalysisNBlkX'], gp[GPU + 'AnalysisNBlkY']
             rec = records(g, nbx, nby)
             x, y, sad = unpack(cp, mvuprefix)
-            bad = int(np.count_nonzero((rec[:, 0] != x) | (rec[:, 1] != y) | (rec[:, 2] != sad)))
+            bad = int(np.count_nonzero((rec[:, 0] != x) | (rec[:, 1] != y) | (sad_of(rec) != sad)))
             if bad:
                 problems.add(f'{label} ToMVU frame {n}: {bad} blocks differ from the records')
     return conv
@@ -148,7 +156,7 @@ def check_from_mvu(core, cfield, gsup, frames, mvuprefix, label, problems):
             nbx, nby = cp[mvuprefix + 'AnalysisNBlkX'], cp[mvuprefix + 'AnalysisNBlkY']
             rec = records(g, nbx, nby)
             x, y, sad = unpack(cp, mvuprefix)
-            bad = int(np.count_nonzero((rec[:, 0] != x) | (rec[:, 1] != y) | (rec[:, 2] != sad) | (rec[:, 3] != 0)))
+            bad = int(np.count_nonzero((rec[:, 0] != x) | (rec[:, 1] != y) | (sad_of(rec) != sad) | (rec[:, 3] != 0)))
             if bad:
                 problems.add(f'{label} FromMVU frame {n}: {bad} records differ from mvu\'s arrays')
     return conv
@@ -184,6 +192,7 @@ def main():
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, GRAYS, ...')
+    ap.add_argument('--extreme', action='store_true', help='every other frame dark, the others bright (mvtest.extreme)')
     ap.add_argument('--crop', help='WxH: crop the frames to this size first, for grids that end inside a block')
     ap.add_argument('--pel', type=int, default=2)
     ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
@@ -203,6 +212,8 @@ def main():
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
     clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
+    if args.extreme:
+        clip = extreme(core, clip)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)
@@ -272,7 +283,7 @@ def main():
                     g.props[mp + 'AnalysisVectors'] = v
                 else:
                     s = list(g.props[mp + 'AnalysisSAD'])
-                    s[5] = -1
+                    s[5] = {'sad': -1, 'huge': 1 << 32, 'big': BIG_SAD}[what]
                     g.props[mp + 'AnalysisSAD'] = s
             return g
         return core.std.ModifyFrame(cf, cf, modify)
@@ -280,6 +291,16 @@ def main():
     expect_error('FromMVU on a vector outside the padded frame', lambda: core.mvgpu.FromMVU(corrupt('vector'), gsup, mvuprefix=mp),
                  'outside the padded frame', problems)
     expect_error('FromMVU on a negative SAD', lambda: core.mvgpu.FromMVU(corrupt('sad'), gsup, mvuprefix=mp), 'negative', problems)
+    expect_error('FromMVU on a SAD of 2^32', lambda: core.mvgpu.FromMVU(corrupt('huge'), gsup, mvuprefix=mp), "doesn't fit 32 bits", problems)
+    # a SAD past 2^31 both ways: the records' unsigned 32 bits, then mvu's array again
+    big = core.std.GPUDownload(core.mvgpu.FromMVU(corrupt('big'), gsup, mvuprefix=mp))
+    back = core.mvgpu.ToMVU(core.mvgpu.FromMVU(corrupt('big'), gsup, mvuprefix=mp), mvuprefix=mp)
+    for n in range(frames):
+        g, b = big.get_frame(n), back.get_frame(n)
+        if g.props[GPU + 'AnalysisHasVectors'] == 1:
+            got, again = int(sad_of(records(g, g.props[GPU + 'AnalysisNBlkX'], g.props[GPU + 'AnalysisNBlkY']))[5]), b.props[mp + 'AnalysisSAD'][5]
+            if got != BIG_SAD or again != BIG_SAD:
+                problems.add(f'a SAD of {BIG_SAD}: {got} in the records, {again} back in mvu\'s array, frame {n}')
     bare = core.std.RemoveFrameProps(core.mvgpu.FromMVU(cf, gsup, mvuprefix=mp), props=[GPU + 'SuperGPULayout'])
     expect_error('mvgpu.Compensate on vectors without their super description', lambda: core.mvgpu.Compensate(gclip, gsup, bare),
                  'the description of the super it was analysed on', problems)

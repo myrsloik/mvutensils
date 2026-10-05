@@ -7,8 +7,8 @@ layout(local_size_x = 64) in;
 
 // One checkerboard pass at pyramid level pc.level over the blocks of colour pc.colour, as
 // Pyramid::Passes: each tries its four neighbours' vectors and then the 8 positions one pixel
-// around the winner, under Analyse's cost with lambda * 2^level, all kept within the level's
-// padding. Like refine_pass.comp: 8 blocks of the colour per workgroup in a row, 8 lanes per
+// around the winner, those with pnew's penalty, under Analyse's cost with lambda * 2^level, all kept
+// within the level's padding. Like refine_pass.comp: 8 blocks of the colour per workgroup in a row, 8 lanes per
 // block, lanes 0-3 measuring the neighbours, then all 8 the positions around the winner, each
 // step's best by one minimum of CandidateKey over the group. Dispatched as
 // (((nbx + 1) / 2 + 7) / 8, nby, fields in the batch) of the level.
@@ -30,13 +30,13 @@ void main() {
     int64_t lambda;
     LevelContext(lv, b, p, lambda);
     ivec2 best = levelVec[fo + b];
-    int bestSad = levelSad[fo + b];
+    uint bestSad = levelSad[fo + b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
 
     // The neighbours' vectors; one equal to the best, which the CPU skips, can't win either
     int nbs[4] = int[4](bx > 0 ? b - 1 : -1, bx + 1 < lv.nbx ? b + 1 : -1, by > 0 ? b - lv.nbx : -1, by + 1 < lv.nby ? b + lv.nbx : -1);
     ivec2 v = ivec2(0);
-    int s = 0;
+    uint s = 0u;
     uint64_t mine = kNoKey;
     if (live && sub < 4 && nbs[sub] >= 0) {
         v = LevelBound(lv, levelVec[fo + nbs[sub]]);
@@ -46,7 +46,7 @@ void main() {
     uint64_t win = subgroupClusteredMin(mine, 8u);
     int owner = KeyLane(win);
     ivec2 wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
-    int ws = FromLane(s, owner, 8);
+    uint ws = uint(FromLane(int(s), owner, 8));
     if (win != kNoKey && KeyCost(win) < bestCost) {
         bestCost = KeyCost(win);
         best = wv;
@@ -56,11 +56,11 @@ void main() {
     // The 8 positions one pixel around the winner
     ivec2 c0 = best;
     v = LevelBound(lv, c0 + Around(sub, 1));
-    s = live ? LevelSadOf(lv, v) : 0;
-    win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda), sub) : kNoKey, 8u);
+    s = live ? LevelSadOf(lv, v) : 0u;
+    win = subgroupClusteredMin(live && v != c0 ? CandidateKey(Cost(s, v, p, lambda) + Penalty(s, PNew()), sub) : kNoKey, 8u);
     owner = KeyLane(win);
     wv = ivec2(FromLane(v.x, owner, 8), FromLane(v.y, owner, 8));
-    ws = FromLane(s, owner, 8);
+    ws = uint(FromLane(int(s), owner, 8));
     if (win != kNoKey && KeyCost(win) < bestCost) {
         best = wv;
         bestSad = ws;

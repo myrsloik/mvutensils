@@ -47,6 +47,34 @@ def format_clip(core, clip, fmt):
     return clip if f.id == clip.format.id else core.resize.Bicubic(clip, format=f.id)
 
 
+def extreme(core, clip):
+    """The clip with every other frame dark and the others bright, each sample within an eighth of its
+    range from one end of it, so that frames next to each other differ by most of the range everywhere:
+    the SADs of 128x128 blocks with 4:4:4 chroma at 16 bits or float then pass 2^31 (mvu's SADs are
+    unsigned 32-bit sums)"""
+    f = clip.format
+    if f.sample_type == vs.FLOAT:
+        chroma = f.num_planes > 1
+        dark = ['x 0.125 *'] + (['x 0.125 * 0.4375 -'] if chroma else [])
+        bright = ['1 x 0.125 * -'] + (['0.4375 x 0.125 * -'] if chroma else [])
+    else:
+        dark = ['x 8 /']
+        bright = [f'{(1 << f.bits_per_sample) - 1} x 8 / -']
+    pairs = core.std.Interleave([core.std.Expr(clip, dark), core.std.Expr(clip, bright)])
+    return core.std.SelectEvery(pairs, 4, [0, 3])  # dark 0, bright 1, dark 2, ...
+
+
+def overrange(core, clip):
+    """A float clip with every other frame's samples multiplied by 32 and the others' by -32, chroma's
+    as luma's, so that frames next to each other differ by many times the nominal range everywhere:
+    float SADs, which mvu scales to the 16-bit range with each sample unbounded, then pass the largest
+    SAD a block's pixels make at 16 bits, the sum of a block's planes passes 2^32 from 32x32 4:4:4
+    blocks on, and each plane's saturates at 2^32 - 1 from 64x64 blocks on"""
+    assert clip.format.sample_type == vs.FLOAT
+    pairs = core.std.Interleave([core.std.Expr(clip, 'x 32 *'), core.std.Expr(clip, 'x -32 *')])
+    return core.std.SelectEvery(pairs, 4, [0, 3])
+
+
 def grid_label(blksize, overlap):
     """A grid as the checks print it, from "h" or "h v" lists: 16/8, or 16x8/8x4 where the axes differ"""
     bx, by, ox, oy = blksize[0], blksize[-1], overlap[0], overlap[-1]

@@ -195,8 +195,10 @@ bool SameAnalysis(const VectorInfo &a, const VectorInfo &b);
 // pixels, a row of records per row of blocks, 4 * nbx x nby. The frame also carries the description
 // of the super it was analysed on (allocate it with the super frame as its property source).
 // chroma: whether the SADs count chroma; hasVectors: whether the records hold vectors (they don't
-// where the reference frame is outside the clip, as mvu's frames have none there): HasVectors.
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi);
+// where the reference frame is outside the clip, as mvu's frames have none there): HasVectors;
+// levels: the pyramid levels the search took (Analyse's levels), the super's all by default.
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi,
+                    int levels = 0);
 
 // A frame of a vector clip as the vectors' records, a new reference, or null when it has none
 const VSFrame *GetAnalysisVectors(const VSFrame *frame, const std::string &prefix, const VSAPI *vsapi);

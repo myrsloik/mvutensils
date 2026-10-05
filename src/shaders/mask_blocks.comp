@@ -59,7 +59,7 @@ uint SadValue(int bx, int by, ivec2 v) {
         bxi = bx;
         byi = by;
     }
-    int sad = Rec(bxi, byi).z >> pc.sadShift;
+    uint sad = uint(Rec(bxi, byi).z) >> uint(pc.sadShift);
     precise float x = float(sad) * pc.norm;
     float p = pc.gamma == 1.0 ? x : pc.gamma == 0.0 ? 1.0 : PowF(x, pc.gamma);
     precise float l = float(pc.maxVal) * p;
@@ -120,7 +120,7 @@ void main() {
     bool live = b < pc.nbx * pc.nby;
     int bx = live ? b % pc.nbx : 0, by = live ? b / pc.nbx : 0;
     ivec4 r = Rec(bx, by);
-    uint sum = subgroupAdd(live && r.z > pc.thscd1 ? 1u : 0u);
+    uint sum = subgroupAdd(live && uint(r.z) > uint(pc.thscd1) ? 1u : 0u);
     if (subgroupElect() && sum != 0u)
         atomicAdd(counts[pc.countSlot], sum);
     if (!live || pc.kind == kCount)

@@ -35,7 +35,7 @@ int Div256(int a) {
 // subsampling)
 bool Source(int bx, int by, int x, int y, int Sx, int Sy, out int X, out int Y) {
     ivec4 r = vecF[by * pc.recStride + bx];
-    bool moved = r.z < kThSad;
+    bool moved = uint(r.z) < uint(kThSad);
     int blx = bx * kStep * kPel + (moved ? Div256(r.x * pc.time256) : 0);
     int bly = by * kStepY * kPel + (moved ? Div256(r.y * pc.time256) : 0);
     if (pc.plane != 0) {

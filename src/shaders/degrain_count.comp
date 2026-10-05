@@ -14,7 +14,7 @@ void main() {
     int b = int(gl_GlobalInvocationID.x);
     uint changed = 0u;
     if (b < Blocks())
-        changed = Record(r, b % pc.nbx, b / pc.nbx).z > pc.thscd1 ? 1u : 0u;
+        changed = uint(Record(r, b % pc.nbx, b / pc.nbx).z) > uint(pc.thscd1) ? 1u : 0u;
     uint sum = subgroupAdd(changed);
     if (subgroupElect() && sum != 0u)
         atomicAdd(counts[r], sum);

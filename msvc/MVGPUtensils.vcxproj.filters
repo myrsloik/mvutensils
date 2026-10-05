@@ -160,6 +160,9 @@
     <None Include="..\src\shaders\refine_qpel.comp">
       <Filter>Shader Files</Filter>
     </None>
+    <None Include="..\src\shaders\sadf_common.glsl">
+      <Filter>Shader Files</Filter>
+    </None>
     <None Include="..\src\shaders\seed_build.comp">
       <Filter>Shader Files</Filter>
     </None>

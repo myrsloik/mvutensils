@@ -17,8 +17,9 @@
 // mvu.Recalculate on the GPU: vectors for the super's grid from another analysis (of another super of
 // the same clip, a prefiltered one say), each block starting from the old vectors interpolated at its
 // centre and searched around where that start matches badly (recalc.comp). The vectors are mvu's bit for
-// bit given the same supers and old vectors, but for float supers, which are searched as the 16-bit
-// samples they stand for, as mvgpu.Analyse searches them.
+// bit given the same supers and old vectors, float supers' those of mvu's AVX-512 build, whose float SADs
+// round apart from its AVX2 and SSE2 builds' (a SAD past 32 bits, of float samples far outside their
+// range, is stored saturated).
 //
 // Implemented: all of mvu.Recalculate's arguments, on the supers mvgpu.Analyse takes, for their own
 // grid or another that fits their block-aligned frame (SuperLayout::WithGrid), from old vectors of
@@ -241,10 +242,6 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
             d->chroma = true;
         if (!L.format.chroma)
             d->chroma = false;
-        // recalc.comp keeps a block's SAD in an int; a SATD reaches at most twice the SAD
-        const int64_t pixels = static_cast<int64_t>(useSatd ? 2 : 1) * G.blk * G.blkY + (d->chroma ? 2 * (G.blk / L.format.xr) * (G.blkY / L.format.yr) : 0);
-        if (pixels * ((1 << std::min(16, L.format.bits)) - 1) > INT32_MAX)
-            throw std::runtime_error("the blocks' SADs can pass 2^31 (128x128 blocks with chroma at 16 bits or float), which isn't implemented");
         int64_t lambda = vsapi->mapGetIntSaturated(in, "mvlambda", 0, &err);
         if (err)
             lambda = 1000;
@@ -299,9 +296,13 @@ static void VS_CC recalculateCreate(const VSMap *in, VSMap *out, [[maybe_unused]
         pc.hc = L.hc;
         pc.aw = L.aw;
         pc.ah = L.ah;
-        // A SAD stays within int's range, so larger thresholds and lambdas act as int's largest
+        // lambda capped at int's largest; thsad unsigned, as a SAD is, and 64 bits wide, as float SADs add up
+        // past 32 bits (each plane's up to 2^32 - 1); a negative one as 0 (a block of SAD 0 keeps its vector
+        // anyway: nothing costs less)
         pc.lambda = static_cast<int32_t>(std::min<int64_t>(lambdaLevel, std::numeric_limits<int32_t>::max()));
-        pc.thsad = static_cast<int32_t>(std::clamp<int64_t>(thsad, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()));
+        const uint64_t th = static_cast<uint64_t>(std::max<int64_t>(thsad, 0));
+        pc.thsad = static_cast<int32_t>(static_cast<uint32_t>(th));
+        pc.thsadHi = static_cast<int32_t>(static_cast<uint32_t>(th >> 32));
         pc.pnew = pnew;
         pc.search = search;
         pc.searchParam = searchParam;

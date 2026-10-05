@@ -12,7 +12,7 @@ layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint disp
 
 void main() {
     uint b = gl_GlobalInvocationID.x;
-    if (b >= uint(pc.nbx * pc.nby) || sadA[b] <= pc.badSad)
+    if (b >= uint(pc.nbx * pc.nby) || int64_t(sadA[b]) <= int64_t(pc.badSad))
         return;
     flagged[atomicAdd(dispatchX, 1u)] = b;
 }

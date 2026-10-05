@@ -20,8 +20,9 @@
 //
 // - the coarse node, shared by every field Analyse or AnalyseMany makes: frame n holds the coarse
 //   searches of all of frame n's fields, run as one batch, the field in the dispatches' z: an
-//   exhaustive search at the super's smallest level, then at every finer level down to the finest
-//   seeds from the level above and checkerboard passes (pyr_top/pyr_seed/pyr_pass/median.comp);
+//   exhaustive search at the smallest level the search takes (levels), then at every finer level
+//   down to the finest seeds from the level above and checkerboard passes
+//   (pyr_top/pyr_seed/pyr_pass/median.comp);
 // - the field's node: a seed list per block of the full-size grid, from zero, the field's median
 //   and the finest level's vectors around the block, and with AnalyseMany the chained and inverted
 //   vectors of fields refined before (seed_scatter/seed_build.comp); then the refinement: the
@@ -42,18 +43,24 @@
 // vectors alone.
 //
 // Implemented, on Gray and YUV supers of any subsampling (4:2:0, 4:2:2, 4:4:0, 4:4:4) and 8 to
-// 16-bit or float samples (mvlambda, lsad and badsad scaled to the depth as mvu scales them, floats
-// searched as 16-bit samples, a Gray super's SADs luma's): chroma, mvlambda, lsad, plevel (lambda *
+// 16-bit or float samples (mvlambda, lsad and badsad scaled to the depth as mvu scales them, floats'
+// as 16 bits', their SADs mvu's float SADs, a Gray super's SADs luma's): chroma, mvlambda, lsad, plevel (lambda *
 // 2^(plevel * L) at coarse level L, as mvu scales it per level), badsad and badrange (the
 // fallback's threshold and radius), delta, prefix, plus badstep, the fallback's step, which mvu
 // doesn't have. The fallback's defaults are the tested ones (badsad 1000, badrange 40, badstep 2)
 // rather than mvu's (badsad 10000, which this search would almost never reach, and badrange 24).
-// search, searchparam, pelsearch, levels, pnew, pzero, pglobal, globalmv, meander and trymany tune
-// mvu's search, which this one doesn't use; they are checked and otherwise ignored. satd makes luma's
+// mvu's search arguments as this search takes them: levels, the pyramid levels searched, as mvu
+// counts them (0 all, less than 0 all but that many; the super's levels are this search's, the
+// frame halved while at least kTopWidth pixels wide, and the full-size grid's); globalmv=False leaves
+// out the field's median (mvu's global vector); pzero, pglobal and pnew, mvu's penalties in 256ths of
+// the SAD, on the zero seed, the median, and the positions a search steps to (refine_common.glsl's
+// PZero); pelsearch, the full-size passes' reach around each block's winner, pelsearch / pel pixels
+// (pel, mvu's default, one pixel, as the passes always had). search, searchparam, meander and trymany
+// order mvu's search, which this one doesn't do; they are checked and otherwise ignored. satd makes luma's
 // SAD its SATD, mvu's, at the full-size grid (the coarse search keeps the SAD; 16x2 blocks are refused,
-// as mvu refuses them). Blocks whose SAD can pass 2^31 (128x128 with chroma at 16 bits or float) are
-// refused. blksize and overlap may be other than the super's, as in mvu: the grid then has to fit the
-// super's block-aligned frame (SuperLayout::WithGrid).
+// as mvu refuses them). SADs are unsigned, as mvu's are: the largest blocks' reach 2^32 (128x128 with
+// 4:4:4 chroma at 16 bits, or with satd). blksize and overlap may be other than the super's, as in
+// mvu: the grid then has to fit the super's block-aligned frame (SuperLayout::WithGrid).
 
 namespace {
 
@@ -63,6 +70,12 @@ constexpr int kMedianSlots = 32, kGlobalSlot = 31;
 constexpr int kPairs = 1;         // checkerboard pass pairs before the fallback
 constexpr int kTopRadius = 32;    // the exhaustive search's radius at the top level, px
 constexpr int kLevelPairs = 2;    // checkerboard pass pairs at every coarse level
+constexpr int kMaxMoveRadius = 32; // the passes' reach (pelsearch / pel): their positions' place in CandidateKey takes 13 bits
+
+// mvu's penalties packed as Params.penalties: pzero, pglobal and pnew, 9 bits each (refine_common.glsl's PZero)
+int Penalties(int pzero, int pglobal, int pnew) {
+    return pzero | (pglobal << 9) | (pnew << 18);
+}
 
 // The pixels of a block's SAD: luma's, and U's and V's unless it is luma's alone
 int BlockPixels(const SuperLayout &L, bool chroma) {
@@ -75,8 +88,8 @@ int64_t SadPixels(const SuperLayout &L, bool chroma, bool satd) {
     return BlockPixels(L, chroma) + (satd ? static_cast<int64_t>(L.blk) * L.blkY : 0);
 }
 
-// The bit depth the search works at: the samples', but 16 for floats, which it searches as the
-// 16-bit samples they stand for (refine_common.glsl's Quantize), as mvu scales float SADs
+// The bit depth the search's SADs count at: the samples', but 16 for floats, whose SADs mvu scales
+// to the 16-bit range (sadf_common.glsl's ScaledF)
 int SearchBits(const SuperLayout &L) {
     return L.format.Kind() == 2 ? 16 : L.format.bits;
 }
@@ -113,10 +126,13 @@ int SearchVariant(const SuperLayout &L, bool chroma, bool satd = false) {
 // against 8 blocks per workgroup: 4:4:4 32x32 -31..-32%, 4:2:0 32x32 -14..-21%, luma-only 32x32
 // -3..-7%, 4:4:4 16x16 -2..-4%, 16-bit 4:4:4 16x16 -17%, 16-bit 4:2:0 16x16 +-3%; split 4 against 2:
 // 4:4:4 32x32 -12..-13%, 16-bit 4:2:0 32x32 -18..-21%, 16-bit 4:4:4 32x32 -35..-36%, but blocks of
-// 1.5 KB (4:2:0 32x32, 16-bit 4:4:4 16x16) +6..7%.
+// 1.5 KB (4:2:0 32x32, 16-bit 4:4:4 16x16) +6..7%. Float samples take 1: a lane measures a candidate's
+// whole SAD in mvu's order (refine_common.glsl's LaneSadF).
 constexpr int kSplitBytes = 768, kSplit4Bytes = 3072;
 int RefineSplit(const SuperLayout &L, bool chroma) {
-    const int bytes = BlockPixels(L, chroma) * (L.format.Kind() == 0 ? 1 : 2); // floats are cached as 16-bit samples
+    if (L.format.Kind() == 2)
+        return 1;
+    const int bytes = BlockPixels(L, chroma) * (L.format.Kind() == 0 ? 1 : 2);
     return bytes >= kSplit4Bytes ? 4 : bytes >= kSplitBytes ? 2 : 1;
 }
 
@@ -165,6 +181,9 @@ struct CoarseData {
     VSVideoInfo vi = {};    // Gray32, a row per delta
     int numFrames = 0;
     SuperLayout layout;
+    int top = 0;          // the level the search starts at (levels)
+    int penalties = 0;    // Params.penalties
+    bool global = true;   // the median seeds every level (globalmv)
     std::vector<int> deltas;
     std::string prefix;
 
@@ -202,23 +221,25 @@ struct CoarseData {
 
 // The coarse searches of a batch's `count` fields, the field in z, as the prototype's vkrefine.cpp
 // records them: the top level's exhaustive search and passes, then each finer level seeded from the
-// one above, down to the finest; then the finest level's median
+// one above, down to the finest; then the finest level's median (the medians only with globalmv)
 class CoarseRecorder {
 public:
     CoarseRecorder(const CoarseData &d, Recorder &rec, uint32_t count) : d(d), L(d.layout), rec(rec), count(count) {}
 
     void Search() {
-        const int T = L.topLevel, F = SuperLayout::kFinest;
+        const int T = d.top, F = SuperLayout::kFinest;
         rec.Dispatch(d.pyrTop, LevelParams(T), static_cast<uint32_t>(L.levels[T].nbx), static_cast<uint32_t>(L.levels[T].nby), count);
         rec.ComputeBarrier();
         LevelPasses(T);
         for (int level = T - 1; level >= F; --level) {
-            Median(level + 1, 2, level);
+            if (d.global)
+                Median(level + 1, 2, level);
             rec.Dispatch(d.pyrSeed, LevelParams(level), static_cast<uint32_t>((L.levels[level].nbx + 7) / 8), static_cast<uint32_t>(L.levels[level].nby), count);
             rec.ComputeBarrier();
             LevelPasses(level);
         }
-        Median(F, L.pel << F, kGlobalSlot);
+        if (d.global)
+            Median(F, L.pel << F, kGlobalSlot);
     }
 
 private:
@@ -231,6 +252,8 @@ private:
         q.medianScale = 1;
         q.finest = SuperLayout::kFinest;
         q.blockRows = 8;
+        q.flags = d.global ? 0 : 8;
+        q.penalties = d.penalties;
         return q;
     }
 
@@ -415,6 +438,10 @@ struct AnalyseData {
     int badSad = 0;
     int fallbackRadius = 0;
     int fallbackStep = 1;
+    int levelCount = 1;  // the pyramid levels searched, for the vectors' description (AnalysisLevels)
+    bool global = true;  // the median seeds the field (globalmv)
+    int penalties = 0;   // Params.penalties
+    int moveRadius = 1;  // the passes' reach, pelsearch / pel pixels
 
     std::string prefix;
 
@@ -463,12 +490,12 @@ public:
     // stamp(i), when given, marks the end of stage i (MVGPU_PROFILE): 1 the seeds, 2 init, 3 the
     // passes before the fallback, 4 the fallback, 5 the passes after it, 6 the half-pel step, 7 the
     // quarter-pel step
-    FieldRecorder(const AnalyseData &d, Recorder &rec, VkBuffer scratch, int lumaStride, int chromaStride, int recStride, int coarseBase,
+    // flags: the field's (Params.flags)
+    FieldRecorder(const AnalyseData &d, Recorder &rec, VkBuffer scratch, int lumaStride, int chromaStride, int recStride, int coarseBase, int flags,
                   std::function<void(int)> stamp)
         : d(d), L(d.grid), rec(rec), scratch(scratch), lumaStride(lumaStride), chromaStride(chromaStride), recStride(recStride), coarseBase(coarseBase),
-          stamp(std::move(stamp)) {}
+          flags(flags), stamp(std::move(stamp)) {}
 
-    // flags is the caller's to set where a kernel uses it
     Params MakeParams(int colour, int stamp) const {
         Params q = {};
         q.nbx = L.nbx;
@@ -497,14 +524,16 @@ public:
         q.coarseBase = coarseBase;
         q.aw = L.aw;
         q.ah = L.ah;
+        q.flags = flags;
+        q.penalties = d.penalties;
+        q.moveRadius = d.moveRadius;
         return q;
     }
 
-    // The full-size seed lists; flags: 1 the chained fields are bound, 2 the inverted field is
-    void SeedLists(int flags) {
+    // The full-size seed lists (flags: 1 the chained fields are bound, 2 the inverted field is)
+    void SeedLists() {
         const uint32_t groups = static_cast<uint32_t>((static_cast<int64_t>(L.nbx) * L.nby + 63) / 64);
         Params q = MakeParams(0, 0);
-        q.flags = flags;
         if (flags & 2) {
             rec.Dispatch(d.seedScatter, q, groups, 1);
             rec.ComputeBarrier();
@@ -574,7 +603,7 @@ private:
     const SuperLayout &L;
     Recorder &rec;
     VkBuffer scratch;
-    int lumaStride, chromaStride, recStride, coarseBase;
+    int lumaStride, chromaStride, recStride, coarseBase, flags;
     std::function<void(int)> stamp;
 };
 
@@ -620,7 +649,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
                 vsapi->setFilterError("Analyse: failed to allocate the vector frame", frameCtx);
                 return nullptr;
             }
-            ExportAnalysis(dst, G, d->deltaFrame, d->chroma, false, d->prefix, vsapi);
+            ExportAnalysis(dst, G, d->deltaFrame, d->chroma, false, d->prefix, vsapi, d->levelCount);
             return dst;
         }
 
@@ -676,7 +705,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         auto sameShape = [&](const VSFrame *f) {
             return f && vsapi->getFrameWidth(f, 0) == 4 * G.nbx && vsapi->getFrameHeight(f, 0) == G.nby && vsapi->getStride(f, 0) == recBytes;
         };
-        const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0) | (coarse ? 0 : 4);
+        const int flags = (sameShape(stepVec) && sameShape(restVec) ? 1 : 0) | (sameShape(invVec) ? 2 : 0) | (coarse ? 0 : 4) | (d->global ? 0 : 8);
 
         // A Gray super has no chroma
         const bool chroma = L.format.chroma;
@@ -755,8 +784,8 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (d->profile)
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
         FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / bytes), static_cast<int>(recBytes / 16),
-                            static_cast<int>(d->coarseRow * coarseRowBytes / 8), std::move(stamp));
-        field.SeedLists(flags);
+                            static_cast<int>(d->coarseRow * coarseRowBytes / 8), flags, std::move(stamp));
+        field.SeedLists();
         field.Refinement();
 
         uint64_t signaled = 0;
@@ -768,7 +797,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         if (d->profile)
             d->profile->Finish(*d->vc, d->pool, signaled, queries);
 
-        ExportAnalysis(vectors, G, d->deltaFrame, d->chroma, true, d->prefix, vsapi);
+        ExportAnalysis(vectors, G, d->deltaFrame, d->chroma, true, d->prefix, vsapi, d->levelCount);
         VSFrame *dst = vectors;
         vectors = nullptr; // returned, not released
         release();
@@ -793,6 +822,10 @@ struct AnalyseArgs {
     int plevel = 1;
     int64_t mvlambda = 1000, lsad = 400, badsad = 1000;
     int badrange = 40, badstep = 2;
+    int top = 0;          // the level the coarse search starts at, levels - 1; 0: none
+    bool global = true;   // globalmv
+    int pzero = 25, pglobal = 0, pnew = 25;
+    int moveRadius = 1;   // pelsearch / pel
 
     Scaled Scale() const {
         const int64_t area = static_cast<int64_t>(grid.blk) * grid.blkY;
@@ -832,8 +865,16 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         CheckBlockSize(blkX, blkY, overlapX, overlapY, a.layout.format.xr > 1 ? 1 : 0, a.layout.format.yr > 1 ? 1 : 0, a.satd);
         a.grid = a.layout.WithGrid(blkX, blkY, overlapX, overlapY);
 
-        // levels, search, searchparam and pelsearch steer mvu's hierarchical search
-        vsapi->mapGetIntSaturated(in, "levels", 0, &err);
+        // levels: the pyramid levels searched, the full-size grid's and the coarse ones down from the
+        // top (mvu's count, its messages); search and searchparam order mvu's search, ignored here
+        const int levels = vsapi->mapGetIntSaturated(in, "levels", 0, &err), available = a.layout.topLevel + 1;
+        if (levels > available)
+            throw std::runtime_error("levels is " + std::to_string(levels) + " but the super clip only has " + std::to_string(available) +
+                                     (available == 1 ? " level" : " levels"));
+        const int count = levels > 0 ? levels : available + levels;
+        if (count < 1)
+            throw std::runtime_error("the levels argument resolves to a non-positive level count");
+        a.top = count - 1;
 
         int searchType = vsapi->mapGetIntSaturated(in, "search", 0, &err);
         if (err)
@@ -843,19 +884,19 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
 
         int pelSearch = vsapi->mapGetIntSaturated(in, "pelsearch", 0, &err);
         if (err)
-            pelSearch = 2;
+            pelSearch = a.layout.pel;
 
         if (pelSearch <= 0)
             throw std::runtime_error("pelsearch must be positive");
+        a.moveRadius = pelSearch / a.layout.pel;
+        if (a.moveRadius > kMaxMoveRadius)
+            throw std::runtime_error("pelsearch must be at most " + std::to_string((kMaxMoveRadius + 1) * a.layout.pel - 1));
 
         a.chroma = !!vsapi->mapGetInt(in, "chroma", 0, &err);
         if (err)
             a.chroma = true;
         if (!a.layout.format.chroma) // a Gray super's SADs are luma's alone, as in mvu
             a.chroma = false;
-        // The kernels keep a block's SAD in an int
-        if (SadPixels(a.grid, a.chroma, a.satd) * ((1 << SearchBits(a.grid)) - 1) > INT32_MAX)
-            throw std::runtime_error("the blocks' SADs can pass 2^31 (128x128 blocks with chroma at 16 bits or float), which isn't implemented");
 
         a.deltaFrame = vsapi->mapGetIntSaturated(in, "delta", 0, &err);
         if (err)
@@ -875,7 +916,9 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
         if (err)
             a.plevel = 1;
 
-        vsapi->mapGetInt(in, "globalmv", 0, &err);
+        a.global = !!vsapi->mapGetInt(in, "globalmv", 0, &err);
+        if (err)
+            a.global = true;
 
         int pnew = vsapi->mapGetIntSaturated(in, "pnew", 0, &err);
         if (err)
@@ -919,6 +962,9 @@ AnalyseArgs ParseAnalyseArgs(const VSMap *in, const VSAPI *vsapi) {
 
         if (pglobal < 0 || pglobal > 256)
             throw std::runtime_error("pglobal must be between 0 and 256");
+        a.pzero = pzero;
+        a.pglobal = pglobal;
+        a.pnew = pnew;
 
         if (a.deltaFrame == 0)
             throw std::runtime_error("delta can't be 0");
@@ -942,6 +988,9 @@ VSNode *CreateCoarse(const AnalyseArgs &a, const std::vector<int> &deltas, VSCor
     const VSVideoInfo *superVi = vsapi->getVideoInfo(a.node);
     d->numFrames = superVi->numFrames;
     d->layout = a.layout;
+    d->top = a.top;
+    d->penalties = Penalties(a.pzero, a.pglobal, a.pnew);
+    d->global = a.global;
     d->deltas = deltas;
     d->prefix = a.prefix;
     const SuperLayout &L = d->layout;
@@ -1032,6 +1081,10 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     d->badSad = static_cast<int>(s.badSad);
     d->fallbackRadius = std::abs(a.badrange);
     d->fallbackStep = a.badstep;
+    d->levelCount = a.top + 1;
+    d->global = a.global;
+    d->penalties = Penalties(a.pzero, a.pglobal, a.pnew);
+    d->moveRadius = a.moveRadius;
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
@@ -1118,7 +1171,7 @@ static void VS_CC analyseCreate(const VSMap *in, VSMap *out, [[maybe_unused]] vo
     try {
         AnalyseArgs a = ParseAnalyseArgs(in, vsapi);
         try {
-            if (a.layout.topLevel >= 1)
+            if (a.top >= SuperLayout::kFinest)
                 coarse = CreateCoarse(a, {a.deltaFrame}, core, vsapi);
             vsapi->mapConsumeNode(out, "clip", CreateAnalyse(a, a.deltaFrame, coarse, 0, nullptr, nullptr, 0, nullptr, core, vsapi), maAppend);
         } catch (...) {
@@ -1167,7 +1220,7 @@ static void VS_CC analyseManyCreate(const VSMap *in, VSMap *out, [[maybe_unused]
                 deltas.push_back(-r * delta);
                 deltas.push_back(r * delta);
             }
-            if (a.layout.topLevel >= 1)
+            if (a.top >= SuperLayout::kFinest)
                 coarse = CreateCoarse(a, deltas, core, vsapi);
             for (int r = 1; r <= radius; ++r) {
                 // (n, -r) chains (n, -1) and (n - 1, -(r - 1)); (n, r) chains (n, 1) and (n + 1, r - 1)

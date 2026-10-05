@@ -40,7 +40,7 @@ struct CompensateData {
 
     int delta = 0; // the vectors' reference frame is n + delta
     int time256 = 0;
-    int thsad = 0; // scaled
+    uint32_t thsad = 0; // scaled
     int nbx = 0, nby = 0, step = 0, stepY = 0, overlap = 0, overlapY = 0;
     SceneChange scd;
 
@@ -202,7 +202,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
         // compensate.comp's slots: thsad, the grid's step and overlap, the clip's largest value
-        pc.thscd1 = d->thsad;
+        pc.thscd1 = static_cast<int32_t>(d->thsad); // compensate.comp reads it unsigned
         pc.time4096FX = d->step;
         pc.time4096FY = d->overlap;
         pc.stepY = d->stepY;
@@ -307,11 +307,11 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
         d->overlap = v.overlapX;
         d->overlapY = v.overlapY;
         d->scd = ScaleSceneChange(v, thscd1, thscd2);
-        // thsad scaled as thscd1 is, truncated as mvu's int64 is; a SAD is never above int's range, so
-        // a larger threshold takes every vector
+        // thsad scaled as thscd1 is, truncated as mvu's int64 is, then unsigned, as a SAD is: a SAD is
+        // below 2^32 - 1, so a larger threshold takes every vector as that does, and one of 0 or less none
         const double scaled = static_cast<double>(thsad) * ThSCDScale(v) + 0.5;
-        constexpr int kMax = std::numeric_limits<int>::max(), kMin = std::numeric_limits<int>::min();
-        d->thsad = scaled >= kMax ? kMax : scaled <= kMin ? kMin : static_cast<int>(static_cast<int64_t>(scaled));
+        constexpr double kMax = static_cast<double>(std::numeric_limits<uint32_t>::max());
+        d->thsad = scaled >= kMax ? std::numeric_limits<uint32_t>::max() : scaled <= 0.0 ? 0u : static_cast<uint32_t>(static_cast<int64_t>(scaled));
         d->time256 = static_cast<int>(time * 256 / 100);
 
         d->vc = VulkanContext::Get(core, vsapi);

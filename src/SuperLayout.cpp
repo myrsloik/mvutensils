@@ -418,7 +418,8 @@ bool SameGeometry(const SuperLayout &a, const SuperLayout &b) {
            a.aw == b.aw && a.ah == b.ah && a.pad == b.pad && a.padY == b.padY && a.pel == b.pel;
 }
 
-void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi) {
+void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chroma, bool hasVectors, const std::string &prefix, const VSAPI *vsapi,
+                    int levels) {
     VSMap *props = vsapi->getFramePropertiesRW(dst);
     auto set = [&](const char *name, int64_t v) { vsapi->mapSetInt(props, (prefix + name).c_str(), v, maReplace); };
     set("AnalysisWidth", layout.aw);
@@ -428,7 +429,7 @@ void ExportAnalysis(VSFrame *dst, const SuperLayout &layout, int delta, bool chr
     set("AnalysisHPad", layout.pad);
     set("AnalysisVPad", layout.padY);
     set("AnalysisPel", layout.pel);
-    set("AnalysisLevels", layout.topLevel + 1);
+    set("AnalysisLevels", levels > 0 ? levels : layout.topLevel + 1);
     set("AnalysisChroma", chroma && layout.format.chroma);
     set("AnalysisXRatioUV", layout.format.xr);
     set("AnalysisYRatioUV", layout.format.yr);

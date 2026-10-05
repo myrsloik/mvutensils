@@ -8,10 +8,12 @@
 layout(local_size_x_id = 1) in;
 
 // The exhaustive search at the top level (pc.level): every position within +-topRadius px that
-// keeps the reference block within the level's padding; the lowest SAD wins, ties to the shorter
-// vector and then to the earlier position in scan order, as Pyramid::Search. One block per
+// keeps the reference block within the level's padding; the lowest cost wins, the SAD with pnew's
+// penalty but at zero (mvu's coarsest level takes zero as its predictor, which goes unpenalized), ties
+// to the shorter vector and then to the earlier position in scan order, as Pyramid::Run. One block per
 // workgroup of one subgroup, its positions spread over the lanes, each lane keeping the least key
-// SAD << 40 | length << 20 | position; dispatched as (nbx, nby, fields in the batch) of the level.
+// cost << 32 | length << 16 | position (a cost is below 2^32, a length below 2^12, a position below
+// 2^13); dispatched as (nbx, nby, fields in the batch) of the level.
 void main() {
     Level lv = levels[pc.level];
     uint lane = gl_SubgroupInvocationID;
@@ -25,14 +27,18 @@ void main() {
     uint64_t mine = ~0ul;
     for (int k = int(lane); k < total; k += kSubgroup) {
         ivec2 v = lo + ivec2(k % nx, k / nx);
-        uint64_t key = (uint64_t(LevelSadOf(lv, v)) << 40) | (uint64_t(v.x * v.x + v.y * v.y) << 20) | uint64_t(k);
+        uint s = LevelSadOf(lv, v);
+        int64_t cost = int64_t(s) + (v == ivec2(0) ? 0l : Penalty(s, PNew()));
+        uint64_t key = (uint64_t(cost) << 32) | (uint64_t(v.x * v.x + v.y * v.y) << 16) | uint64_t(k);
         mine = min(mine, key);
     }
     uint64_t best = subgroupMin(mine);
+    int k = int(best & 0xFFFFul);
+    ivec2 v = lo + ivec2(k % nx, k / nx);
+    uint s = LevelSadOf(lv, v); // the winner's SAD (its key holds its cost)
     if (lane == 0u) {
-        int k = int(best & 0xFFFFFul);
         int b = gFieldBase + lv.fieldOff + by * lv.nbx + bx;
-        levelVec[b] = lo + ivec2(k % nx, k / nx);
-        levelSad[b] = int(best >> 40);
+        levelVec[b] = v;
+        levelSad[b] = s;
     }
 }

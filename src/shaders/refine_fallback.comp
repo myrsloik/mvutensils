@@ -11,7 +11,7 @@ layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; 
 
 // The blocks refine_flag.comp listed, whose SAD is still above badSad, try every position
 // fallbackStep px apart within fallbackRadius px of their predictor, then the positions up to
-// fallbackStep - 1 px around the best. One listed block per workgroup of one or more subgroups,
+// fallbackStep - 1 px around the best, every position's SAD with pnew's penalty. One listed block per workgroup of one or more subgroups,
 // its positions spread over all the lanes; each step's best is one 64-bit minimum of cost and
 // position in scan order, so the first of the cheapest wins, as on the CPU. The flagged blocks are
 // few, so more lanes per block keep more of the GPU busy. Reads field A, which no lane changes;
@@ -20,7 +20,8 @@ layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; 
 //
 // The wide search is a branch and bound, exact: a position can only win if it costs less than the
 // block's current vector and no more than every position measured so far, and its cost only grows
-// as its SAD adds up. So a position whose partial cost passes that bound is dropped; the winner
+// as its SAD adds up (the penalty with it). The phases' lists keep each position's SAD so far, of
+// which its cost follows. So a position whose partial cost passes that bound is dropped; the winner
 // never is, since the bound never falls below its cost. The SAD adds up in kUnits equal units,
 // unit u being luma rows 2u and 2u + 1 and the chroma rows of U and V beside them, row u where
 // chroma is subsampled vertically (4:2:0, 4:4:0), 2u and 2u + 1 where it isn't (4:2:2, 4:4:4), or
@@ -38,9 +39,10 @@ const int kUnits = kBlkY / kUnitRows;
 const int kPhase1 = kUnits / 4 > 1 ? kUnits / 4 : 1;
 const int kPhase2 = kUnits * 5 / 8 > kPhase1 ? kUnits * 5 / 8 : kPhase1;
 const int kPerLane = 4; // positions per lane in a batch
-// Blocks of 8x8 pixels or fewer, or fewer than 8 rows, take their positions' whole SADs at once
+// Blocks of 8x8 pixels or fewer, or fewer than 8 rows, take their positions' whole SADs at once, and so
+// do float samples, whose SADs mvu sums in an order that doesn't add up unit by unit (LaneSadF)
 // (selects rather than ||, as the core's compiler needs: refine_common.glsl's kCurWords)
-const bool kWhole = (kBlkY < 8 ? 1 : (kBlkX * kBlkY <= 64 ? 1 : 0)) != 0;
+const bool kWhole = (kFloatS ? 1 : (kBlkY < 8 ? 1 : (kBlkX * kBlkY <= 64 ? 1 : 0))) != 0;
 
 shared uint64_t sKey[8];              // per subgroup: its least key
 shared uint sPartial[8];              // per subgroup: its part of the block's pixel sum
@@ -48,7 +50,7 @@ shared uint sUnitSum[kUnits];         // the block's pixel sum per unit
 shared uint sUnitBefore[kUnits + 1];  // and the sum of the units before each, the last the whole block's
 shared uint sBound;                   // a position costing more can't win
 shared uint sCount[2];                // entries in sList[0] and sList[1]
-// The survivors of phase 0 and of phase 1: column | row << 16, and the cost so far; one entry each
+// The survivors of phase 0 and of phase 1: column | row << 16, and the SAD so far; one entry each
 // where the search doesn't run in phases (kWhole; shared memory counts even when unused)
 shared uvec2 sList[2][kWhole ? 1 : kPerLane * gl_WorkGroupSize.x];
 
@@ -65,15 +67,15 @@ uint64_t WorkgroupMin(uint64_t key) {
     return least;
 }
 
-// Appends (pos, cost) to sList[list] where keep is set; every active lane of the subgroup must call it
-void Append(int list, bool keep, uint pos, uint cost) {
+// Appends (pos, sad) to sList[list] where keep is set; every active lane of the subgroup must call it
+void Append(int list, bool keep, uint pos, uint sad) {
     uvec4 ballot = subgroupBallot(keep);
     uint base = 0u;
     if (subgroupElect())
         base = atomicAdd(sCount[list], subgroupBallotBitCount(ballot));
     base = subgroupBroadcastFirst(base);
     if (keep)
-        sList[list][base + subgroupBallotExclusiveBitCount(ballot)] = uvec2(pos, cost);
+        sList[list][base + subgroupBallotExclusiveBitCount(ballot)] = uvec2(pos, sad);
 }
 
 // The lane's position: its SAD's word addresses and shifts as LaneSad computes them (or its chroma
@@ -105,10 +107,15 @@ void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     gSm = 0u;
 }
 
+// The cost of the lane's position (Setup) with SAD sad: its lambda term, the SAD and pnew's penalty
+int64_t PositionCost(uint sad) {
+    return gLam + int64_t(sad) + Penalty(sad, PNew());
+}
+
 // The bound's cap: a cost within it plus the block's largest SAD stays within 32 bits; and it stays
 // below 2^32 - 2^20 (2^32 - 2^28 for 16-bit samples) as long as that does
 uint BoundCap() {
-    return min(kWide ? 0xF0000000u : 0xFFF00000u, 0xFFFFFFFFu - uint(kBlockPixels * (kWide ? 65535 : 255)));
+    return min(kWide ? 0xF0000000u : 0xFFF00000u, 0xFFFFFFFFu - uint(kBlockPixels) * (kWide ? 65535u : 255u));
 }
 
 // Adds unit u of the lane's position to its partial sums (luma's SATD to gSa with kSatd)
@@ -173,7 +180,7 @@ void main() {
         sUnitSum[lane] = 0u;
     barrier();
     uint partial = 0u;
-    for (int k = lane; k < kBlockWords; k += lanes) {
+    for (int k = lane; k < (kFloatS ? 0 : kBlockWords); k += lanes) {
         uint px[4] = uint[4](0u, 0u, 0u, 0u);
         for (int i = 0; i < kSPW; ++i)
             px[i] = CurSample(k, i);
@@ -195,7 +202,7 @@ void main() {
     int64_t lambda;
     Context(b, p, lambda);
     ivec2 best = vecA[b];
-    int bestSad = sadA[b];
+    uint bestSad = sadA[b];
     int64_t bestCost = Cost(bestSad, best, p, lambda);
     if (lane == 0) {
         uint before = 0u;
@@ -228,7 +235,8 @@ void main() {
     if (kWhole || bestCost - 1 > int64_t(BoundCap())) {
         for (int k = lane; k < total; k += lanes) {
             ivec2 v = ivec2(x0 + (k % nx) * stepH, y0 + (k / nx) * stepH);
-            mine = min(mine, (uint64_t(Cost(LaneSad(v), v, p, lambda)) << 24) | uint64_t(k));
+            uint s = LaneSad(v);
+            mine = min(mine, (uint64_t(Cost(s, v, p, lambda) + Penalty(s, PNew())) << 24) | uint64_t(k));
         }
     } else for (int base = 0; base < total; base += batch) {
         int count = min(batch, total - base);
@@ -240,16 +248,15 @@ void main() {
         int col = (base + lane) % nx, row = (base + lane) / nx;
         for (int idx = lane; idx < count; idx += lanes) {
             bool keep = false;
-            uint cost = 0u;
+            uint sad = 0u;
             Setup(ivec2(x0 + col * stepH, y0 + row * stepH), p, lambda);
             if (gLam <= int64_t(bound)) {
                 for (int u = 0; u < kPhase1; ++u)
                     Unit(u);
-                int64_t c = gLam + int64_t(UnitsSad(0, kPhase1));
-                keep = c <= int64_t(bound);
-                cost = uint(c);
+                sad = UnitsSad(0, kPhase1);
+                keep = PositionCost(sad) <= int64_t(bound);
             }
-            Append(0, keep, uint(col) | (uint(row) << 16u), cost);
+            Append(0, keep, uint(col) | (uint(row) << 16u), sad);
             col += dc;
             row += dr;
             if (col >= nx) {
@@ -265,38 +272,38 @@ void main() {
             int ua = phase == 1 ? kPhase1 : kPhase2, ub = phase == 1 ? kPhase2 : kUnits;
             for (int e = lane; e < n; e += lanes) {
                 bool keep = false;
-                uint cost = 0u;
+                uint sad = 0u;
                 uvec2 entry = sList[phase - 1][e];
-                if (entry.y <= bound) {
-                    int pc0 = int(entry.x & 0xFFFFu), pr0 = int(entry.x >> 16u);
-                    Setup(ivec2(x0 + pc0 * stepH, y0 + pr0 * stepH), p, lambda);
+                int pc0 = int(entry.x & 0xFFFFu), pr0 = int(entry.x >> 16u);
+                Setup(ivec2(x0 + pc0 * stepH, y0 + pr0 * stepH), p, lambda);
+                if (PositionCost(entry.y) <= int64_t(bound)) {
                     for (int u = ua; u < ub; ++u)
                         Unit(u);
-                    uint c = entry.y + UnitsSad(ua, ub);
-                    if (c <= bound) {
+                    sad = entry.y + UnitsSad(ua, ub);
+                    int64_t c = PositionCost(sad);
+                    if (c <= int64_t(bound)) {
                         if (phase == 2) {
                             mine = min(mine, (uint64_t(c) << 24) | uint64_t(pr0 * nx + pc0));
-                            atomicMin(sBound, c);
-                            bound = c;
+                            atomicMin(sBound, uint(c));
+                            bound = uint(c);
                         } else {
                             keep = true;
-                            cost = c;
                         }
                     }
                 }
                 if (phase == 1)
-                    Append(1, keep, entry.x, cost);
+                    Append(1, keep, entry.x, sad);
             }
         }
         barrier();
     }
-    // A winner's SAD is its cost less its lambda term, so it needn't be measured again
+    // A winner's SAD follows from its cost less its lambda term, so it needn't be measured again
     uint64_t found = WorkgroupMin(mine);
     if (total > 0 && int64_t(found >> 24) < bestCost) {
         int k = int(found & 0xFFFFFFul);
         best = ivec2(x0 + (k % nx) * stepH, y0 + (k / nx) * stepH);
         bestCost = int64_t(found >> 24);
-        bestSad = int(bestCost - (Cost(0, best, p, lambda)));
+        bestSad = SadOfPenalized(bestCost - Cost(0u, best, p, lambda), PNew());
     }
     if (pc.fallbackStep > 1) {
         // The positions up to fallbackStep - 1 px around the best in the CPU's order; one equal to
@@ -310,7 +317,15 @@ void main() {
         int r1 = pc.fallbackStep - 1, side = 2 * r1 + 1, around = side * side;
         int sub = lane & 7, slot = lane >> 3, perRound = lanes >> 3;
         uint64_t near = kNoKey;
-        for (int k0 = 0; k0 < around; k0 += perRound) {
+        // (float samples: a position's whole SAD in one lane)
+        for (int k = lane; k < (kFloatS ? around : 0); k += lanes) {
+            ivec2 v = ClampFull(cc + kPel * ivec2(k % side - r1, k / side - r1));
+            if (v != cc) {
+                uint sad = LaneSad(v);
+                near = min(near, (uint64_t(Cost(sad, v, p, lambda) + Penalty(sad, PNew())) << 8) | uint64_t(k));
+            }
+        }
+        for (int k0 = 0; k0 < (kFloatS ? 0 : around); k0 += perRound) {
             int k = k0 + slot;
             ivec2 v = ClampFull(cc + kPel * ivec2(k % side - r1, k / side - r1));
             bool live = k < around && v != cc;
@@ -324,13 +339,13 @@ void main() {
             }
             uint sad = subgroupClusteredAdd(part, 8u);
             if (live && sub == 0)
-                near = min(near, (uint64_t(Cost(int(sad), v, p, lambda)) << 8) | uint64_t(k));
+                near = min(near, (uint64_t(Cost(sad, v, p, lambda) + Penalty(sad, PNew())) << 8) | uint64_t(k));
         }
         near = WorkgroupMin(near);
         if (near != kNoKey && int64_t(near >> 8) < bestCost) {
             int k = int(near & 0xFFul);
             best = ClampFull(cc + kPel * ivec2(k % side - r1, k / side - r1));
-            bestSad = int(int64_t(near >> 8) - Cost(0, best, p, lambda));
+            bestSad = SadOfPenalized(int64_t(near >> 8) - Cost(0u, best, p, lambda), PNew());
         }
     }
     if (lane == 0) {

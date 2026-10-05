@@ -8,12 +8,12 @@ layout(local_size_x = 64) in;
 // precision, from the reference's 256 weight steps at tables[at] (Degrain.cpp's WeightSteps): the
 // largest k whose step, the least SAD with a weight under k, is above the SAD, by binary search. The
 // weight never rises with the SAD, so the steps give exactly mvu's at every SAD.
-uint Weight(int at, int sad) {
+uint Weight(int at, uint sad) {
     uint k = 0u;
     for (uint jump = 128u; jump != 0u; jump >>= 1u)
-        if (sad < tables[at + int(k + jump) - 1])
+        if (int64_t(sad) < int64_t(tables[at + int(k + jump) - 1]))
             k += jump;
-    return k == 255u && sad < tables[at + 255] ? 256u : k;
+    return k == 255u && int64_t(sad) < int64_t(tables[at + 255]) ? 256u : k;
 }
 
 // normaliseWeights' share of a weighted reference weight a of the total s, int(a * (256.0 / s))
@@ -73,7 +73,8 @@ void main() {
     int totalL = 256 * tables[pc.uwOff] + 1, totalC = totalL;
     for (int r = 0; r < pc.refs; ++r) {
         if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
-            int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
+            uint sad = uint(Record(r, bx, by).z);
+            int uw = tables[pc.uwOff + 1 + r];
             totalL += int(Weight(pc.thOff + 256 * r, sad)) * uw;
             totalC += int(Weight(pc.thOff + 256 * (pc.refs + r), sad)) * uw;
         }
@@ -82,7 +83,8 @@ void main() {
     for (int r = 0; r < pc.refs; ++r) {
         uint wl = 0u, wc = 0u;
         if (Usable(r) && counts[r] <= uint(pc.scdLimit)) {
-            int sad = Record(r, bx, by).z, uw = tables[pc.uwOff + 1 + r];
+            uint sad = uint(Record(r, bx, by).z);
+            int uw = tables[pc.uwOff + 1 + r];
             wl = Normalised(Weight(pc.thOff + 256 * r, sad) * uint(uw), uint(totalL));
             wc = Normalised(Weight(pc.thOff + 256 * (pc.refs + r), sad) * uint(uw), uint(totalC));
         }

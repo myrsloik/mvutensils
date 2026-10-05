@@ -9,7 +9,8 @@ layout(local_size_x = 64) in;
 // The inverted field (n + d, -d), d > 0, scattered onto field (n, d)'s grid as BuildSeeds does:
 // the block of frame n + d at p matched p + u in frame n, so the block of frame n nearest to
 // p + u moves by -u. Each block of the stored field claims that target with key SAD << 32 | its
-// index; the lowest SAD wins, ties to the lower index, as the CPU's loop over the blocks in order.
+// index (the SAD unsigned); the lowest SAD wins, ties to the lower index, as the CPU's loop over the
+// blocks in order.
 // invKey is all ones beforehand: filled once, then reset by seed_build.comp as it reads it. One
 // lane per block; dispatched as ((nbx * nby + 63) / 64, 1).
 void main() {
@@ -21,5 +22,5 @@ void main() {
     int tx = RoundDiv(kPel * (b % pc.nbx) * pc.step + u.x, kPel * pc.step), ty = RoundDiv(kPel * (b / pc.nbx) * pc.stepY + u.y, kPel * pc.stepY);
     if (tx < 0 || ty < 0 || tx >= pc.nbx || ty >= pc.nby)
         return;
-    atomicMin(invKey[ty * pc.nbx + tx], (uint64_t(r.z) << 32) | uint64_t(b));
+    atomicMin(invKey[ty * pc.nbx + tx], (uint64_t(uint(r.z)) << 32) | uint64_t(b));
 }

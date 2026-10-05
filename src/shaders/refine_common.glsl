@@ -43,10 +43,10 @@ uint WorkgroupLane() {
 // frames mvgpu.Super attaches, SuperLayout.h): four planes of hp rows for luma (full, x + 1/2,
 // y + 1/2, both), and for U and V four each of hc rows (U at planes 0-3, V at 4-7), but for
 // subsampled chroma at pel 4, an image each of the quarter-pel grid, 4 hc rows of 4 wc samples. The
-// samples are bytes, 16 bits each at 9 to 16 bits (kWide) or floats (kFloatS, read as the 16-bit
-// samples they stand for, Quantize), the current frame's planes declared all three ways (CurLuma,
-// CurChroma). wp and wc are the storage frames' strides in samples, whole words, so every row starts
-// on a word. LaneSad reads the reference frame's planes as 32-bit words (RefYWord, RefCWord), up to
+// samples are bytes, 16 bits each at 9 to 16 bits (kWide) or floats (kFloatS, one to a word, which
+// LaneSadF reads as they are), the current frame's planes declared all three ways (CurLuma,
+// CurChroma, CurF). wp and wc are the storage frames' strides in samples, whole words, so every row
+// starts on a word. LaneSad reads the reference frame's planes as 32-bit words (RefYWord, RefCWord), up to
 // two past a row's last pixel, so the storage frames carry a spare row at the end.
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma8 { uint8_t curY[]; };
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma16 { uint16_t curY16[]; };
@@ -57,7 +57,8 @@ layout(std430, set = 0, binding = 2) readonly buffer CurChroma16 { uint16_t curC
 layout(std430, set = 0, binding = 2) readonly buffer CurChroma32 { uint curC32[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint refC[]; };
 // Up to maxSeeds seed vectors per block (half-pels), their count, and their SADs once measured;
-// seed_build.comp writes the seeds, the other kernels only read them
+// seed_build.comp writes the seeds, the other kernels only read them. A SAD is unsigned, as mvu's
+// is: the largest blocks' reach 2^32 (128x128 with 4:4:4 chroma at 16 bits, or with satd).
 #ifdef SEED_BUILD
 #define SEED_ACCESS
 #else
@@ -65,12 +66,12 @@ layout(std430, set = 0, binding = 3) readonly buffer RefChroma { uint refC[]; };
 #endif
 layout(std430, set = 0, binding = 4) SEED_ACCESS buffer Seeds { ivec2 seeds[]; };
 layout(std430, set = 0, binding = 5) SEED_ACCESS buffer SeedCount { int seedCount[]; };
-layout(std430, set = 0, binding = 6) buffer SeedSad { int seedSad[]; };
+layout(std430, set = 0, binding = 6) buffer SeedSad { uint seedSad[]; };
 // The field being refined, and a second copy for the kernels that must not update it in place
 layout(std430, set = 0, binding = 7) buffer VecA { ivec2 vecA[]; };
-layout(std430, set = 0, binding = 8) buffer SadA { int sadA[]; };
+layout(std430, set = 0, binding = 8) buffer SadA { uint sadA[]; };
 layout(std430, set = 0, binding = 9) buffer VecB { ivec2 vecB[]; };
-layout(std430, set = 0, binding = 10) buffer SadB { int sadB[]; };
+layout(std430, set = 0, binding = 10) buffer SadB { uint sadB[]; };
 // lambda for each value of (worst neighbour SAD) >> 1, computed on the CPU exactly as the CPU
 // reference does in double precision (Analyse.cpp)
 layout(std430, set = 0, binding = 11) readonly buffer Lambda { int64_t lambdaOf[]; };
@@ -94,7 +95,8 @@ layout(push_constant) uniform Params {
     int fallbackRadius, fallbackStep, badSad, maxSeeds;
     int stamp;       // this dispatch's step number
     int level;       // pyramid: the level the dispatch works on
-    int flags;       // seed building: 1 chained vectors available, 2 inverted vectors available, 4 no coarse search
+    int flags;       // the field: 1 chained vectors available, 2 inverted vectors available, 4 no coarse search, 8 no
+                     // global vector (globalmv=False); the coarse levels: 8 no global vector
     int topRadius;   // pyramid: the exhaustive search radius at the top level
     int medianScale; // median: the factor the vectors are scaled by
     int medianSlot;  // median: where the result goes
@@ -104,6 +106,8 @@ layout(push_constant) uniform Params {
     int recStride;   // fields stored as records (x, y, SAD, 0) per block: records per row
     int coarseBase;  // seed building: where the field's coarse result starts in Coarse, in vectors
     int aw, ah;      // the super's block-aligned frame (the grid's own but on another grid than the super's)
+    int penalties;   // mvu's pzero, pglobal and pnew, 9 bits each from bit 0 (PZero, PGlobal, PNew)
+    int moveRadius;  // the full-size passes: the positions within this many pixels of the winner (pelsearch)
 } pc;
 
 // The target grid's block size (specialization constants 3 and 7), mvu's 8x4, 8x8, 16x2, 16x8,
@@ -140,11 +144,8 @@ const int kGroupBlocks = 8 / kSplit; // a workgroup's blocks
 
 // The samples: bytes at 8 bits, 16 bits each at 9 to 16 (kWide), 4 or 2 to a 32-bit word. The SADs
 // of 16-bit samples count 2^kDepthShift times as much, so the lambda tables take the worst
-// neighbour SAD in steps that much larger (Context). Float samples (kFloatS) are searched as the
-// 16-bit samples they stand for: luma's 0 .. 1 and chroma's -0.5 .. 0.5 (offset by 0.5) scaled to
-// 0 .. 65535, rounded and clamped (Quantize), each read as it comes, so a plane's word w is the
-// pair of samples 2w and 2w + 1 (RefYWord), everything after the reads as at 16 bits; the CPU
-// reference quantizes the same samples, and the SAD is on the 16-bit scale mvu gives float SADs.
+// neighbour SAD in steps that much larger (Context). Float samples (kFloatS) take mvu's float SAD
+// (LaneSadF), which mvu scales to the 16-bit range, so that everything after it is as at 16 bits.
 const int kDepthShift = (kVariant >> 4) & 15;
 const bool kWide = kDepthShift != 0;
 const bool kFloatS = (kVariant & 256) != 0;
@@ -156,30 +157,18 @@ const int kLogSPW = kWide ? 1 : 2;
 const int kArea = kBlkX * kBlkY;
 const int kAreaShift = kArea > 8192 ? 4 : (kArea > 4096 ? 3 : (kArea > 2048 ? 2 : (kArea > 1024 ? 1 : 0)));
 
-// The 16-bit sample a float sample stands for; NaN as 0
-uint Quantize(float x, bool chroma) {
-    precise float v = chroma ? x + 0.5 : x;
-    v = v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
-    precise float s = v * 65535.0 + 0.5;
-    return uint(s);
-}
-
-// Sample i of the current frame's luma or chroma planes
+// Sample i of the current frame's luma or chroma planes (integer samples: floats take CurF)
 uint CurLuma(int i) {
-    return kFloatS ? Quantize(uintBitsToFloat(curY32[i]), false) : kWide ? uint(curY16[i]) : uint(curY[i]);
+    return kWide ? uint(curY16[i]) : uint(curY[i]);
 }
 uint CurChroma(uint i) {
-    return kFloatS ? Quantize(uintBitsToFloat(curC32[i]), true) : kWide ? uint(curC16[i]) : uint(curC[i]);
+    return kWide ? uint(curC16[i]) : uint(curC[i]);
 }
 // Word w of the reference frame's luma or chroma planes read as words
 uint RefYWord(uint w) {
-    if (kFloatS)
-        return Quantize(uintBitsToFloat(refY[2u * w]), false) | (Quantize(uintBitsToFloat(refY[2u * w + 1u]), false) << 16u);
     return refY[w];
 }
 uint RefCWord(uint w) {
-    if (kFloatS)
-        return Quantize(uintBitsToFloat(refC[2u * w]), true) | (Quantize(uintBitsToFloat(refC[2u * w + 1u]), true) << 16u);
     return refC[w];
 }
 // The word holding sample a of a plane read as words, and the shift of the sample within it
@@ -211,7 +200,7 @@ const int kBlockWords = kLumaWords + (kChroma ? 2 * kChromaWords : 0);
 // read as a whole word with the bytes past it masked off: they count as 0 on both sides of the SAD
 const uint kChromaMask = kBlkCX < kSPW ? 0xFFFFu : 0xFFFFFFFFu;
 // The pixels of a block's SAD, luma's twice for a SATD, which reaches at most twice the SAD: times the
-// largest sample, the largest SAD a block can have (Analyse.cpp keeps it within int)
+// largest sample, the largest SAD a block can have, which stays below 2^32 for every block mvu takes
 const int kBlockPixels = (kSatd ? 2 : 1) * kBlkX * kBlkY + (kChroma ? 2 * kBlkCX * kBlkCY : 0);
 
 // Where V's samples start, past U's
@@ -264,7 +253,8 @@ const int kCurWords = kWide ? 1 : (BLOCKS_PER_WORKGROUP * 2 * kBlockWords * 4 >=
 #if defined(LEVEL_BLOCKS)
 const bool kNoCache = false;
 #else
-const bool kNoCache = BLOCKS_PER_WORKGROUP * kBlockWords * 4 > 16384;
+// (float samples, which take their own SAD, go without one too: LaneSadF; a select, as kCurWords)
+const bool kNoCache = (kFloatS ? 1 : (BLOCKS_PER_WORKGROUP * kBlockWords * 4 > 16384 ? 1 : 0)) != 0;
 #endif
 #ifndef NO_BLOCK_CACHE
 #ifdef LEVEL_BLOCKS
@@ -337,7 +327,7 @@ void LoadBlock(int group, int sub, int lanesPerBlock, int bx, int by, bool live)
     gX = bx * pc.step;
     gY = by * pc.stepY;
     uint partial = 0u;
-    if (live) {
+    if (live && !kFloatS) {
         for (int k = sub; k < kBlockWords; k += lanesPerBlock) {
             uint b[4] = uint[4](0u, 0u, 0u, 0u);
             bool counts = kSatd ? k >= kLumaWords : true;
@@ -482,14 +472,15 @@ void PackedStep(uint r, int k, inout uint sa, inout uint sm) {
 
 // The SAD from the sums PackedStep made over the lane's share of the rows, added up over the
 // candidate's kSplit lanes, which must all call it (with kSatd sa holds luma's SATD besides, and
-// gSumCur only chroma's sum)
-int SadOf(uint sa, uint sm) {
-    int s = kWide ? int(sa) : int(sa - 2u * sm);
+// gSumCur only chroma's sum). Unsigned and modulo 2^32 all the way, so a lane's share may wrap below
+// zero (8-bit samples): the whole SAD is below 2^32.
+uint SadOf(uint sa, uint sm) {
+    uint s = kWide ? sa : sa - 2u * sm;
     if (kSplit >= 2)
         s += subgroupShuffleXor(s, 8u);
     if (kSplit >= 4)
         s += subgroupShuffleXor(s, 16u);
-    return kWide ? s : s + int(gSumCur);
+    return kWide ? s : s + gSumCur;
 }
 
 // mvu's SATD (SADFunctions.cpp's Satd_C), luma's metric with kSatd: the block in 4x4 tiles, each the sum
@@ -597,8 +588,15 @@ uint LumaAddr(int X, int Y) {
 // words (the storage frames' strides are), so every row of the block sits at the same offset in its
 // words. At pel 4 the luma vector is on the half-pel grid (ClampHalf, ClampFull), so is 4:4:4
 // chroma's, and subsampled chroma's anywhere, read from its quarter-pel image, its pixels gathered
-// from a word each.
-int LaneSad(ivec2 v) {
+// from a word each. Float samples take LaneSadF.
+#ifndef LEVEL_BLOCKS
+uint LaneSadF(ivec2 v, bool quarter);
+#endif
+uint LaneSad(ivec2 v) {
+#ifndef LEVEL_BLOCKS
+    if (kFloatS)
+        return LaneSadF(v, false);
+#endif
     uint a = LumaAddr(kPel * (gX + pc.pad) + v.x, kPel * (gY + pc.padY) + v.y);
     uint w = WordOf(a), shift = ShiftOf(a), stride = uint(pc.wp) >> uint(kLogSPW);
     int cur = kNoCache ? 0 : gGroup * kBlockWords;
@@ -659,6 +657,76 @@ int LaneSad(ivec2 v) {
 }
 #endif
 
+#if !defined(NO_BLOCK_CACHE) && !defined(LEVEL_BLOCKS)
+// Float samples (kFloatS) take their own SAD: mvu's of float blocks, its float operations in its order
+// (sadf_common.glsl), the samples read as they are, one lane measuring the whole block (kSplit 1), the
+// current pixels read from the super (no cache). gSadV is the vector measured, gSadQuarter whether it may
+// lie between the half-pel grid's samples (refine_qpel.comp), which then come from them as mvu.Super's
+// float quarter planes hold them, the rounded average (a + b) * 0.5 of two vertical averages.
+ivec2 gSadV;
+bool gSadQuarter = false;
+
+float AvgF(float a, float b) {
+    precise float s = (a + b) * 0.5;
+    return s;
+}
+
+// The current frame's sample (x, y) of the block's plane p
+float CurF(int p, int x, int y) {
+    if (p == 0)
+        return uintBitsToFloat(curY32[(gY + pc.padY + y) * pc.wp + gX + pc.pad + x]);
+    uint base = p == 2 ? ChromaV() : 0u;
+    return uintBitsToFloat(curC32[base + ChromaPixel((gX >> kLogCX) + pc.padc + x, (gY >> kLogCY) + pc.padcY + y)]);
+}
+
+// The reference's sample of plane p at (X, Y), 1 / pel pixels of the padded plane
+float RefF(int p, int X, int Y) {
+    if (p == 0) {
+        if (gSadQuarter && ((X | Y) & 1) != 0) {
+            int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+            uint plane = uint(pc.wp * pc.hp);
+            return AvgF(AvgF(uintBitsToFloat(refY[HalfAddr(Xa, Ya, plane, pc.wp)]), uintBitsToFloat(refY[HalfAddr(Xa, Yb, plane, pc.wp)])),
+                        AvgF(uintBitsToFloat(refY[HalfAddr(Xb, Ya, plane, pc.wp)]), uintBitsToFloat(refY[HalfAddr(Xb, Yb, plane, pc.wp)])));
+        }
+        return uintBitsToFloat(refY[LumaAddr(X, Y)]);
+    }
+    uint base = p == 2 ? ChromaV() : 0u;
+    if (gSadQuarter && !kImage && ((X | Y) & 1) != 0) {
+        int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+        uint plane = uint(pc.wc * pc.hc);
+        return AvgF(AvgF(uintBitsToFloat(refC[base + HalfAddr(Xa, Ya, plane, pc.wc)]), uintBitsToFloat(refC[base + HalfAddr(Xa, Yb, plane, pc.wc)])),
+                    AvgF(uintBitsToFloat(refC[base + HalfAddr(Xb, Ya, plane, pc.wc)]), uintBitsToFloat(refC[base + HalfAddr(Xb, Yb, plane, pc.wc)])));
+    }
+    return uintBitsToFloat(refC[base + ChromaAddr(X, Y)]);
+}
+
+float DiffF(int p, int x, int y) {
+    float ref;
+    if (p == 0) {
+        ref = RefF(0, kPel * (gX + pc.pad + x) + gSadV.x, kPel * (gY + pc.padY + y) + gSadV.y);
+    } else {
+        ivec2 vc = ChromaVector(gSadV);
+        ref = RefF(p, kPel * ((gX >> kLogCX) + pc.padc + x) + vc.x, kPel * ((gY >> kLogCY) + pc.padcY + y) + vc.y);
+    }
+    precise float d = CurF(p, x, y) - ref;
+    return d;
+}
+
+#include "sadf_common.glsl"
+
+// The block's float SAD at vector v (with kSatd luma's SATD), each plane's scaled alone and added as mvu
+// adds them, the total saturated to the records' 32 bits (only float samples far outside their range reach
+// them)
+uint LaneSadF(ivec2 v, bool quarter) {
+    gSadV = v;
+    gSadQuarter = quarter;
+    uint64_t s = uint64_t(kSatd ? SatdF(kBlkX, kBlkY) : SadF(0, kBlkX, kBlkY));
+    if (kChroma)
+        s += uint64_t(SadF(1, kBlkCX, kBlkCY)) + uint64_t(SadF(2, kBlkCX, kBlkCY));
+    return uint(min(s, 0xFFFFFFFFul));
+}
+#endif
+
 // The value of lane `sub` of this lane's group; call in uniform control flow
 int FromLane(int value, int sub, int lanesPerBlock) {
     return subgroupShuffle(value, (gl_SubgroupInvocationID & ~uint(lanesPerBlock - 1)) + uint(sub));
@@ -674,12 +742,14 @@ void Sort4(inout int a[4]) {
 }
 
 // Predictor and relaxed lambda of block b from its four neighbours in field A; a neighbour outside
-// the grid repeats the block's own vector and doesn't count for the neighbourhood SAD
+// the grid repeats the block's own vector and doesn't count for the neighbourhood SAD. The worst SAD
+// is capped at the largest a block's pixels can make (kBlockPixels times the largest sample), the
+// table's last entry's: only float SADs, of samples outside their range, pass it.
 void Context(int b, out ivec2 p, out int64_t lambda) {
     int bx = b % pc.nbx, by = b / pc.nbx;
     int nbs[4] = int[4](bx > 0 ? b - 1 : b, bx + 1 < pc.nbx ? b + 1 : b, by > 0 ? b - pc.nbx : b, by + 1 < pc.nby ? b + pc.nbx : b);
     int xs[4], ys[4];
-    int worst = 0;
+    uint worst = 0u;
     for (int i = 0; i < 4; ++i) {
         ivec2 v = vecA[nbs[i]];
         xs[i] = v.x;
@@ -690,12 +760,44 @@ void Context(int b, out ivec2 p, out int64_t lambda) {
     Sort4(xs);
     Sort4(ys);
     p = ivec2((xs[1] + xs[2]) / 2, (ys[1] + ys[2]) / 2);
-    lambda = lambdaOf[worst >> (1 + kDepthShift + kAreaShift)];
+    uint cap = uint(kBlockPixels) * ((1u << uint(8 + kDepthShift)) - 1u);
+    lambda = lambdaOf[min(worst, cap) >> uint(1 + kDepthShift + kAreaShift)];
 }
 
-int64_t Cost(int sad, ivec2 v, ivec2 p, int64_t lambda) {
+int64_t Cost(uint sad, ivec2 v, ivec2 p, int64_t lambda) {
     int64_t dx = int64_t(v.x - p.x), dy = int64_t(v.y - p.y);
     return int64_t(sad) + ((lambda * (dx * dx + dy * dy)) >> 8);
+}
+
+// mvu's penalties, in 256ths of a candidate's SAD, which its cost takes on besides: pzero for the zero
+// seed, pglobal for the field's median (the global vector), pnew for the positions a search steps to
+// (the passes' positions around the winner, the top level's window, the fallback's, the sub-pel steps'),
+// none for the predictors (the coarse vectors, the chained and inverted ones, the neighbours', the
+// block's own)
+int PZero() {
+    return pc.penalties & 511;
+}
+int PGlobal() {
+    return (pc.penalties >> 9) & 511;
+}
+int PNew() {
+    return (pc.penalties >> 18) & 511;
+}
+int64_t Penalty(uint sad, int pen) {
+    return (int64_t(pen) * int64_t(sad)) >> 8;
+}
+// The penalty of seed k of a full-size block: seed 0 is zero, seed 1 the field's median where the field
+// has one (seed_build.comp)
+int SeedPenalty(int k) {
+    return k == 0 ? PZero() : (k == 1 && (pc.flags & 12) == 0 ? PGlobal() : 0);
+}
+// The SAD whose cost with penalty pen is c, SAD + Penalty(SAD, pen): that grows by at least one with
+// each unit of SAD, so exactly one SAD has it, floor(256 c / (256 + pen)) or the next
+uint SadOfPenalized(int64_t c, int pen) {
+    int64_t s = (c << 8) / int64_t(256 + pen);
+    if (s + ((int64_t(pen) * s) >> 8) < c)
+        ++s;
+    return uint(s);
 }
 
 // The 8 positions one step around a vector, in the CPU's order: rows top to bottom, then left to

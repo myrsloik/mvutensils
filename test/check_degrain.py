@@ -16,6 +16,7 @@ on 8 bits serve the clip. Every pixel of every frame and plane is compared.
 --format converts the 8-bit 4:2:0 source first (mvtest.format_clip: resize.Bicubic, shifted a
 quarter pixel to more than 8 bits). --centersuper gives both a separate centre super, of the clip
 blurred, as scripts that denoise with the super of another clip do.
+--extreme makes every other frame dark and the others bright first (mvtest.extreme), for SADs past 2^31.
 """
 import argparse
 import os
@@ -25,7 +26,7 @@ import numpy as np
 import vapoursynth as vs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # an embedded Python leaves the script's directory out
-from mvtest import eight_bit, format_clip, nv12_clip, plane_pair  # noqa: E402
+from mvtest import eight_bit, extreme, format_clip, nv12_clip, plane_pair  # noqa: E402
 
 
 def main():
@@ -34,6 +35,7 @@ def main():
     ap.add_argument('--size', required=True, help='WxH')
     ap.add_argument('--frames', type=int, required=True)
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name: YUV420P8, YUV444P16, YUV420P10, ...')
+    ap.add_argument('--extreme', action='store_true', help='every other frame dark, the others bright (mvtest.extreme)')
     ap.add_argument('--analyse8', action='store_true', help='analyse an 8-bit copy of the clip')
     ap.add_argument('--vectors', choices=['mvgpu', 'mvu'], default='mvgpu', help="whose vectors both sides use")
     ap.add_argument('--blksize', type=int, nargs='+', default=[16], help='the block width, and its height when it differs')
@@ -64,6 +66,8 @@ def main():
         core.std.LoadPlugin(args.mvu)
     w, h = (int(v) for v in args.size.split('x'))
     clip = format_clip(core, nv12_clip(core, args.src, w, h, args.frames), args.format)
+    if args.extreme:
+        clip = extreme(core, clip)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)

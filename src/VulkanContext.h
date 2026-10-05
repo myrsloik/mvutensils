@@ -107,9 +107,9 @@ struct Params {
     int32_t stamp, level, flags, topRadius;
     int32_t medianScale, medianSlot, finest, blockRows;
     int32_t colour, recStride, coarseBase, aw;
-    int32_t ah;
+    int32_t ah, penalties, moveRadius;
 };
-static_assert(sizeof(Params) == 116, "refine_common.glsl's Params is 29 ints");
+static_assert(sizeof(Params) == 124, "refine_common.glsl's Params is 31 ints");
 
 // Super's push constants (super.comp, super_qpel.comp, pyr_reduce.comp), matching
 // super_common.glsl's Params; they share the Main layout and its push constant range
@@ -185,7 +185,7 @@ struct RecalcParams {
     int32_t hc, aw, ah, lambda;
     int32_t thsad, pnew, search, searchParam;
     int32_t smoothing, oldPelShift, stepY, blkOldY;
-    int32_t stepOldY;
+    int32_t stepOldY, thsadHi;
 };
 static_assert(sizeof(RecalcParams) <= kPushBytes, "recalc.comp's Params must fit the push constants");
 
