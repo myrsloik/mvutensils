@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <bit>
 #include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
 #ifdef _WIN32
 #include <malloc.h>
 #else 

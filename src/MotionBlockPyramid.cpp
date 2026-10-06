@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <cmath>
+#include <utility>
 #include "Common.h"
 
 static constexpr VECTOR zeroMVCandidate = { 0, 0, 0 };
