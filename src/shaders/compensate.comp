@@ -14,24 +14,26 @@ layout(local_size_x = 64) in;
 #define kOverlapY pc.overlapY
 #define kPixelMax pc.time4096BX
 #define kWinOff pc.colOff
-#define kQuad pc.time4096BY // four pixels per lane (Main4)
+#define kQuad pc.time4096BY // four pixels per lane (Main4, Main4UV)
 
-// The frame's own super's planes and the reference super's, and the output, as words, for Main4
+// The frame's own super's planes and the reference super's, and the outputs, as words, for Main4 and
+// Main4UV
 layout(std430, set = 0, binding = 0) readonly buffer SrcLuma32 { uint srcY32[]; };
 layout(std430, set = 0, binding = 1) readonly buffer SrcChroma32 { uint srcC32[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma32 { uint refY32[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RefChroma32 { uint refC32[]; };
 layout(std430, set = 0, binding = 12) writeonly buffer Out32 { uint outPx32[]; };
+layout(std430, set = 0, binding = 14) writeonly buffer OutV32 { uint outPxV32[]; };
 
 // C++'s a / 256, truncated toward zero
 int Div256(int a) {
     return a >= 0 ? a >> 8 : -(-a >> 8);
 }
 
-// Where block (bx, by)'s pixel at the plane's (x, y) comes from, (X, Y) in 1 / pel pixels of the plane:
-// true, the reference frame's super (bound as ref) at the block's vector scaled to the time, when the
-// block's SAD is under thsad; else false, the frame's own super (src) at the block's own place, as
-// mvu.Compensate takes the blocks (its blx, bly, chroma's the luma position shifted by the
+// Where block (bx, by)'s pixel at the plane's (x, y) comes from, (X, Y) in 1 / pel pixels of the
+// plane: true, the reference frame's super (bound as ref) at the block's vector scaled to the time,
+// when the block's SAD is under thsad; else false, the frame's own super (src) at the block's own
+// place, as mvu.Compensate takes the blocks (its blx, bly, chroma's the luma position shifted by the
 // subsampling)
 bool Source(int bx, int by, int x, int y, int Sx, int Sy, out int X, out int Y) {
     ivec4 r = vecF[by * pc.recStride + bx];
@@ -47,6 +49,27 @@ bool Source(int bx, int by, int x, int y, int Sx, int Sy, out int X, out int Y) 
     return moved;
 }
 
+// The plane's block geometry (luma's, or chroma's, its subsampling dividing it): block size, step
+// and overlap
+void Geometry(out int Bx, out int By, out int Sx, out int Sy, out int Ox, out int Oy) {
+    int lx = pc.plane == 0 ? 0 : kLogX, ly = pc.plane == 0 ? 0 : kLogY;
+    Bx = (kStep + kOverlap) >> lx;
+    By = (kStepY + kOverlapY) >> ly;
+    Sx = kStep >> lx;
+    Sy = kStepY >> ly;
+    Ox = kOverlap >> lx;
+    Oy = kOverlapY >> ly;
+}
+
+// Where block (bx, by)'s overlap window weight at the plane's pixel (x, y) is in taps[]: mvu's
+// OverlapWindows, the 9 of them for the frame's edges and corners, values to 2048; the next pixel's
+// the entry after it
+int WindowAt(int bx, int by, int x, int y, int Bx, int By, int Sx, int Sy) {
+    int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
+    int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
+    return kWinOff + ((wby + wbx) * By + y - by * Sy) * Bx + x - bx * Sx;
+}
+
 // The four bytes from byte a on, of words w0 (holding byte a) and w1
 uint Funnel4(uint w0, uint w1, uint a) {
     uint s = (a & 3u) * 8u;
@@ -55,31 +78,85 @@ uint Funnel4(uint w0, uint w1, uint a) {
 uvec4 Unpack4(uint w) {
     return uvec4(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu, w >> 24u);
 }
-
-// Sample()'s four samples at (X, Y), (X + kPel, Y), ... of the reference frame's super or the frame's
-// own, 8-bit at pel 1 or 2: where none of them is clamped they are four bytes in a row of one plane,
-// read as words (the super's spare rows keep the word after the last pixel inside it); else one at a
-// time
-uint Word(bool ref, bool luma, uint i) {
-    return luma ? (ref ? refY32[i] : srcY32[i]) : (ref ? refC32[i] : srcC32[i]);
+uint Pack4(uvec4 p) {
+    return p.x | (p.y << 8u) | (p.z << 16u) | (p.w << 24u);
 }
 
+// Word i of the reference frame's super or the frame's own, luma's or chroma's
+uint WordY(bool ref, uint i) {
+    return ref ? refY32[i] : srcY32[i];
+}
+uint WordC(bool ref, uint i) {
+    return ref ? refC32[i] : srcC32[i];
+}
+
+// Sample()'s four luma samples at (X, Y), (X + kPel, Y), ... of the reference frame's super or the
+// frame's own, 8-bit at pel 1 or 2: where none of them is clamped they are four bytes in a row of one
+// plane, read as words (the super's spare rows keep the word after the last pixel inside it); else
+// one at a time
 uvec4 Sample4(bool ref, int X, int Y) {
-    bool luma = pc.plane == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    int Xp = X + kPel * (luma ? pc.pad : pc.padc), Yp = Y + kPel * (luma ? pc.padY : pc.padcY);
+    int stride = pc.wp, rows = pc.hp;
+    int Xp = X + kPel * pc.pad, Yp = Y + kPel * pc.padY;
     if (Xp >= 0 && Xp + 3 * kPel <= kPel * stride - 1 && Yp >= 0 && Yp <= kPel * rows - 1) {
-        uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-        uint a = base + (kPel == 1 ? uint(Yp * stride + Xp) : HalfAddr(Xp, Yp, stride, rows)), i = a >> 2u;
-        return Unpack4(Funnel4(Word(ref, luma, i), Word(ref, luma, i + 1u), a));
+        uint a = kPel == 1 ? uint(Yp * stride + Xp) : HalfAddr(Xp, Yp, stride, rows), i = a >> 2u;
+        return Unpack4(Funnel4(WordY(ref, i), WordY(ref, i + 1u), a));
     }
     return uvec4(Sample(ref, X, Y), Sample(ref, X + kPel, Y), Sample(ref, X + 2 * kPel, Y), Sample(ref, X + 3 * kPel, Y));
 }
 
-// main's arithmetic for four adjacent pixels per lane, 8-bit samples at pel 1 or 2, where the
-// plane's step and overlap are multiples of 4 (Compensate.cpp sets kQuad): the four lie in the same
-// blocks, their reference samples kPel apart in one row of one plane. Dispatched as
-// ((width + 255) / 256, height) workgroups per plane.
+// And SampleUV()'s four places' U samples (u) and V samples (v): where none is clamped, eight bytes
+// in a row of one plane, U's and V's alternating, read as three words
+void Sample4UV(bool ref, int X, int Y, out uvec4 u, out uvec4 v) {
+    int stride = pc.wc, rows = pc.hc;
+    int Xp = X + kPel * pc.padc, Yp = Y + kPel * pc.padcY;
+    if (Xp >= 0 && Xp + 3 * kPel <= kPel * stride - 1 && Yp >= 0 && Yp <= kPel * rows - 1) {
+        uint a = 2u * (kPel == 1 ? uint(Yp * stride + Xp) : HalfAddr(Xp, Yp, stride, rows)), i = a >> 2u;
+        uint w1 = WordC(ref, i + 1u);
+        uint lo = Funnel4(WordC(ref, i), w1, a), hi = Funnel4(w1, WordC(ref, i + 2u), a);
+        u = uvec4(lo & 0xFFu, (lo >> 16u) & 0xFFu, hi & 0xFFu, (hi >> 16u) & 0xFFu);
+        v = uvec4((lo >> 8u) & 0xFFu, lo >> 24u, (hi >> 8u) & 0xFFu, hi >> 24u);
+        return;
+    }
+    uvec2 s0 = SampleUV(ref, X, Y), s1 = SampleUV(ref, X + kPel, Y), s2 = SampleUV(ref, X + 2 * kPel, Y), s3 = SampleUV(ref, X + 3 * kPel, Y);
+    u = uvec4(s0.x, s1.x, s2.x, s3.x);
+    v = uvec4(s0.y, s1.y, s2.y, s3.y);
+}
+
+// A group of four 8-bit output pixels at at, inside of them in the plane: a word where they're whole
+// and aligned, else a byte at a time; luma's or U's, and V's
+void Store4(uint at, int inside, uvec4 p) {
+    if (inside == 4 && (at & 3u) == 0u) {
+        outPx32[at >> 2u] = Pack4(p);
+    } else {
+        [[unroll]] for (int i = 0; i < 4; ++i)
+            if (i < inside)
+                outPx[at + uint(i)] = uint8_t(p[i]);
+    }
+}
+void Store4V(uint at, int inside, uvec4 p) {
+    if (inside == 4 && (at & 3u) == 0u) {
+        outPxV32[at >> 2u] = Pack4(p);
+    } else {
+        [[unroll]] for (int i = 0; i < 4; ++i)
+            if (i < inside)
+                outPxV[at + uint(i)] = uint8_t(p[i]);
+    }
+}
+
+// mvu.Compensate's pixel of the plane: every block covering it, one or, inside the overlaps, two or
+// four, gives it its motion compensated pixel, or its own super's (Source), weighted by the block's
+// overlap window (Window), each product >> 6 and added up in mvu's order, the row above before the
+// block's own and the left column first, then (sum + 16) >> 5, clamped to the clip's largest value;
+// without overlap the one block's pixel. Float clips take mvu's float arithmetic (overlaps_c,
+// ToPixels): products / 64 added up from zero in the same order, then / 32, unclamped. Where the
+// vectors are at a scene change (counts[0] above the limit), the clip's pixel. Chroma's lanes make U
+// and V together (MainUV, Main4UV): their blocks, sources and windows are the same, and the supers
+// hold their samples side by side. Each path is dispatched as ((width + 63) / 64, height) workgroups
+// per plane, luma and chroma, the four pixel ones (kQuad) as ((width + 255) / 256, height).
+
+// Luma, four adjacent pixels per lane: main's arithmetic, 8-bit samples at pel 1 or 2, where the
+// step and overlap are multiples of 4 (Compensate.cpp sets kQuad): the four lie in the same blocks,
+// their reference samples kPel apart in one row of one plane.
 void Main4() {
     int x = 4 * int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= pc.width)
@@ -93,11 +170,8 @@ void Main4() {
             if (i < inside)
                 res[i] = uint(clipSrc[c + uint(i)]);
     } else {
-        bool luma = pc.plane == 0;
-        int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-        int Bx = (kStep + kOverlap) >> lx, By = (kStepY + kOverlapY) >> ly;
-        int Sx = kStep >> lx, Sy = kStepY >> ly;
-        int Ox = kOverlap >> lx, Oy = kOverlapY >> ly;
+        int Bx, By, Sx, Sy, Ox, Oy;
+        Geometry(Bx, By, Sx, Sy, Ox, Oy);
         int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
         bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
         uvec4 acc = uvec4(0u);
@@ -111,55 +185,145 @@ void Main4() {
             if ((kOverlap | kOverlapY) == 0) {
                 acc = v;
             } else {
-                int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
-                int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
-                int t = kWinOff + ((wby + wbx) * By + y - by * Sy) * Bx + x - bx * Sx;
+                int t = WindowAt(bx, by, x, y, Bx, By, Sx, Sy);
                 acc += (v * uvec4(uint(taps[t]), uint(taps[t + 1]), uint(taps[t + 2]), uint(taps[t + 3]))) >> 6u;
             }
         }
         res = (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uvec4(uint(kPixelMax)));
     }
-    if (inside == 4 && (at & 3u) == 0u) {
-        outPx32[at >> 2u] = res.x | (res.y << 8u) | (res.z << 16u) | (res.w << 24u);
+    Store4(at, inside, res);
+}
+
+// Chroma, four adjacent pixels per lane, U and V together: Main4's arithmetic, where chroma's step and
+// overlap are multiples of 4.
+void Main4UV() {
+    int x = 4 * int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+    if (x >= pc.width)
+        return;
+    int inside = min(4, pc.width - x); // the group's pixels inside the plane
+    uint at = uint(y * pc.outStride + x), c = uint(y * pc.clipStride + x);
+    uvec4 ru = uvec4(0u), rv = uvec4(0u);
+    if (counts[0] > uint(pc.scdLimit)) {
+        [[unroll]] for (int i = 0; i < 4; ++i) {
+            if (i < inside) {
+                ru[i] = uint(clipSrc[c + uint(i)]);
+                rv[i] = uint(clipSrcV[c + uint(i)]);
+            }
+        }
     } else {
-        [[unroll]] for (int i = 0; i < 4; ++i)
-            if (i < inside)
-                outPx[at + uint(i)] = uint8_t(res[i]);
+        int Bx, By, Sx, Sy, Ox, Oy;
+        Geometry(Bx, By, Sx, Sy, Ox, Oy);
+        int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
+        bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
+        uvec4 au = uvec4(0u), av = uvec4(0u);
+        for (int k = 3; k >= 0; --k) {
+            if (((k & 1) != 0 && !hasLeft) || ((k & 2) != 0 && !hasUp))
+                continue;
+            int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? byA - 1 : byA;
+            int X, Y;
+            bool moved = Source(bx, by, x, y, Sx, Sy, X, Y);
+            uvec4 u, v;
+            Sample4UV(moved, X, Y, u, v);
+            if ((kOverlap | kOverlapY) == 0) {
+                au = u;
+                av = v;
+            } else {
+                int t = WindowAt(bx, by, x, y, Bx, By, Sx, Sy);
+                uvec4 w4 = uvec4(uint(taps[t]), uint(taps[t + 1]), uint(taps[t + 2]), uint(taps[t + 3]));
+                au += (u * w4) >> 6u;
+                av += (v * w4) >> 6u;
+            }
+        }
+        bool ov = (kOverlap | kOverlapY) != 0;
+        ru = ov ? min((au + 16u) >> 5u, uvec4(uint(kPixelMax))) : au;
+        rv = ov ? min((av + 16u) >> 5u, uvec4(uint(kPixelMax))) : av;
+    }
+    Store4(at, inside, ru);
+    Store4V(at, inside, rv);
+}
+
+// Chroma, one pixel per lane, U and V together, any pel and sample type
+void MainUV(int x, int y) {
+    uint at = uint(y * pc.outStride + x), c = uint(y * pc.clipStride + x);
+    if (counts[0] > uint(pc.scdLimit)) {
+        if (kFloat) {
+            outPxF[at] = clipSrcF[c];
+            outPxVF[at] = clipSrcVF[c];
+        } else {
+            Store(at, ClipPx(false, c));
+            StoreV(at, ClipPxV(false, c));
+        }
+        return;
+    }
+    int Bx, By, Sx, Sy, Ox, Oy;
+    Geometry(Bx, By, Sx, Sy, Ox, Oy);
+    int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
+    bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
+    uvec2 acc = uvec2(0u);
+    vec2 accF = vec2(0.0);
+    for (int k = 3; k >= 0; --k) {
+        if (((k & 1) != 0 && !hasLeft) || ((k & 2) != 0 && !hasUp))
+            continue;
+        int bx = (k & 1) != 0 ? bxA - 1 : bxA, by = (k & 2) != 0 ? byA - 1 : byA;
+        int X, Y;
+        bool moved = Source(bx, by, x, y, Sx, Sy, X, Y);
+        int win = 2048; // (a branch, not ?:, which may read the windows where there are none)
+        if ((kOverlap | kOverlapY) != 0)
+            win = taps[WindowAt(bx, by, x, y, Bx, By, Sx, Sy)];
+        if (kFloat) {
+            vec2 v = SampleUVF(moved, X, Y);
+            if ((kOverlap | kOverlapY) == 0) {
+                accF = v;
+            } else {
+                precise vec2 t = v * float(win);
+                precise vec2 u = t * (1.0 / 64.0);
+                precise vec2 a = accF + u;
+                accF = a;
+            }
+        } else {
+            uvec2 v = SampleUV(moved, X, Y);
+            if ((kOverlap | kOverlapY) == 0)
+                acc = v;
+            else
+                acc += (v * uint(win)) >> 6u;
+        }
+    }
+    if (kFloat) {
+        precise vec2 v = (kOverlap | kOverlapY) == 0 ? accF : accF * (1.0 / 32.0);
+        outPxF[at] = v.x;
+        outPxVF[at] = v.y;
+    } else {
+        uvec2 v = (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uvec2(uint(kPixelMax)));
+        Store(at, v.x);
+        StoreV(at, v.y);
     }
 }
 
-// mvu.Compensate's pixel of the plane: every block covering it, one or, inside the overlaps, two or
-// four, gives it its motion compensated pixel, or its own super's (Source), weighted by the block's
-// overlap window (mvu's
-// OverlapWindows, the 9 of them for the frame's edges and corners, values to 2048), each product >> 6
-// and added up in mvu's order, the row above before the block's own and the left column first, then
-// (sum + 16) >> 5, clamped to the clip's largest value; without overlap the one block's pixel. Float
-// clips take mvu's float arithmetic (overlaps_c, ToPixels): products / 64 added up from zero in the
-// same order, then / 32, unclamped. Where the vectors are at a scene change (counts[0] above the
-// limit), the clip's pixel. Dispatched as ((width + 63) / 64, height) workgroups per plane.
 void main() {
     if (kQuad != 0) {
-        Main4();
+        if (pc.plane != 0)
+            Main4UV();
+        else
+            Main4();
         return;
     }
     int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= pc.width)
         return;
+    if (pc.plane != 0) {
+        MainUV(x, y);
+        return;
+    }
     uint at = uint(y * pc.outStride + x), c = uint(y * pc.clipStride + x);
     if (counts[0] > uint(pc.scdLimit)) {
         if (kFloat)
             outPxF[at] = clipSrcF[c];
-        else if (kWide)
-            outPx16[at] = clipSrc16[c];
         else
-            outPx[at] = clipSrc[c];
+            Store(at, ClipPx(false, c));
         return;
     }
-    bool luma = pc.plane == 0;
-    int lx = luma ? 0 : kLogX, ly = luma ? 0 : kLogY;
-    int Bx = (kStep + kOverlap) >> lx, By = (kStepY + kOverlapY) >> ly; // the plane's block size,
-    int Sx = kStep >> lx, Sy = kStepY >> ly;                            // step
-    int Ox = kOverlap >> lx, Oy = kOverlapY >> ly;                      // and overlap
+    int Bx, By, Sx, Sy, Ox, Oy;
+    Geometry(Bx, By, Sx, Sy, Ox, Oy);
     int bxA = min(x / Sx, pc.nbx - 1), byA = min(y / Sy, pc.nby - 1);
     bool hasLeft = bxA >= 1 && x < bxA * Sx + Ox, hasUp = byA >= 1 && y < byA * Sy + Oy;
 
@@ -172,11 +336,8 @@ void main() {
         int X, Y;
         bool moved = Source(bx, by, x, y, Sx, Sy, X, Y);
         int win = 2048;
-        if ((kOverlap | kOverlapY) != 0) {
-            int wbx = bx == pc.nbx - 1 ? 2 : (bx == 0 ? 0 : 1);
-            int wby = by == 0 ? 0 : (by == pc.nby - 1 ? 6 : 3);
-            win = taps[kWinOff + ((wby + wbx) * By + y - by * Sy) * Bx + x - bx * Sx];
-        }
+        if ((kOverlap | kOverlapY) != 0)
+            win = taps[WindowAt(bx, by, x, y, Bx, By, Sx, Sy)];
         if (kFloat) {
             float v = SampleF(moved, X, Y);
             if ((kOverlap | kOverlapY) == 0) {
@@ -199,10 +360,6 @@ void main() {
         precise float v = (kOverlap | kOverlapY) == 0 ? accF : accF * (1.0 / 32.0);
         outPxF[at] = v;
     } else {
-        uint v = (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uint(kPixelMax));
-        if (kWide)
-            outPx16[at] = uint16_t(v);
-        else
-            outPx[at] = uint8_t(v);
+        Store(at, (kOverlap | kOverlapY) == 0 ? acc : min((acc + 16u) >> 5u, uint(kPixelMax)));
     }
 }

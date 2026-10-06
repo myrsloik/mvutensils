@@ -28,14 +28,13 @@ const int kLogX = kChromaLog & 1, kLogY = kChromaLog >> 1;
 const bool kWide = (kVariant & 4) != 0;
 const bool kFloat = (kVariant & 8) != 0;
 const bool kImage = kPel == 4 && kChromaLog != 0; // subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h)
-const int kChromaPlanes = kImage ? 16 : kPel == 1 ? 1 : 4; // U's half-pel planes (or image, or full-pel plane), then V's as many plane sizes on
 
 // Matches FlowParams in VulkanContext.h
 layout(push_constant) uniform Params {
     int nbx, nby, recStride, flags;         // the grid, vector records per row, kHave* and kBlend
     int pad, padY, padc, padcY;             // the supers' padding, luma's and chroma's
     int wp, hp, wc, hc;                     // their storage frames' strides and rows per plane
-    int plane, width, height, outStride;    // flow_inter.comp: the plane, its size, the output plane's stride
+    int plane, width, height, outStride;    // the plane (0 luma, 1 chroma: U and V together), its size, the output planes' stride
     int clipStride, time256, thscd1, scdLimit; // the clip planes' stride; the time (flow_blur.comp's blur256); the scene change test
     int colOff, rowOff;                     // flow_inter.comp: the plane's resize taps in taps[]
     float occnormX, occnormY;               // flow_prep.comp: MakeVectorOcclusionMask's occnorm
@@ -54,8 +53,10 @@ const int kHaveFB = 1, kHaveExtra = 2, kBlend = 4, kVerticalFirst = 8;
 // then B's; the scene change counts of F, B, FF, BB; the clip's plane in both frames; the output;
 // the resize's taps, for each column of each plane's output, then each row (FlowInterpolate.cpp's
 // ResizeTaps): the block to its left (above it) << 15 | that block's 14-bit weight, the next block
-// taking the rest. The planes' samples are bytes, 16 bits each for 9 to 16-bit clips (kWide) or
-// floats (kFloat), every plane buffer declared all three ways.
+// taking the rest; and for chroma, whose U and V a lane makes together, V's output and clip planes
+// (U's in the output's and the clip's bindings). The supers hold chroma's U and V interleaved, sample
+// by sample (SuperLayout.h). The planes' samples are bytes, 16 bits each for 9 to 16-bit clips
+// (kWide) or floats (kFloat), every plane buffer declared all three ways.
 layout(std430, set = 0, binding = 0) readonly buffer SrcLuma { uint8_t srcY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer SrcChroma { uint8_t srcC[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma { uint8_t refY[]; };
@@ -84,24 +85,52 @@ layout(std430, set = 0, binding = 10) readonly buffer ClipSrcF { float clipSrcF[
 layout(std430, set = 0, binding = 11) readonly buffer ClipRefF { float clipRefF[]; };
 layout(std430, set = 0, binding = 12) writeonly buffer OutF { float outPxF[]; };
 layout(std430, set = 0, binding = 13) readonly buffer Taps { int taps[]; };
+layout(std430, set = 0, binding = 14) writeonly buffer OutV { uint8_t outPxV[]; };
+layout(std430, set = 0, binding = 15) readonly buffer ClipSrcV { uint8_t clipSrcV[]; };
+layout(std430, set = 0, binding = 16) readonly buffer ClipRefV { uint8_t clipRefV[]; };
+layout(std430, set = 0, binding = 14) writeonly buffer OutV16 { uint16_t outPxV16[]; };
+layout(std430, set = 0, binding = 15) readonly buffer ClipSrcV16 { uint16_t clipSrcV16[]; };
+layout(std430, set = 0, binding = 16) readonly buffer ClipRefV16 { uint16_t clipRefV16[]; };
+layout(std430, set = 0, binding = 14) writeonly buffer OutVF { float outPxVF[]; };
+layout(std430, set = 0, binding = 15) readonly buffer ClipSrcVF { float clipSrcVF[]; };
+layout(std430, set = 0, binding = 16) readonly buffer ClipRefVF { float clipRefVF[]; };
 
-// A sample of the plane pc.plane of the frame before (src) or the frame after (ref)
-uint Px(bool ref, uint i) {
-    if (kWide) {
-        if (pc.plane == 0)
-            return ref ? uint(refY16[i]) : uint(srcY16[i]);
+// A sample of luma's or chroma's planes of the frame before (src) or the frame after (ref)
+uint LumaPx(bool ref, uint i) {
+    if (kWide)
+        return ref ? uint(refY16[i]) : uint(srcY16[i]);
+    return ref ? uint(refY[i]) : uint(srcY[i]);
+}
+uint ChromaPx(bool ref, uint i) {
+    if (kWide)
         return ref ? uint(refC16[i]) : uint(srcC16[i]);
-    }
-    if (pc.plane == 0)
-        return ref ? uint(refY[i]) : uint(srcY[i]);
     return ref ? uint(refC[i]) : uint(srcC[i]);
 }
 
-// A sample of the clip's plane in the frame before or the frame after
+// A sample of the clip's plane in the frame before or the frame after: luma's or U's, and V's
 uint ClipPx(bool ref, uint i) {
     if (kWide)
         return ref ? uint(clipRef16[i]) : uint(clipSrc16[i]);
     return ref ? uint(clipRef[i]) : uint(clipSrc[i]);
+}
+uint ClipPxV(bool ref, uint i) {
+    if (kWide)
+        return ref ? uint(clipRefV16[i]) : uint(clipSrcV16[i]);
+    return ref ? uint(clipRefV[i]) : uint(clipSrcV[i]);
+}
+
+// The output's pixel at i: luma's or U's, and V's
+void Store(uint i, uint v) {
+    if (kWide)
+        outPx16[i] = uint16_t(v);
+    else
+        outPx[i] = uint8_t(v);
+}
+void StoreV(uint i, uint v) {
+    if (kWide)
+        outPxV16[i] = uint16_t(v);
+    else
+        outPxV[i] = uint8_t(v);
 }
 
 // The rounded average mvu.Super's quarter planes take of two samples
@@ -109,10 +138,11 @@ uint Avg(uint a, uint b) {
     return (a + b + 1u) >> 1u;
 }
 
-// Float clips: a sample of the plane, and mvu.Super's float AveragePixels, (a + b) * 0.5
-float PxF(bool ref, uint i) {
-    if (pc.plane == 0)
-        return ref ? refYF[i] : srcYF[i];
+// Float clips: a sample of luma's or chroma's planes, and mvu.Super's float AveragePixels, (a + b) * 0.5
+float LumaPxF(bool ref, uint i) {
+    return ref ? refYF[i] : srcYF[i];
+}
+float ChromaPxF(bool ref, uint i) {
     return ref ? refCF[i] : srcCF[i];
 }
 float AvgF(float a, float b) {
@@ -126,67 +156,117 @@ uint HalfAddr(int Xh, int Yh, int stride, int rows) {
     return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
 }
 
-// mvu's PlaneGather: the sample at (X, Y), 1 / pel pixels from the plane's top left pixel, of the
-// super of the frame before or the frame after (at pel 1 its full-pel plane); between the half-pel
-// samples (luma, and 4:4:4
-// chroma, at pel 4) the rounded average of their neighbours, as mvu.Super's quarter planes hold it;
-// subsampled chroma at pel 4 from its quarter-pel image. The position is clamped to the storage,
-// where mvu reads outside the padding.
+// mvu's PlaneGather of luma: the sample at (X, Y), 1 / pel pixels from the plane's top left pixel, of
+// the super of the frame before or the frame after (at pel 1 its full-pel plane); at pel 4 between the
+// half-pel samples the rounded average of their neighbours, as mvu.Super's quarter planes hold it. The
+// position is clamped to the storage, where mvu reads outside the padding.
 uint Sample(bool ref, int X, int Y) {
-    bool luma = pc.plane == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    X += kPel * (luma ? pc.pad : pc.padc);
-    Y += kPel * (luma ? pc.padY : pc.padcY);
-    uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-    if (!luma && kImage) {
-        X = clamp(X, 0, 4 * stride - 1);
-        Y = clamp(Y, 0, 4 * rows - 1);
-        return Px(ref, base + uint(Y * 4 * stride + X));
-    }
+    int stride = pc.wp, rows = pc.hp;
+    X += kPel * pc.pad;
+    Y += kPel * pc.padY;
     if (kPel == 1) {
         X = clamp(X, 0, stride - 1);
         Y = clamp(Y, 0, rows - 1);
-        return Px(ref, base + uint(Y * stride + X));
+        return LumaPx(ref, uint(Y * stride + X));
     }
     if (kPel == 2) {
         X = clamp(X, 0, 2 * stride - 1);
         Y = clamp(Y, 0, 2 * rows - 1);
-        return Px(ref, base + HalfAddr(X, Y, stride, rows));
+        return LumaPx(ref, HalfAddr(X, Y, stride, rows));
     }
     X = clamp(X, 0, 4 * stride - 2);
     Y = clamp(Y, 0, 4 * rows - 2);
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
-    return Avg(Avg(Px(ref, base + HalfAddr(Xa, Ya, stride, rows)), Px(ref, base + HalfAddr(Xa, Yb, stride, rows))),
-               Avg(Px(ref, base + HalfAddr(Xb, Ya, stride, rows)), Px(ref, base + HalfAddr(Xb, Yb, stride, rows))));
+    return Avg(Avg(LumaPx(ref, HalfAddr(Xa, Ya, stride, rows)), LumaPx(ref, HalfAddr(Xa, Yb, stride, rows))),
+               Avg(LumaPx(ref, HalfAddr(Xb, Ya, stride, rows)), LumaPx(ref, HalfAddr(Xb, Yb, stride, rows))));
 }
 
-// Sample(), of a float clip
-float SampleF(bool ref, int X, int Y) {
-    bool luma = pc.plane == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    X += kPel * (luma ? pc.pad : pc.padc);
-    Y += kPel * (luma ? pc.padY : pc.padcY);
-    uint base = pc.plane == 2 ? uint(kChromaPlanes * pc.wc * pc.hc) : 0u;
-    if (!luma && kImage) {
+// And of chroma: U's and V's samples at (X, Y), which the interleaved planes hold side by side, U's
+// where one plane alone would hold the sample at a at 2a; 4:4:4 at pel 4 between its half-pel samples
+// as luma, subsampled chroma at pel 4 from its quarter-pel image
+uvec2 SampleUV(bool ref, int X, int Y) {
+    int stride = pc.wc, rows = pc.hc;
+    X += kPel * pc.padc;
+    Y += kPel * pc.padcY;
+    uint a;
+    if (kImage) {
         X = clamp(X, 0, 4 * stride - 1);
         Y = clamp(Y, 0, 4 * rows - 1);
-        return PxF(ref, base + uint(Y * 4 * stride + X));
+        a = 2u * uint(Y * 4 * stride + X);
+        return uvec2(ChromaPx(ref, a), ChromaPx(ref, a + 1u));
     }
     if (kPel == 1) {
         X = clamp(X, 0, stride - 1);
         Y = clamp(Y, 0, rows - 1);
-        return PxF(ref, base + uint(Y * stride + X));
+        a = 2u * uint(Y * stride + X);
+        return uvec2(ChromaPx(ref, a), ChromaPx(ref, a + 1u));
     }
     if (kPel == 2) {
         X = clamp(X, 0, 2 * stride - 1);
         Y = clamp(Y, 0, 2 * rows - 1);
-        return PxF(ref, base + HalfAddr(X, Y, stride, rows));
+        a = 2u * HalfAddr(X, Y, stride, rows);
+        return uvec2(ChromaPx(ref, a), ChromaPx(ref, a + 1u));
     }
     X = clamp(X, 0, 4 * stride - 2);
     Y = clamp(Y, 0, 4 * rows - 2);
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
-    return AvgF(AvgF(PxF(ref, base + HalfAddr(Xa, Ya, stride, rows)), PxF(ref, base + HalfAddr(Xa, Yb, stride, rows))),
-                AvgF(PxF(ref, base + HalfAddr(Xb, Ya, stride, rows)), PxF(ref, base + HalfAddr(Xb, Yb, stride, rows))));
+    uint aa = 2u * HalfAddr(Xa, Ya, stride, rows), ab = 2u * HalfAddr(Xa, Yb, stride, rows);
+    uint ba = 2u * HalfAddr(Xb, Ya, stride, rows), bb = 2u * HalfAddr(Xb, Yb, stride, rows);
+    return uvec2(Avg(Avg(ChromaPx(ref, aa), ChromaPx(ref, ab)), Avg(ChromaPx(ref, ba), ChromaPx(ref, bb))),
+                 Avg(Avg(ChromaPx(ref, aa + 1u), ChromaPx(ref, ab + 1u)), Avg(ChromaPx(ref, ba + 1u), ChromaPx(ref, bb + 1u))));
+}
+
+// Sample() and SampleUV(), of a float clip
+float SampleF(bool ref, int X, int Y) {
+    int stride = pc.wp, rows = pc.hp;
+    X += kPel * pc.pad;
+    Y += kPel * pc.padY;
+    if (kPel == 1) {
+        X = clamp(X, 0, stride - 1);
+        Y = clamp(Y, 0, rows - 1);
+        return LumaPxF(ref, uint(Y * stride + X));
+    }
+    if (kPel == 2) {
+        X = clamp(X, 0, 2 * stride - 1);
+        Y = clamp(Y, 0, 2 * rows - 1);
+        return LumaPxF(ref, HalfAddr(X, Y, stride, rows));
+    }
+    X = clamp(X, 0, 4 * stride - 2);
+    Y = clamp(Y, 0, 4 * rows - 2);
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    return AvgF(AvgF(LumaPxF(ref, HalfAddr(Xa, Ya, stride, rows)), LumaPxF(ref, HalfAddr(Xa, Yb, stride, rows))),
+                AvgF(LumaPxF(ref, HalfAddr(Xb, Ya, stride, rows)), LumaPxF(ref, HalfAddr(Xb, Yb, stride, rows))));
+}
+vec2 SampleUVF(bool ref, int X, int Y) {
+    int stride = pc.wc, rows = pc.hc;
+    X += kPel * pc.padc;
+    Y += kPel * pc.padcY;
+    uint a;
+    if (kImage) {
+        X = clamp(X, 0, 4 * stride - 1);
+        Y = clamp(Y, 0, 4 * rows - 1);
+        a = 2u * uint(Y * 4 * stride + X);
+        return vec2(ChromaPxF(ref, a), ChromaPxF(ref, a + 1u));
+    }
+    if (kPel == 1) {
+        X = clamp(X, 0, stride - 1);
+        Y = clamp(Y, 0, rows - 1);
+        a = 2u * uint(Y * stride + X);
+        return vec2(ChromaPxF(ref, a), ChromaPxF(ref, a + 1u));
+    }
+    if (kPel == 2) {
+        X = clamp(X, 0, 2 * stride - 1);
+        Y = clamp(Y, 0, 2 * rows - 1);
+        a = 2u * HalfAddr(X, Y, stride, rows);
+        return vec2(ChromaPxF(ref, a), ChromaPxF(ref, a + 1u));
+    }
+    X = clamp(X, 0, 4 * stride - 2);
+    Y = clamp(Y, 0, 4 * rows - 2);
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    uint aa = 2u * HalfAddr(Xa, Ya, stride, rows), ab = 2u * HalfAddr(Xa, Yb, stride, rows);
+    uint ba = 2u * HalfAddr(Xb, Ya, stride, rows), bb = 2u * HalfAddr(Xb, Yb, stride, rows);
+    return vec2(AvgF(AvgF(ChromaPxF(ref, aa), ChromaPxF(ref, ab)), AvgF(ChromaPxF(ref, ba), ChromaPxF(ref, bb))),
+                AvgF(AvgF(ChromaPxF(ref, aa + 1u), ChromaPxF(ref, ab + 1u)), AvgF(ChromaPxF(ref, ba + 1u), ChromaPxF(ref, bb + 1u))));
 }
 
 // The resize's blocks and weights at the plane's pixel (x, y): blocks gIa and gIb = gIa + 1 of the

@@ -23,7 +23,7 @@ layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; 
 // as its SAD adds up (the penalty with it). The phases' lists keep each position's SAD so far, of
 // which its cost follows. So a position whose partial cost passes that bound is dropped; the winner
 // never is, since the bound never falls below its cost. The SAD adds up in kUnits equal units,
-// unit u being luma rows 2u and 2u + 1 and the chroma rows of U and V beside them, row u where
+// unit u being luma rows 2u and 2u + 1 and the chroma rows beside them (U and V), row u where
 // chroma is subsampled vertically (4:2:0, 4:4:0), 2u and 2u + 1 where it isn't (4:2:2, 4:4:4), or
 // the luma rows alone without chroma; with kSatd luma rows 4u to 4u + 3, a band of luma's SATD tiles,
 // and the chroma rows beside them. In three phases: every position's first units, then the next
@@ -79,10 +79,10 @@ void Append(int list, bool keep, uint pos, uint sad) {
 }
 
 // The lane's position: its SAD's word addresses and shifts as LaneSad computes them (or its chroma
-// rows' sample addresses in the quarter-pel images), its lambda term (saturated to 32 bits: anything
+// rows' sample address in the quarter-pel image), its lambda term (saturated to 32 bits: anything
 // that large passes every bound), and the partial sums of the units measured
 int64_t gLam;
-uint gW, gShift, gWU, gWV, gShiftC, gSa, gSm;
+uint gW, gShift, gWC, gShiftC, gSa, gSm;
 
 void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     // The search's positions are whole pels (at pel 4 on the full-pel grid, ClampFull); at pel 2 a
@@ -94,11 +94,9 @@ void Setup(ivec2 v, ivec2 p, int64_t lambda) {
     int Xc = kPel * ((gX >> kLogCX) + pc.padc) + vc.x, Yc = kPel * ((gY >> kLogCY) + pc.padcY) + vc.y;
     uint ac = ChromaAddr(Xc, Yc);
     if (kImage) {
-        gWU = ac;
-        gWV = ac + ChromaV();
+        gWC = ac;
     } else {
-        gWU = WordOf(ac);
-        gWV = WordOf(ac + ChromaV());
+        gWC = WordOf(ac);
         gShiftC = ShiftOf(ac);
     }
     int dx = v.x - p.x, dy = v.y - p.y;
@@ -120,7 +118,7 @@ uint BoundCap() {
 
 // Adds unit u of the lane's position to its partial sums (luma's SATD to gSa with kSatd)
 void Unit(int u) {
-    uint stride = uint(pc.wp) >> uint(kLogSPW), strideC = uint(pc.wc) >> uint(kLogSPW);
+    uint stride = uint(pc.wp) >> uint(kLogSPW), strideC = uint(2 * pc.wc) >> uint(kLogSPW);
     if (kSatd) {
         gSa += BandSatd(gW, gShift, stride, 4 * u, 0);
     } else {
@@ -137,26 +135,23 @@ void Unit(int u) {
     }
     if (!kChroma)
         return;
-    int curU = kLumaWords, curV = curU + kChromaWords;
-    // chroma rows kUnitRows * u >> kLogCY up to before kUnitRows * (u + 1) >> kLogCY
+    int curC = kLumaWords;
+    // chroma rows kUnitRows * u >> kLogCY up to before kUnitRows * (u + 1) >> kLogCY, U and V
+    // interleaved
     [[unroll]] for (int jj = 0; jj < (kUnitRows >> kLogCY); ++jj) {
         int jc = ((kUnitRows * u) >> kLogCY) + jj;
         if (kImage) {
-            uint au = gWU + uint(jc * ChromaRow()), av = gWV + uint(jc * ChromaRow());
-            [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-                PackedStep(StridedWord(au + uint(4 * kSPW * i)) & kChromaMask, curU + jc * kRowWordsC + i, gSa, gSm);
-                PackedStep(StridedWord(av + uint(4 * kSPW * i)) & kChromaMask, curV + jc * kRowWordsC + i, gSa, gSm);
-            }
+            uint a = gWC + uint(jc * ChromaRow());
+            [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+                PackedStep(StridedWord(a + uint(4 * kSPW * i)), curC + jc * kRowWordsC + i, gSa, gSm);
             continue;
         }
-        uint ru = gWU + uint(jc) * strideC, rv = gWV + uint(jc) * strideC;
-        uint loU = RefCWord(ru), loV = RefCWord(rv);
+        uint r = gWC + uint(jc) * strideC;
+        uint lo = RefCWord(r);
         [[unroll]] for (int i = 0; i < kRowWordsC; ++i) {
-            uint hiU = RefCWord(ru + uint(i) + 1u), hiV = RefCWord(rv + uint(i) + 1u);
-            PackedStep(Bytes4(loU, hiU, gShiftC) & kChromaMask, curU + jc * kRowWordsC + i, gSa, gSm);
-            PackedStep(Bytes4(loV, hiV, gShiftC) & kChromaMask, curV + jc * kRowWordsC + i, gSa, gSm);
-            loU = hiU;
-            loV = hiV;
+            uint hi = RefCWord(r + uint(i) + 1u);
+            PackedStep(Bytes4(lo, hi, gShiftC), curC + jc * kRowWordsC + i, gSa, gSm);
+            lo = hi;
         }
     }
 }
@@ -184,7 +179,7 @@ void main() {
         uint px[4] = uint[4](0u, 0u, 0u, 0u);
         for (int i = 0; i < kSPW; ++i)
             px[i] = CurSample(k, i);
-        int unit = k < kLumaWords ? k / kRowWords / kUnitRows : ((((k - kLumaWords) % kChromaWords) / kRowWordsC) << kLogCY) / kUnitRows;
+        int unit = k < kLumaWords ? k / kRowWords / kUnitRows : (((k - kLumaWords) / kRowWordsC) << kLogCY) / kUnitRows;
         uint sum = (kSatd ? k >= kLumaWords : true) ? px[0] + px[1] + px[2] + px[3] : 0u;
         partial += sum;
         atomicAdd(sUnitSum[unit], sum);

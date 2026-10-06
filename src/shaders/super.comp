@@ -6,8 +6,9 @@ layout(local_size_x = 64) in;
 
 // A frame's level-0 super planes built on the GPU exactly as mvu.Super builds them
 // (SuperPyramid.cpp's CopyAndPadPlane, GeneratePelPlanes and SetExternalPelPlanes), in the layout
-// SuperLayout.h gives: per plane (Y at binding 0, U then V at binding 2) its sub-pel planes, rows
-// pc.wp or pc.wc samples apart, pc.hp or pc.hc rows each. Step pc.step:
+// SuperLayout.h gives: luma's sub-pel planes (binding 0), rows pc.wp samples apart, pc.hp rows each,
+// and chroma's (binding 2), U and V interleaved sample by sample, rows 2 pc.wc samples apart, pc.hc
+// rows each. Step pc.step:
 //
 // 0: the full-pel planes from the frame: extended to the block-aligned size the grid covers, then
 //    padded, edges repeated, the rows below the frame copies of its last row;
@@ -20,26 +21,70 @@ layout(local_size_x = 64) in;
 //
 // At pel 4 luma keeps its four planes, its quarter samples computed where they're read, and so does
 // 4:4:4 chroma; subsampled chroma's quarter-pel image super_qpel.comp makes whole, from the frame,
-// and Super.cpp dispatches luma alone here. Each lane makes 4 samples of a row, read and written as
-// groups of four (super_common.glsl; rows start on groups, the last group of a row may run into the
-// row's alignment, which nothing reads, and the frames' spare row takes the reads past the last
-// one), 256 samples of a row per workgroup, the plane (Y, U, V) in z; dispatched as
-// ((W + 255) / 256, H, planes) with W x H the padded luma size.
+// and Super.cpp dispatches luma alone here. Each lane makes 4 pixels of a row, luma's 4 samples or
+// chroma's 4 of U and 4 of V, which U and V each filter alike, read and written as groups of four
+// samples (super_common.glsl; rows start on groups, the last group of a row may run into the row's
+// alignment, which nothing reads, and the frames' spare row takes the reads past the last one), 256
+// pixels of a row per workgroup, luma (z 0) or chroma (z 1); dispatched as ((W + 255) / 256, H,
+// planes) with W x H the padded luma size and planes 1 for Gray, else 2.
 
 int gBuf;           // the plane's storage: kLuma or kChroma
-int gW, gH;         // the padded plane
-int gStride;        // rows apart, samples
+int gW, gH;         // the padded plane, pixels
+int gStride;        // rows apart, samples (chroma's two a pixel)
 uint gPlaneSize;    // sub-pel planes apart
-uint gBase;         // where its first sub-pel plane starts
 int gPadX, gPadY;   // its padding
 int gRealW, gRealH; // the frame's plane
-int gRaw, gPelBuf;  // the frame's and the pelclip's plane, as buffers
 int gRawStride, gPelStride;
 
-// The group of samples x .. x + 3 of row y of sub-pel plane slot (0 full-pel, 1 x + 1/2,
-// 2 y + 1/2, 3 both), x a multiple of 4
-uint Group(int slot, int x, int y) {
-    return (gBase + uint(slot) * gPlaneSize + uint(y * gStride + x)) >> 2u;
+// The group of samples s .. s + 3 of row y of sub-pel plane slot (0 full-pel, 1 x + 1/2, 2 y + 1/2,
+// 3 both), s a multiple of 4
+uint Group(int slot, int s, int y) {
+    return (uint(slot) * gPlaneSize + uint(y * gStride + s)) >> 2u;
+}
+
+// Pixels x .. x + 3 of row y of sub-pel plane slot, x a multiple of 4: luma's group of samples (in u),
+// or chroma's U samples (u) and V samples (v), which the interleaved plane holds alternating in the
+// two groups from sample 2x on
+void LoadI(int slot, int x, int y, out ivec4 u, out ivec4 v) {
+    if (gBuf == kLuma) {
+        u = Get4I(kLuma, Group(slot, x, y));
+        v = u;
+        return;
+    }
+    uint g = Group(slot, 2 * x, y);
+    ivec4 a = Get4I(kChroma, g), b = Get4I(kChroma, g + 1u);
+    u = ivec4(a.x, a.z, b.x, b.z);
+    v = ivec4(a.y, a.w, b.y, b.w);
+}
+void LoadF(int slot, int x, int y, out vec4 u, out vec4 v) {
+    if (gBuf == kLuma) {
+        u = Get4F(kLuma, Group(slot, x, y));
+        v = u;
+        return;
+    }
+    uint g = Group(slot, 2 * x, y);
+    vec4 a = Get4F(kChroma, g), b = Get4F(kChroma, g + 1u);
+    u = vec4(a.x, a.z, b.x, b.z);
+    v = vec4(a.y, a.w, b.y, b.w);
+}
+// And their stores (v unused for luma)
+void StoreI(int slot, int x, int y, ivec4 u, ivec4 v) {
+    if (gBuf == kLuma) {
+        Put4I(kLuma, Group(slot, x, y), u);
+        return;
+    }
+    uint g = Group(slot, 2 * x, y);
+    Put4I(kChroma, g, ivec4(u.x, v.x, u.y, v.y));
+    Put4I(kChroma, g + 1u, ivec4(u.z, v.z, u.w, v.w));
+}
+void StoreF(int slot, int x, int y, vec4 u, vec4 v) {
+    if (gBuf == kLuma) {
+        Put4F(kLuma, Group(slot, x, y), u);
+        return;
+    }
+    uint g = Group(slot, 2 * x, y);
+    Put4F(kChroma, g, vec4(u.x, v.x, u.y, v.y));
+    Put4F(kChroma, g + 1u, vec4(u.z, v.z, u.w, v.w));
 }
 
 // Sample j of the 12 a, b, c hold, x - 4 .. x + 7 (j a constant once unrolled)
@@ -50,149 +95,207 @@ float WF(vec4 a, vec4 b, vec4 c, int j) {
     return j < 4 ? a[j] : j < 8 ? b[j - 4] : c[j - 8];
 }
 
-// The horizontal filter of sub-pel plane src's row y at samples x .. x + 3, into plane dst
+// The horizontal filter at pixels x .. x + 3 of a row whose pixels x - 4 .. x + 7 a, b, c hold
+ivec4 HorizontalI(ivec4 a, ivec4 b, ivec4 c, int x) {
+    ivec4 r;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        int j = 4 + k, mode = Mode(x + k, gW);
+        if (mode == 0)
+            r[k] = WI(a, b, c, j);
+        else if (mode == 1)
+            r[k] = AvgI(WI(a, b, c, j), WI(a, b, c, j + 1));
+        else if (pc.sharp == 1)
+            r[k] = BicubicI(WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2));
+        else
+            r[k] = WienerI(WI(a, b, c, j - 2), WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2), WI(a, b, c, j + 3));
+    }
+    return r;
+}
+vec4 HorizontalF(vec4 a, vec4 b, vec4 c, int x) {
+    vec4 r;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        int j = 4 + k, mode = Mode(x + k, gW);
+        if (mode == 0)
+            r[k] = WF(a, b, c, j);
+        else if (mode == 1)
+            r[k] = AvgF(WF(a, b, c, j), WF(a, b, c, j + 1));
+        else if (pc.sharp == 1)
+            r[k] = BicubicF(WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2));
+        else
+            r[k] = WienerF(WF(a, b, c, j - 2), WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2), WF(a, b, c, j + 3));
+    }
+    return r;
+}
+
+// The horizontal filter of sub-pel plane src's row y at pixels x .. x + 3, into plane dst
 void Horizontal(int src, int dst, int x, int y) {
+    bool chroma = gBuf == kChroma;
     if (kFloat) {
-        vec4 a = x >= 4 ? Get4F(gBuf, Group(src, x - 4, y)) : vec4(0.0), b = Get4F(gBuf, Group(src, x, y)), c = Get4F(gBuf, Group(src, x + 4, y));
-        vec4 r;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            int j = 4 + k, mode = Mode(x + k, gW);
-            if (mode == 0)
-                r[k] = WF(a, b, c, j);
-            else if (mode == 1)
-                r[k] = AvgF(WF(a, b, c, j), WF(a, b, c, j + 1));
-            else if (pc.sharp == 1)
-                r[k] = BicubicF(WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2));
-            else
-                r[k] = WienerF(WF(a, b, c, j - 2), WF(a, b, c, j - 1), WF(a, b, c, j), WF(a, b, c, j + 1), WF(a, b, c, j + 2), WF(a, b, c, j + 3));
-        }
-        Put4F(gBuf, Group(dst, x, y), r);
+        vec4 ua = vec4(0.0), va = vec4(0.0), ub, vb, uc, vc;
+        if (x >= 4)
+            LoadF(src, x - 4, y, ua, va);
+        LoadF(src, x, y, ub, vb);
+        LoadF(src, x + 4, y, uc, vc);
+        vec4 ru = HorizontalF(ua, ub, uc, x), rv = ru;
+        if (chroma)
+            rv = HorizontalF(va, vb, vc, x);
+        StoreF(dst, x, y, ru, rv);
     } else {
-        ivec4 a = x >= 4 ? Get4I(gBuf, Group(src, x - 4, y)) : ivec4(0), b = Get4I(gBuf, Group(src, x, y)), c = Get4I(gBuf, Group(src, x + 4, y));
-        ivec4 r;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            int j = 4 + k, mode = Mode(x + k, gW);
-            if (mode == 0)
-                r[k] = WI(a, b, c, j);
-            else if (mode == 1)
-                r[k] = AvgI(WI(a, b, c, j), WI(a, b, c, j + 1));
-            else if (pc.sharp == 1)
-                r[k] = BicubicI(WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2));
-            else
-                r[k] = WienerI(WI(a, b, c, j - 2), WI(a, b, c, j - 1), WI(a, b, c, j), WI(a, b, c, j + 1), WI(a, b, c, j + 2), WI(a, b, c, j + 3));
-        }
-        Put4I(gBuf, Group(dst, x, y), r);
+        ivec4 ua = ivec4(0), va = ivec4(0), ub, vb, uc, vc;
+        if (x >= 4)
+            LoadI(src, x - 4, y, ua, va);
+        LoadI(src, x, y, ub, vb);
+        LoadI(src, x + 4, y, uc, vc);
+        ivec4 ru = HorizontalI(ua, ub, uc, x), rv = ru;
+        if (chroma)
+            rv = HorizontalI(va, vb, vc, x);
+        StoreI(dst, x, y, ru, rv);
     }
 }
 
-// And the vertical one, from the groups of rows y - 2 .. y + 3 holding the same 4 columns
-void Vertical(int src, int dst, int x, int y) {
+// The vertical filter at row y from the same 4 pixels of rows y - 2 .. y + 3, r[0] .. r[5]
+ivec4 VerticalI(ivec4 r[6], int y) {
     int mode = Mode(y, gH);
+    ivec4 o;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        if (mode == 0)
+            o[k] = r[2][k];
+        else if (mode == 1)
+            o[k] = AvgI(r[2][k], r[3][k]);
+        else if (pc.sharp == 1)
+            o[k] = BicubicI(r[1][k], r[2][k], r[3][k], r[4][k]);
+        else
+            o[k] = WienerI(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
+    }
+    return o;
+}
+vec4 VerticalF(vec4 r[6], int y) {
+    int mode = Mode(y, gH);
+    vec4 o;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        if (mode == 0)
+            o[k] = r[2][k];
+        else if (mode == 1)
+            o[k] = AvgF(r[2][k], r[3][k]);
+        else if (pc.sharp == 1)
+            o[k] = BicubicF(r[1][k], r[2][k], r[3][k], r[4][k]);
+        else
+            o[k] = WienerF(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
+    }
+    return o;
+}
+
+// And the vertical one of plane src's rows y - 2 .. y + 3 (clamped to the plane), into plane dst
+void Vertical(int src, int dst, int x, int y) {
+    bool chroma = gBuf == kChroma;
     if (kFloat) {
-        vec4 r[6];
+        vec4 ru[6], rv[6];
         [[unroll]] for (int i = 0; i < 6; ++i)
-            r[i] = Get4F(gBuf, Group(src, x, clamp(y - 2 + i, 0, gH - 1)));
-        vec4 o;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            if (mode == 0)
-                o[k] = r[2][k];
-            else if (mode == 1)
-                o[k] = AvgF(r[2][k], r[3][k]);
-            else if (pc.sharp == 1)
-                o[k] = BicubicF(r[1][k], r[2][k], r[3][k], r[4][k]);
-            else
-                o[k] = WienerF(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
-        }
-        Put4F(gBuf, Group(dst, x, y), o);
+            LoadF(src, x, clamp(y - 2 + i, 0, gH - 1), ru[i], rv[i]);
+        vec4 ou = VerticalF(ru, y), ov = ou;
+        if (chroma)
+            ov = VerticalF(rv, y);
+        StoreF(dst, x, y, ou, ov);
     } else {
-        ivec4 r[6];
+        ivec4 ru[6], rv[6];
         [[unroll]] for (int i = 0; i < 6; ++i)
-            r[i] = Get4I(gBuf, Group(src, x, clamp(y - 2 + i, 0, gH - 1)));
-        ivec4 o;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            if (mode == 0)
-                o[k] = r[2][k];
-            else if (mode == 1)
-                o[k] = AvgI(r[2][k], r[3][k]);
-            else if (pc.sharp == 1)
-                o[k] = BicubicI(r[1][k], r[2][k], r[3][k], r[4][k]);
-            else
-                o[k] = WienerI(r[0][k], r[1][k], r[2][k], r[3][k], r[4][k], r[5][k]);
-        }
-        Put4I(gBuf, Group(dst, x, y), o);
+            LoadI(src, x, clamp(y - 2 + i, 0, gH - 1), ru[i], rv[i]);
+        ivec4 ou = VerticalI(ru, y), ov = ou;
+        if (chroma)
+            ov = VerticalI(rv, y);
+        StoreI(dst, x, y, ou, ov);
     }
 }
 
-// DiagonalBilinear at samples x .. x + 3: the average of four, of two along the last column and
-// the last row, the last sample copied
-void Diagonal(int dst, int x, int y) {
-    int yn = min(y + 1, gH - 1);
+// DiagonalBilinear at pixels x .. x + 3 of row y from the full-pel pixels x .. x + 7 of it (a0, a1)
+// and of the next row (b0, b1): the average of four, of two along the last column and the last row,
+// the last sample copied
+ivec4 DiagonalI(ivec4 a0, ivec4 a1, ivec4 b0, ivec4 b1, int x, int y) {
     bool bottom = y == gH - 1;
+    ivec4 o;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        int s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
+        bool right = x + k >= gW - 1;
+        if (right && bottom)
+            o[k] = s;
+        else if (bottom)
+            o[k] = AvgI(s, sx);
+        else if (right)
+            o[k] = AvgI(s, t);
+        else
+            o[k] = Avg4I(s, sx, t, tx);
+    }
+    return o;
+}
+vec4 DiagonalF(vec4 a0, vec4 a1, vec4 b0, vec4 b1, int x, int y) {
+    bool bottom = y == gH - 1;
+    vec4 o;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        float s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
+        bool right = x + k >= gW - 1;
+        if (right && bottom)
+            o[k] = s;
+        else if (bottom)
+            o[k] = AvgF(s, sx);
+        else if (right)
+            o[k] = AvgF(s, t);
+        else
+            o[k] = Avg4F(s, sx, t, tx);
+    }
+    return o;
+}
+
+// The diagonal plane at pixels x .. x + 3 of row y, bilinear, into plane dst
+void Diagonal(int dst, int x, int y) {
+    bool chroma = gBuf == kChroma;
+    int yn = min(y + 1, gH - 1);
     if (kFloat) {
-        vec4 a0 = Get4F(gBuf, Group(0, x, y)), a1 = Get4F(gBuf, Group(0, x + 4, y)), b0 = Get4F(gBuf, Group(0, x, yn)), b1 = Get4F(gBuf, Group(0, x + 4, yn));
-        vec4 o;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            float s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
-            bool right = x + k >= gW - 1;
-            if (right && bottom)
-                o[k] = s;
-            else if (bottom)
-                o[k] = AvgF(s, sx);
-            else if (right)
-                o[k] = AvgF(s, t);
-            else
-                o[k] = Avg4F(s, sx, t, tx);
-        }
-        Put4F(gBuf, Group(dst, x, y), o);
+        vec4 ua0, va0, ua1, va1, ub0, vb0, ub1, vb1;
+        LoadF(0, x, y, ua0, va0);
+        LoadF(0, x + 4, y, ua1, va1);
+        LoadF(0, x, yn, ub0, vb0);
+        LoadF(0, x + 4, yn, ub1, vb1);
+        vec4 ou = DiagonalF(ua0, ua1, ub0, ub1, x, y), ov = ou;
+        if (chroma)
+            ov = DiagonalF(va0, va1, vb0, vb1, x, y);
+        StoreF(dst, x, y, ou, ov);
     } else {
-        ivec4 a0 = Get4I(gBuf, Group(0, x, y)), a1 = Get4I(gBuf, Group(0, x + 4, y)), b0 = Get4I(gBuf, Group(0, x, yn)), b1 = Get4I(gBuf, Group(0, x + 4, yn));
-        ivec4 o;
-        [[unroll]] for (int k = 0; k < 4; ++k) {
-            int s = a0[k], sx = k < 3 ? a0[k + 1] : a1[0], t = b0[k], tx = k < 3 ? b0[k + 1] : b1[0];
-            bool right = x + k >= gW - 1;
-            if (right && bottom)
-                o[k] = s;
-            else if (bottom)
-                o[k] = AvgI(s, sx);
-            else if (right)
-                o[k] = AvgI(s, t);
-            else
-                o[k] = Avg4I(s, sx, t, tx);
-        }
-        Put4I(gBuf, Group(dst, x, y), o);
+        ivec4 ua0, va0, ua1, va1, ub0, vb0, ub1, vb1;
+        LoadI(0, x, y, ua0, va0);
+        LoadI(0, x + 4, y, ua1, va1);
+        LoadI(0, x, yn, ub0, vb0);
+        LoadI(0, x + 4, yn, ub1, vb1);
+        ivec4 ou = DiagonalI(ua0, ua1, ub0, ub1, x, y), ov = ou;
+        if (chroma)
+            ov = DiagonalI(va0, va1, vb0, vb1, x, y);
+        StoreI(dst, x, y, ou, ov);
     }
 }
 
 void main() {
-    int z = int(gl_WorkGroupID.z);
-    if (z == 0) {
+    bool chroma = gl_WorkGroupID.z != 0u;
+    if (!chroma) {
         gBuf = kLuma;
         gW = pc.aw + 2 * pc.padX;
         gH = pc.ah + 2 * pc.padY;
         gStride = pc.wp;
         gPlaneSize = uint(pc.wp * pc.hp);
-        gBase = 0u;
         gPadX = pc.padX;
         gPadY = pc.padY;
         gRealW = pc.w;
         gRealH = pc.h;
-        gRaw = kRawY;
-        gPelBuf = kPelY;
         gRawStride = pc.srcStrideY;
         gPelStride = pc.pelStrideY;
     } else {
         gBuf = kChroma;
         gW = pc.aw / pc.xr + 2 * pc.padcX;
         gH = pc.ah / pc.yr + 2 * pc.padcY;
-        gStride = pc.wc;
-        gPlaneSize = uint(pc.wc * pc.hc);
-        gBase = uint(z - 1) * uint(pc.chromaPlanes) * gPlaneSize;
+        gStride = 2 * pc.wc;
+        gPlaneSize = uint(2 * pc.wc * pc.hc);
         gPadX = pc.padcX;
         gPadY = pc.padcY;
         gRealW = pc.w / pc.xr;
         gRealH = pc.h / pc.yr;
-        gRaw = z == 1 ? kRawU : kRawV;
-        gPelBuf = z == 1 ? kPelU : kPelV;
         gRawStride = pc.srcStrideC;
         gPelStride = pc.pelStrideC;
     }
@@ -203,16 +306,27 @@ void main() {
     int sy = clamp(y - gPadY, 0, gRealH - 1);
     ivec4 sx = clamp(ivec4(x) + ivec4(0, 1, 2, 3) - gPadX, 0, gRealW - 1);
     if (pc.step == 0) {
+        int rawU = chroma ? kRawU : kRawY;
         if (kFloat) {
-            vec4 v;
-            [[unroll]] for (int k = 0; k < 4; ++k)
-                v[k] = GetF(gRaw, uint(sy * gRawStride + sx[k]));
-            Put4F(gBuf, Group(0, x, y), v);
+            vec4 u, v;
+            [[unroll]] for (int k = 0; k < 4; ++k) {
+                uint at = uint(sy * gRawStride + sx[k]);
+                u[k] = GetF(rawU, at);
+                v[k] = u[k];
+                if (chroma) // (a branch, not ?:, which may load from V's plane, unbound for Gray)
+                    v[k] = GetF(kRawV, at);
+            }
+            StoreF(0, x, y, u, v);
         } else {
-            ivec4 v;
-            [[unroll]] for (int k = 0; k < 4; ++k)
-                v[k] = GetI(gRaw, uint(sy * gRawStride + sx[k]));
-            Put4I(gBuf, Group(0, x, y), v);
+            ivec4 u, v;
+            [[unroll]] for (int k = 0; k < 4; ++k) {
+                uint at = uint(sy * gRawStride + sx[k]);
+                u[k] = GetI(rawU, at);
+                v[k] = u[k];
+                if (chroma)
+                    v[k] = GetI(kRawV, at);
+            }
+            StoreI(0, x, y, u, v);
         }
     } else if (pc.step == 1) {
         Horizontal(0, 1, x, y);
@@ -224,18 +338,29 @@ void main() {
             Horizontal(2, 3, x, y);
     } else {
         // Half-pel plane fx | (fy << 1) is pelclip sample (2 sx + fx, 2 sy + fy)
+        int pelU = chroma ? kPelU : kPelY;
         for (int i = 1; i < 4; ++i) {
             int row = (2 * sy + (i >> 1)) * gPelStride + (i & 1);
             if (kFloat) {
-                vec4 v;
-                [[unroll]] for (int k = 0; k < 4; ++k)
-                    v[k] = GetF(gPelBuf, uint(row + 2 * sx[k]));
-                Put4F(gBuf, Group(i, x, y), v);
+                vec4 u, v;
+                [[unroll]] for (int k = 0; k < 4; ++k) {
+                    uint at = uint(row + 2 * sx[k]);
+                    u[k] = GetF(pelU, at);
+                    v[k] = u[k];
+                    if (chroma)
+                        v[k] = GetF(kPelV, at);
+                }
+                StoreF(i, x, y, u, v);
             } else {
-                ivec4 v;
-                [[unroll]] for (int k = 0; k < 4; ++k)
-                    v[k] = GetI(gPelBuf, uint(row + 2 * sx[k]));
-                Put4I(gBuf, Group(i, x, y), v);
+                ivec4 u, v;
+                [[unroll]] for (int k = 0; k < 4; ++k) {
+                    uint at = uint(row + 2 * sx[k]);
+                    u[k] = GetI(pelU, at);
+                    v[k] = u[k];
+                    if (chroma)
+                        v[k] = GetI(kPelV, at);
+                }
+                StoreI(i, x, y, u, v);
             }
         }
     }

@@ -16,7 +16,7 @@ layout(std430, set = 0, binding = 26) writeonly buffer OutRec { ivec4 outRec[]; 
 // positions around a vector all differ in phase, so reading only what each needs would only make
 // the lanes diverge (probe/qpel_bench.cpp measured it slower). Chroma subsampled either way comes
 // from its quarter-pel image; 4:4:4 chroma's samples are computed from its half-pel planes as luma's
-// are.
+// are, a row's U and V samples together, interleaved as the super holds them.
 // With kSplit 2 the lane measures every other row, and SadOf adds the other lane's; with kSatd luma's
 // SATD, every other band of 4 rows.
 uint LaneSadQuarter(ivec2 v) {
@@ -61,34 +61,30 @@ uint LaneSadQuarter(ivec2 v) {
         return SadOf(sa, sm);
     ivec2 vc = ChromaVector(v);
     int Xc = 4 * ((gX >> kLogCX) + pc.padc) + vc.x, Yc = 4 * ((gY >> kLogCY) + pc.padcY) + vc.y;
-    int curU = cur + kLumaWords;
+    int curC = cur + kLumaWords;
     if (kImage) {
         uint ac = ChromaAddr(Xc, Yc);
         for (int j = gHalf; j < pc.blockRows >> kLogCY; j += kSplit) {
-            [[unroll]] for (int p = 0; p < 2; ++p) {
-                uint r[kRowWordsC];
-                RunC(ac + uint(p) * ChromaV() + uint(j * ChromaRow()), r);
-                int at = curU + p * kChromaWords + j * kRowWordsC;
-                [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
-                    PackedStep(r[i], at + i, sa, sm);
-            }
+            uint r[kRowWordsC];
+            RunC(ac + uint(j * ChromaRow()), r);
+            int at = curC + j * kRowWordsC;
+            [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+                PackedStep(r[i], at + i, sa, sm);
         }
     } else {
         int Xca = Xc >> 1, Xcb = Xca + (Xc & 1), Yca = Yc >> 1, Ycb = Yca + (Yc & 1);
         uint planeC = uint(pc.wc * pc.hc);
-        uint ca = HalfAddr(Xca, Yca, planeC, pc.wc), cb = HalfAddr(Xca, Ycb, planeC, pc.wc), cc = HalfAddr(Xcb, Yca, planeC, pc.wc),
-             cd = HalfAddr(Xcb, Ycb, planeC, pc.wc);
+        uint ca = 2u * HalfAddr(Xca, Yca, planeC, pc.wc), cb = 2u * HalfAddr(Xca, Ycb, planeC, pc.wc), cc = 2u * HalfAddr(Xcb, Yca, planeC, pc.wc),
+             cd = 2u * HalfAddr(Xcb, Ycb, planeC, pc.wc);
         for (int j = gHalf; j < pc.blockRows; j += kSplit) {
-            [[unroll]] for (int p = 0; p < 2; ++p) {
-                uint o = uint(p) * ChromaV() + uint(j * pc.wc), r0[kRowWordsC], r1[kRowWordsC], r2[kRowWordsC], r3[kRowWordsC];
-                RunC(ca + o, r0);
-                RunC(cb + o, r1);
-                RunC(cc + o, r2);
-                RunC(cd + o, r3);
-                int at = curU + p * kChromaWords + j * kRowWordsC;
-                [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
-                    PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), at + i, sa, sm);
-            }
+            uint o = uint(j * ChromaRow()), r0[kRowWordsC], r1[kRowWordsC], r2[kRowWordsC], r3[kRowWordsC];
+            RunC(ca + o, r0);
+            RunC(cb + o, r1);
+            RunC(cc + o, r2);
+            RunC(cd + o, r3);
+            int at = curC + j * kRowWordsC;
+            [[unroll]] for (int i = 0; i < kRowWordsC; ++i)
+                PackedStep(Avg(Avg(r0[i], r1[i]), Avg(r2[i], r3[i])), at + i, sa, sm);
         }
     }
     return SadOf(sa, sm);

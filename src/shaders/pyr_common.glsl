@@ -13,12 +13,14 @@
 #include "refine_common.glsl"
 
 // A frame's pyramid, the one mvgpu.Super attaches (SuperLayout.h): for every level L >= 1 its Y
-// plane, then U, then V, each inside a border of repeated edge pixels (borderY, borderC wide), so
-// a read anywhere a block may reach (Level.pad) sees what SmallPlane::At's clamping would give,
-// and the words LevelSadOf reads around it stay inside. offY, offU and offV point at each plane's
-// first pixel inside the border, its rows strideY or strideC apart, whole words; the samples are the
-// super's, kSPW to a word (floats one, which LevelSadOf reads as they are). mvgpu.Super builds it (pyr_reduce.comp); these kernels read the current
-// frame's (16) and each field's reference frame's (17, element z) as words.
+// plane, then its chroma plane, U and V interleaved sample by sample, each inside a border of
+// repeated edge pixels (borderY, borderC pixels wide), so a read anywhere a block may reach
+// (Level.pad) sees what SmallPlane::At's clamping would give, and the words LevelSadOf reads around
+// it stay inside. offY and offC point at each plane's first pixel inside the border (U's sample of
+// chroma's, V's the next), its rows strideY or strideC samples apart, whole words; the samples are
+// the super's, kSPW to a word (floats one, which LevelSadOf reads as they are). mvgpu.Super builds it
+// (pyr_reduce.comp); these kernels read the current frame's (16) and each field's reference frame's
+// (17, element z) as words.
 const int kMaxBatch = 16; // fields per batch: VulkanContext.h's kMaxBatch
 layout(std430, set = 0, binding = 16) readonly buffer CurPyramid { uint curPyrW[]; };
 layout(std430, set = 0, binding = 17) readonly buffer RefPyramid { uint w[]; } refPyr[kMaxBatch];
@@ -34,7 +36,7 @@ layout(std430, set = 0, binding = 19) buffer LevelSad { uint levelSad[]; };
 // Matches LevelEntry in SuperLayout.h.
 struct Level {
     int w, h, wc, hc;
-    int offY, offU, offV, nbx;
+    int offY, offC, spare, nbx;
     int nby, fieldOff, pad, lambdaOff;
     int frameSamples, fieldTotal, strideY, strideC;
     int borderY, borderC, padY, reserved;
@@ -100,7 +102,7 @@ ivec2 LevelBound(Level lv, ivec2 v) {
 #ifndef NO_BLOCK_CACHE
 // Sets up the lane's level block and copies its current pixels to shared memory in the form
 // PackedStep takes, as LoadBlock does, with their sum in gSumCur: kLevelLumaWords words of luma,
-// then kLevelChromaWords of U and as many of V unless the SAD is luma's alone. Every lane of the
+// then kLevelChromaWords of chroma, U and V interleaved, unless the SAD is luma's alone. Every lane of the
 // workgroup must call it, after SetupField, and then barrier().
 void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int by, bool live) {
     gGroup = group;
@@ -115,9 +117,8 @@ void LoadLevelBlock(int group, int sub, int lanesPerBlock, Level lv, int bx, int
                 if (k < kLevelLumaWords) {
                     at = lv.offY + (gLY + k / kLevelRowWords) * lv.strideY + gLX + (k % kLevelRowWords) * kSPW + i;
                 } else {
-                    int kc = (k - kLevelLumaWords) % kLevelChromaWords;
-                    at = (k - kLevelLumaWords < kLevelChromaWords ? lv.offU : lv.offV) + ((gLY >> kLogCY) + kc / kLevelRowWordsC) * lv.strideC + (gLX >> kLogCX) +
-                         (kc % kLevelRowWordsC) * kSPW + i;
+                    int kc = k - kLevelLumaWords;
+                    at = lv.offC + ((gLY >> kLogCY) + kc / kLevelRowWordsC) * lv.strideC + 2 * (gLX >> kLogCX) + (kc % kLevelRowWordsC) * kSPW + i;
                 }
                 b[i] = PyrSample(at);
                 partial += b[i];
@@ -135,17 +136,19 @@ ivec2 gLvV;
 
 float DiffF(int p, int x, int y) {
     Level lv = gLv;
-    float c, r;
-    if (p == 0) {
-        c = uintBitsToFloat(curPyrW[lv.offY + (gLY + y) * lv.strideY + gLX + x]);
-        r = uintBitsToFloat(refPyr[gField].w[lv.offY + (gLY + gLvV.y + y) * lv.strideY + gLX + gLvV.x + x]);
-    } else {
-        ivec2 cv = ChromaVector(gLvV);
-        int off = p == 1 ? lv.offU : lv.offV, cx = (gLX >> kLogCX) + x, cy = (gLY >> kLogCY) + y;
-        c = uintBitsToFloat(curPyrW[off + cy * lv.strideC + cx]);
-        r = uintBitsToFloat(refPyr[gField].w[off + (cy + cv.y) * lv.strideC + cx + cv.x]);
-    }
+    float c = uintBitsToFloat(curPyrW[lv.offY + (gLY + y) * lv.strideY + gLX + x]);
+    float r = uintBitsToFloat(refPyr[gField].w[lv.offY + (gLY + gLvV.y + y) * lv.strideY + gLX + gLvV.x + x]);
     precise float d = c - r;
+    return d;
+}
+vec2 DiffUV(int x, int y) {
+    Level lv = gLv;
+    ivec2 cv = ChromaVector(gLvV);
+    int cx = (gLX >> kLogCX) + x, cy = (gLY >> kLogCY) + y;
+    int a = lv.offC + cy * lv.strideC + 2 * cx, b = lv.offC + (cy + cv.y) * lv.strideC + 2 * (cx + cv.x);
+    vec2 c = vec2(uintBitsToFloat(curPyrW[a]), uintBitsToFloat(curPyrW[a + 1]));
+    vec2 r = vec2(uintBitsToFloat(refPyr[gField].w[b]), uintBitsToFloat(refPyr[gField].w[b + 1]));
+    precise vec2 d = c - r;
     return d;
 }
 
@@ -154,15 +157,17 @@ float DiffF(int p, int x, int y) {
 // The lane's SAD of its level block for full-pel vector v: luma 8x8 plus U and V (8 >> kLogCX) x
 // (8 >> kLogCY), the chroma vector the luma one divided by the subsampling toward zero, or luma alone
 // (the reference's CoarseSad). The border stands in for the CPU's clamping, so rows are read as words
-// like LaneSad's, with the same packed arithmetic; float samples as mvu sums them, each plane scaled
-// alone (DiffF). One lane measures the whole SAD (kSplit 1).
+// like LaneSad's, a chroma row's U and V samples together, with the same packed arithmetic; float
+// samples as mvu sums them, each plane scaled alone (DiffF). One lane measures the whole SAD (kSplit 1).
 uint LevelSadOf(Level lv, ivec2 v) {
     if (kFloatS) {
         gLv = lv;
         gLvV = v;
         uint64_t s = uint64_t(SadF(0, 8, 8));
-        if (kChroma)
-            s += uint64_t(SadF(1, 8 >> kLogCX, 8 >> kLogCY)) + uint64_t(SadF(2, 8 >> kLogCX, 8 >> kLogCY));
+        if (kChroma) {
+            uvec2 c = SadUV(8 >> kLogCX, 8 >> kLogCY);
+            s += uint64_t(c.x) + uint64_t(c.y);
+        }
         return uint(min(s, 0xFFFFFFFFul));
     }
     uint a = uint(lv.offY + (gLY + v.y) * lv.strideY + gLX + v.x);
@@ -184,21 +189,18 @@ uint LevelSadOf(Level lv, ivec2 v) {
     if (!kChroma)
         return SadOf(sa, sm);
     ivec2 cv = ChromaVector(v);
-    int rowC = ((gLY >> kLogCY) + cv.y) * lv.strideC + (gLX >> kLogCX) + cv.x;
-    uint au = uint(lv.offU + rowC), av = uint(lv.offV + rowC);
-    uint wu = WordOf(au), shiftU = ShiftOf(au), wv = WordOf(av), shiftV = ShiftOf(av), strideC = uint(lv.strideC) >> uint(kLogSPW);
-    int curU = cur + kLevelLumaWords, curV = curU + kLevelChromaWords;
+    uint ac = uint(lv.offC + ((gLY >> kLogCY) + cv.y) * lv.strideC + 2 * ((gLX >> kLogCX) + cv.x));
+    uint wc = WordOf(ac), shiftC = ShiftOf(ac), strideC = uint(lv.strideC) >> uint(kLogSPW);
+    int curC = cur + kLevelLumaWords;
     for (int j0 = 0; j0 < pc.blockRows >> kLogCY; j0 += kRowChunk) {
         [[unroll]] for (int jj = 0; jj < kRowChunk; ++jj) {
             int j = j0 + jj;
-            uint u = wu + uint(j) * strideC, t = wv + uint(j) * strideC;
-            uint loU = PyrWord(u), loV = PyrWord(t);
+            uint u = wc + uint(j) * strideC;
+            uint lo = PyrWord(u);
             [[unroll]] for (int i = 0; i < kLevelRowWordsC; ++i) {
-                uint hiU = PyrWord(u + uint(i) + 1u), hiV = PyrWord(t + uint(i) + 1u);
-                PackedStep(Bytes4(loU, hiU, shiftU), curU + j * kLevelRowWordsC + i, sa, sm);
-                PackedStep(Bytes4(loV, hiV, shiftV), curV + j * kLevelRowWordsC + i, sa, sm);
-                loU = hiU;
-                loV = hiV;
+                uint hi = PyrWord(u + uint(i) + 1u);
+                PackedStep(Bytes4(lo, hi, shiftC), curC + j * kLevelRowWordsC + i, sa, sm);
+                lo = hi;
             }
         }
     }

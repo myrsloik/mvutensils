@@ -88,10 +88,11 @@ constexpr int kMaxDegrainRefs = 50; // 2 * the largest radius, degrain_common.gl
 // The Flow kernels' bindings in the Main layout (flow_common.glsl): the two supers' planes (the frame
 // before and the one after), the vector frames (F and B, and FF and BB for the extra masks), the
 // blocks' occlusion masks and scene change counts, the clip's planes for the blend, the output
-// plane, the resize's taps
+// plane, the resize's taps; and for chroma, which a dispatch makes U and V of together, V's output
+// plane and clip planes (U's at kFlOut, kFlClipSrc and kFlClipRef)
 enum FlowBinding {
     kFlSrcLuma, kFlSrcChroma, kFlRefLuma, kFlRefChroma, kFlVecF, kFlVecB, kFlVecFF, kFlVecBB,
-    kFlMasks, kFlCounts, kFlClipSrc, kFlClipRef, kFlOut, kFlTaps,
+    kFlMasks, kFlCounts, kFlClipSrc, kFlClipRef, kFlOut, kFlTaps, kFlOutV, kFlClipSrcV, kFlClipRefV,
 };
 
 // The push constants of every layout: 128 bytes, as many as every device is guaranteed to take

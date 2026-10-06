@@ -46,12 +46,18 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   reference frame lies past the end of the super no vectors, also where a longer vector clip has
   some for it. `satd` on 16×2 blocks is refused as mvu refuses it.
   `test/check_robustness.py` runs each of these cases on both plugins.
-* `Analyse` searches float supers as the 16-bit samples they stand for: luma's 0 to 1 and
-  chroma's −0.5 to 0.5 scaled to 0 to 65535, rounded and clamped, each sample as it is read, which
-  puts the SADs on the 16-bit scale mvu gives float SADs. `Degrain`, `FlowInter` and `FlowFPS` take
-  mvu's float arithmetic operation for operation. mvu's float `FlowInter` and `FlowFPS` round
-  differently with each CPU's kernels (AVX-512, AVX2, SSE2); mvgpu's are bit for bit those of
-  mvu's AVX-512 kernels.
+* Float SADs are mvu's: `Analyse` and `Recalculate` add up a block's float differences (with `satd`
+  its tiles' Hadamard coefficients) in exactly the order mvu's AVX-512 kernels do
+  (`src/shaders/sadf_common.glsl`), and scale each plane's SAD to the 16-bit range as mvu does.
+  `Degrain`, `FlowInter` and `FlowFPS` take mvu's float arithmetic operation for operation. mvu's
+  float SADs, `FlowInter` and `FlowFPS` round differently with each CPU's kernels (AVX-512, AVX2,
+  SSE2); mvgpu's are bit for bit those of mvu's AVX-512 kernels. Samples far outside their range
+  can take a block's float SAD past 2^32 − 1: each plane's saturates there, as in mvu, but mvu adds
+  the planes in 64 bits, where mvgpu's SADs, 32 bits wide, saturate (`Recalculate` compares the
+  64-bit sums as mvu does, so its vectors stay mvu's; `Analyse`'s lambda relaxation takes a float
+  SAD past the largest an integer block can make as that largest). Float `Analyse` runs at about a
+  fifth of 16-bit's speed (4:4:4, 16×16 blocks, `pel=4`, RX 6900 XT): a lane measures a candidate's
+  float SAD in mvu's order, where integer SADs take a word of packed samples at a time.
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`; `plevel` scales the coarse levels'
   lambda as mvu scales it per level), a wide search for the blocks still
@@ -81,7 +87,13 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   one pixel around). `search`, `searchparam`, `meander` and `trymany` order mvu's search, one block
   after another, which this one doesn't do; they are checked and otherwise ignored.
   The wide search defaults to the tested `badsad=1000`, `badrange=40` and `badstep=2` rather than
-  mvu's `badsad=10000` (which it would almost never reach) and `badrange=24`.
+  mvu's `badsad=10000` (which it would almost never reach) and `badrange=24`. `badsad` has a very
+  big effect on speed: every block above it gets the wide search, which at the default takes a large
+  share of the GPU time, and more with chroma (the threshold doesn't grow with the chroma the SAD
+  counts). With `badsad=10000` the 16-bit `Degrain` chain below ran 22–23% faster at 4:2:0 (1080p
+  and 4K) and 44% faster at 4:4:4 (4K), while `Degrain`'s PSNR against the clean originals of the
+  test clips fell by 0.00–0.04 dB; the wide search matters most where motion outruns the coarse
+  search, which those clips have little of.
 * `AnalyseMany` also seeds each field from the fields refined before it (chained and inverted
   vectors), which separate `Analyse` calls can't.
 * The super and the vectors are GPU frames laid out for the GPU, described by frame properties
@@ -160,10 +172,8 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   replicated candidate for candidate: unlike `Analyse`'s, its blocks don't depend on one another.
   `satd` makes luma's SAD mvu's SATD, as in `Analyse`.
   As in mvu, a frame whose old vectors are missing (their reference frame outside the clip) stays
-  without vectors, with the new grid's description. Float supers
-  are searched as `Analyse` searches them, as the 16-bit samples they stand for (mvu sums float
-  differences in the order its CPU kernels take), so at `pel=1`, where the samples are the clip's,
-  the vectors are mvu's of the clip so quantized.
+  without vectors, with the new grid's description. Float supers' vectors are mvu's too, at every
+  `pel`, those of mvu's AVX-512 build (above).
 * `test/matrix.py` runs the checks over their case matrices (`super`, `analyse`, `degrain`, `flow`,
   `masks`, `motion`, `recalculate`, `convert`, `robustness`) on a directory of raw test clips, and
   `smoke` a cross section of all of them in a few minutes.
@@ -179,6 +189,44 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   64-bit floats where the device has them (the masks' powers, float `FlowBlur`'s sums).
   Building needs the Vulkan headers (`-Dvulkan_include=` for meson, the Vulkan SDK for
   `msvc/MVGPUtensils.slnx`); nothing is linked, the core hands out every entry point.
+
+## Performance
+
+Measured on a Ryzen 7 9800X3D (8 cores, 16 threads, AVX-512) with a Radeon RX 6900 XT, against
+MVUtensils' Release build (its AVX-512 kernels): 16-bit 4:2:0 clips at 1080p and 4K, their frames
+rendered into memory beforehand so that the source costs nothing, `pel=2`, radius 2, 16 frames
+requested at a time as vspipe requests them (`test/bench_vs_mvu.py`, on an otherwise idle machine;
+`test/bench.py` times mvgpu alone, stage by stage, on a source decoded to GPU frames). Frames per
+second, mvu / mvgpu:
+
+| | 1080p, 16×16 blocks, overlap 8 | 4K, 16×16, overlap 8 | 4K, 32×32, overlap 16 |
+|---|---|---|---|
+| `Super` + `AnalyseMany` | 118 / 273 | 27.2 / 78.8 | 50.5 / 65.3 |
+| `Degrain` (with the search) | 103 / 267 | 23.2 / 73.3 | 39.8 / 62.8 |
+| `FlowFPS`, frame rate doubled (output frames) | 312 / 936 | 71.6 / 283 | 106 / 247 |
+
+mvgpu's numbers include uploading the clip and downloading the result. mvu keeps all 16 threads
+busy; mvgpu less than one (about 3 ms of CPU time per 1080p frame, 8 ms per 4K frame, mostly the
+transfers), which leaves the CPU to an encoder. mvgpu is bound by the GPU: at 4K with 16×16 blocks
+a frame takes 13.7 ms of it, 11.2 ms of that refining the four full-size fields (`Degrain` 1.1 ms,
+the coarse search 0.8 ms, `Super` 0.5 ms). The refinement's cost follows the pixels the blocks cover
+and the candidates tried rather than the number of blocks, so 32×32 blocks are no faster for mvgpu
+than 16×16 ones, while mvu, which pays per block, nearly doubles its speed with them.
+
+The super keeps chroma's U and V interleaved, sample by sample (`src/SuperLayout.h`): the search
+reads a block's chroma rows once rather than U's and V's apart, and the filters make a pixel's U and
+V in one lane, which shares its vectors, weights and masks between them. Against the planar layout
+before it, the chains above ran 8–12% faster with 16×16 blocks, 0–4% with 32×32 ones and 3% with
+4:4:4 chroma; `Degrain`'s at 1080p 15% faster with 8-bit samples and 19% with float ones.
+
+Searching on the GPU and degraining on the CPU (`mvgpu.ToMVU` and `mvu.Degrain` with an
+`onelevel=True` super, as above) gives the same frames as mvgpu's `Degrain`, bit for bit, 1–4%
+faster (273, 73.9 and 65.3 frames per second), since `Degrain`'s GPU time moves to otherwise idle
+CPU cores, but it keeps 5 to 11 threads busy.
+
+The largest speed setting is `Analyse`'s `badsad` (above): with mvu's `badsad=10000` instead of the
+default 1000, mvgpu's `Degrain` chain ran at 328 rather than 266 frames per second at 1080p and 90
+rather than 74 at 4K (16-bit 4:2:0, 16×16 blocks), and at 46 rather than 32 with 4:4:4 chroma at 4K.
 
 # MVUtensils
 

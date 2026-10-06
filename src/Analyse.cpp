@@ -783,7 +783,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         std::function<void(int)> stamp;
         if (d->profile)
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
-        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / bytes), static_cast<int>(recBytes / 16),
+        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / (2 * bytes)), static_cast<int>(recBytes / 16),
                             static_cast<int>(d->coarseRow * coarseRowBytes / 8), flags, std::move(stamp));
         field.SeedLists();
         field.Refinement();

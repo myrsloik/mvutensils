@@ -4,11 +4,11 @@
 Both make the super of the same clip with the same arguments. Every sub-pel plane of level 0, padding
 included, is compared sample for sample (float ones bit for bit): mvu.Super's level-0 frames
 (MVUtensilsSuperLevel0, the sub-pel planes stacked) against mvgpu.Super's frames, the storage
-(SuperLayout.h): luma in the frame's rows, chroma and the coarse levels at the offsets the frame's
-properties give.
+(SuperLayout.h): luma in the frame's rows, chroma (U and V interleaved, sample by sample) and the coarse
+levels at the offsets the frame's properties give.
 At pel 4, where mvgpu keeps only luma's half-pel planes (and 4:4:4 chroma's), its quarter planes are
 computed from them the way the kernels read them and compared with mvu's, and subsampled chroma's
-sixteen are read out of its quarter-pel image (every fourth sample of every fourth row from the phase
+sixteen are read out of its quarter-pel image (every fourth place of every fourth row from the phase
 on), every sample, the last column's and row's too. mvgpu's coarse levels, which mvu
 doesn't have, are compared with a numpy model of their reduction (rfilter's filter on clamped reads,
 SuperLayout.h's level table).
@@ -145,7 +145,8 @@ def reduce_plane(s, rfilter):
 
 
 def level_table(w, h, chroma, xr, yr, padx, pady):
-    """SuperLayout::Make's coarse levels: (w, h, wc, hc, offY, offU, offV, strideY, strideC, borderY, borderC) per level"""
+    """SuperLayout::Make's coarse levels: (w, h, wc, hc, offY, offC, strideY, strideC, borderY, borderC) per level, chroma's
+    plane holding U and V interleaved (offC U's first pixel, V's the sample after it, strideC samples a row)"""
     def up(v, a):
         return (v + a - 1) // a * a
 
@@ -162,14 +163,12 @@ def level_table(w, h, chroma, xr, yr, padx, pady):
         sy = up(w + 2 * by, 4)
         offY = offset + by * sy + by
         offset = up(offset + sy * (h + 2 * by), 16)
-        sc = offU = offV = 0
+        sc = offC = 0
         if chroma:
-            sc = up(wc + 2 * bc, 4)
-            offU = offset + bc * sc + bc
+            sc = up(2 * (wc + 2 * bc), 4)
+            offC = offset + bc * sc + 2 * bc
             offset = up(offset + sc * (hc + 2 * bc), 16)
-            offV = offset + bc * sc + bc
-            offset = up(offset + sc * (hc + 2 * bc), 16)
-        levels.append((w, h, wc, hc, offY, offU, offV, sy, sc, by, bc))
+        levels.append((w, h, wc, hc, offY, offC, sy, sc, by, bc))
     return levels
 
 
@@ -259,7 +258,7 @@ def main():
     gp = gsup.get_frame(0).props
     luma_planes = 1 if pel == 1 else 4  # at pel 4 the half-pel planes, the quarter ones computed
     image = pel == 4 and chroma and (xr > 1 or yr > 1)  # subsampled chroma at pel 4: its quarter-pel image
-    chroma_planes = n_sub if image else luma_planes     # plane sizes per chroma plane: else kept as luma is
+    chroma_planes = n_sub if image else luma_planes     # chroma's plane sizes (U and V interleaved in each): else kept as luma is
     top = gp['MVGPUtensilsSuperLevels'] - 1
 
     planes = 3 if chroma else 1
@@ -282,15 +281,15 @@ def main():
             H = (ah if p == 0 else ah // yr) + 2 * (pady if p == 0 else pady // yr)
             mvu = np.asarray(cl0[p].get_frame(n)[0])
             stored = luma_planes if p == 0 else chroma_planes
-            base = 0 if p == 0 else (p - 1) * chroma_planes
+            c = p - 1  # chroma's U (0) or V (1): every other sample of the interleaved rows
             if p > 0 and image:
-                # The plane's quarter-pel image: 4 H rows of 4 strides, phase (fx, fy) of pixel (x, y)
-                # at (4 x + fx, 4 y + fy); U's, then V's
-                img = cbuf[base * H * cstride:(base + n_sub) * H * cstride].reshape(4 * H, 4 * cstride)
-                gsub = lambda slot, img=img: img[slot >> 2::4, slot & 3::4][:H, :W]
+                # The planes' quarter-pel image: 4 H rows of 4 strides, phase (fx, fy) of pixel (x, y)
+                # at place (4 x + fx, 4 y + fy), U's and V's samples side by side
+                img = cbuf[:n_sub * H * cstride].reshape(4 * H, 4 * cstride)
+                gsub = lambda slot, img=img, c=c: img[slot >> 2::4, 2 * (slot & 3) + c::8][:H, :W]
             elif p > 0:
-                rows = cbuf[base * H * cstride:(base + stored) * H * cstride].reshape(stored * H, cstride)
-                gsub = lambda slot, rows=rows: rows[slot * H:(slot + 1) * H, :W]
+                rows = cbuf[:stored * H * cstride].reshape(stored * H, cstride)
+                gsub = lambda slot, rows=rows, c=c: rows[slot * H:(slot + 1) * H, c::2][:, :W]
             else:
                 gsub = lambda slot: g_luma[slot * H:(slot + 1) * H, :W]
             half = None
@@ -318,15 +317,16 @@ def main():
             buf = buf[props['MVGPUtensilsSuperPyramidOffset'] // buf.itemsize:]
             table = level_table(w, h, chroma, xr, yr, padx, pady)
             src = g_real
-            for (lw, lh, lwc, lhc, offY, offU, offV, sy, sc, bdy, bdc) in table:
+            for (lw, lh, lwc, lhc, offY, offC, sy, sc, bdy, bdc) in table:
                 nxt = []
                 for p in range(planes):
                     lvl = reduce_plane(src[p], args.rfilter)
-                    dw, dh, off, stride, border = (lw, lh, offY, sy, bdy) if p == 0 else (lwc, lhc, offU if p == 1 else offV, sc, bdc)
+                    # chroma's pixels every other sample, U's from offC, V's from the next
+                    dw, dh, off, stride, step, border = (lw, lh, offY, sy, 1, bdy) if p == 0 else (lwc, lhc, offC + p - 1, sc, 2, bdc)
                     assert lvl.shape == (dh, dw)
                     padded = lvl[np.clip(np.arange(-border, dh + border), 0, dh - 1)][:, np.clip(np.arange(-border, dw + border), 0, dw - 1)]
-                    start = off - border * stride - border
-                    got = np.lib.stride_tricks.as_strided(buf[start:], shape=padded.shape, strides=(stride * buf.itemsize, buf.itemsize))
+                    start = off - border * stride - step * border
+                    got = np.lib.stride_tricks.as_strided(buf[start:], shape=padded.shape, strides=(stride * buf.itemsize, step * buf.itemsize))
                     bad = bits_of(np.ascontiguousarray(got)) != bits_of(padded)
                     pyr_compared += bad.size
                     pyr_differ += int(bad.sum())

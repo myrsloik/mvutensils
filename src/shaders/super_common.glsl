@@ -39,7 +39,7 @@ layout(push_constant) uniform Params {
 } pc;
 
 // The buffers, numbered for Get and Put: the storage frames (SuperLayout.h), luma's sub-pel
-// planes and U's then V's; the frame's planes; the pelclip's planes; the pyramid
+// planes and chroma's, U and V interleaved; the frame's planes; the pelclip's planes; the pyramid
 const int kLuma = 0, kChroma = 1, kRawY = 2, kRawU = 3, kRawV = 4, kPelY = 5, kPelU = 6, kPelV = 7, kPyramid = 8;
 
 layout(std430, set = 0, binding = 0) buffer LumaB { uint8_t lumaB[]; };

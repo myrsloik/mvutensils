@@ -148,7 +148,7 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         q.padcY = L.padcY;
         q.wp = static_cast<int32_t>(lumaStride / bytes);
         q.hp = L.hp;
-        q.wc = static_cast<int32_t>(chromaStride / bytes);
+        q.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         q.hc = L.hc;
         q.lumaPlanes = L.lumaPlanes;
         q.chromaPlanes = L.ChromaPlanes();
@@ -166,11 +166,11 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
 
         // The full-pel planes from the frame; then the half-pel planes from them (the diagonal one
         // after the y + 1/2 one it filters), or from the pelclip. At pel 4 with subsampled chroma
-        // those are luma's alone, and super_qpel.comp makes chroma's quarter-pel images whole from the
-        // frame; 4:4:4 chroma gets the same planes as luma. Four samples
-        // of a padded row per lane.
+        // those are luma's alone, and super_qpel.comp makes chroma's quarter-pel image whole from the
+        // frame; 4:4:4 chroma gets the same planes as luma. Four pixels of a padded row per lane,
+        // luma's (z 0) or U's and V's together (z 1), whose planes are interleaved.
         const uint32_t groups = static_cast<uint32_t>((L.aw + 2 * L.pad + 255) / 256), rows = static_cast<uint32_t>(L.hp);
-        const uint32_t stepPlanes = d->quarterPipeline ? 1u : static_cast<uint32_t>(planes);
+        const uint32_t stepPlanes = F.chroma && !d->quarterPipeline ? 2u : 1u;
         auto planesStep = [&](int step) {
             q.step = step;
             rec.Dispatch(d->planesPipeline, q, groups, rows, stepPlanes);
@@ -188,7 +188,7 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         }
         stamp(2);
         if (d->quarterPipeline) {
-            rec.Dispatch(d->quarterPipeline, q, static_cast<uint32_t>((L.aw / F.xr + 2 * L.padc + 255) / 256), static_cast<uint32_t>(L.hc), 2);
+            rec.Dispatch(d->quarterPipeline, q, static_cast<uint32_t>((L.aw / F.xr + 2 * L.padc + 255) / 256), static_cast<uint32_t>(L.hc), 1);
             rec.ComputeBarrier();
         }
         stamp(3);
@@ -317,7 +317,7 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
         if (L.topLevel > 0)
             d->reducePipeline = vc.Pipeline(Kernel::PyrReduce, 0, pel, format.Kind());
         const VkDeviceSize lumaBytes = static_cast<VkDeviceSize>(L.LumaRows()) * L.wp * format.Bytes();
-        const VkDeviceSize chromaBytes = static_cast<VkDeviceSize>(L.ChromaRows()) * L.wc * format.Bytes();
+        const VkDeviceSize chromaBytes = static_cast<VkDeviceSize>(L.ChromaRows()) * 2 * L.wc * format.Bytes();
         if (lumaBytes > vc.limits.maxStorageBufferRange || (format.chroma && chromaBytes > vc.limits.maxStorageBufferRange))
             throw std::runtime_error("the frame is too large for the device's storage buffers");
 

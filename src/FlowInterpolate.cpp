@@ -248,6 +248,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         for (int p = 0; p < numPlanes; ++p)
             if (vsapi->getStride(ref, p) != vsapi->getStride(src, p))
                 return fail("the clip's frames' strides differ");
+        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
+        // strides)
+        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
+            return fail("the clip's U and V planes have different strides");
 
         // Scratch: the scene change counts, then F's and B's occlusion masks
         const int nb = d->nbx * d->nby;
@@ -298,7 +302,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / bytes);
+        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         pc.hc = L.hc;
         pc.time256 = time256;
         pc.thscd1 = d->thscd1;
@@ -332,18 +336,24 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
             rec.ComputeBarrier();
         }
         stamp(1);
-        for (int p = 0; p < numPlanes; ++p) {
+        // Luma, then chroma: U and V in one dispatch, V's output and clip planes at their own bindings
+        for (int p = 0; p < (numPlanes > 1 ? 2 : 1); ++p) {
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
             pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
             pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
-            pc.colOff = d->colOff[p ? 1 : 0];
-            pc.rowOff = d->rowOff[p ? 1 : 0];
-            pc.flags = (pc.flags & ~kVerticalFirst) | (d->verticalFirst[p ? 1 : 0] ? kVerticalFirst : 0);
+            pc.colOff = d->colOff[p];
+            pc.rowOff = d->rowOff[p];
+            pc.flags = (pc.flags & ~kVerticalFirst) | (d->verticalFirst[p] ? kVerticalFirst : 0);
             rec.Bind(kFlClipSrc, clipSrc[p].buffer);
             rec.Bind(kFlClipRef, clipRef[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
+            if (p) {
+                rec.Bind(kFlClipSrcV, clipSrc[2].buffer);
+                rec.Bind(kFlClipRefV, clipRef[2].buffer);
+                rec.Bind(kFlOutV, outPlanes[2].buffer);
+            }
             rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
         }
         stamp(2);

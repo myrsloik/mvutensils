@@ -11,15 +11,16 @@
 // - luma: the padded sub-pel planes one after another, hp rows each, then a spare row, wp samples
 //   wide, in the frame's own rows (which start whole words apart): the full-pel plane alone at pel
 //   1; at pel 2 and 4 it and the three half-pel planes (x + 1/2, y + 1/2, both).
-// - chroma (not for Gray): U's samples, then V's, then a spare row, wc wide in rows of their own
-//   stride: the full-pel plane of hc rows at pel 1, and the three half-pel planes after it at pel
-//   2, and at pel 4 when chroma isn't subsampled (4:4:4, kept as luma is); at pel 4 when it is, one
-//   image of the plane's quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at
-//   (4x + fx, 4y + fy), 4 hc rows of 4 wc samples, each four of the frame's rows (as much as
-//   sixteen planes would take).
-// - pyramid (not with onelevel): the coarse levels 1 .. topLevel the search starts from, every
-//   plane of every level inside a border of repeated edge pixels, at the offsets the level table
-//   gives; flat.
+// - chroma (not for Gray): U and V interleaved, sample by sample, U's sample of a place then V's,
+//   in rows of 2 wc samples (wc pixels of each) at a stride of their own, then a spare row: the
+//   full-pel plane of hc rows at pel 1, and the three half-pel planes after it at pel 2, and at pel
+//   4 when chroma isn't subsampled (4:4:4, kept as luma is); at pel 4 when it is, one image of the
+//   planes' quarter-pel grid, quarter sample (fx, fy) of padded pixel (x, y) at (4x + fx, 4y + fy),
+//   4 hc rows of 4 wc places, U's and V's samples side by side, each four of the region's rows (as
+//   much as sixteen planes would take).
+// - pyramid (not with onelevel): the coarse levels 1 .. topLevel the search starts from, luma's
+//   plane and chroma's (U and V interleaved, as level 0's) of every level inside a border of
+//   repeated edge pixels, at the offsets the level table gives; flat.
 //
 // The frame is the storage and nothing else: it shares no planes with the clip's frames and holds
 // no frames in its properties, so the core's frame cache sees all of it and keeps nothing else
@@ -43,6 +44,18 @@
 // slower. Luma's half-pel samples stay planes: the passes read one phase at a time, which planes keep
 // packed (probe/layout_bench.cpp measured luma as an image 5-19% slower). A pelclip's quarter samples
 // are no such averages, so mvgpu.Super refuses a pelclip at pel 4 (a divergence from mvu.Super).
+//
+// Chroma is interleaved because whatever reads it takes U and V at the same places: the search's SAD
+// reads one row of 2 kBlkCX samples where it read a row of U and one of V (float SADs take U's and V's
+// sums side by side, in one pass), and the filters that compensate motion make a pixel's U and V in
+// the same lane, which shares its vectors, weights and masks between them and finds both samples in
+// the same words. Measured against the planar layout before it on the test clips (RX 6900 XT, pel 2,
+// 16x16 blocks, overlap 8; 16-bit 4:2:0 at 4K unless said): the four fields' refinement took 9% less
+// GPU time (17% less with float samples, at 1080p), Degrain's pixels 14-15% less (13% at 8 bits, 10%
+// with floats), FlowInter's 22% and Compensate's 20%, and the chains ran 8-12% faster (0-4% with
+// 32x32 blocks, 3% at 4:4:4). Prototypes of U and V in one lane from planar planes gained a third to
+// two thirds as much, and lost at 8 bits: a lane reading U's and V's rows from planes far apart touches
+// twice the cache lines.
 
 #include <cstdint>
 #include <string>
@@ -51,10 +64,12 @@
 #include <VapourSynth4.h>
 
 // A coarse pyramid level as the kernels read it, matching pyr_common.glsl's Level. Offsets,
-// strides and sizes count samples.
+// strides and sizes count samples; offC is U's sample of chroma's first pixel inside the border, its
+// V's the next (the plane interleaved, as level 0's), strideC the samples of its rows, wc and hc and
+// borderC count pixels.
 struct LevelEntry {
     int32_t w, h, wc, hc;
-    int32_t offY, offU, offV, nbx;
+    int32_t offY, offC, spare, nbx;
     int32_t nby, fieldOff, pad, lambdaOff; // pad: the horizontal padding, padY the vertical
     int32_t frameSamples, fieldTotal;      // entry 0 only
     int32_t strideY, strideC;
@@ -64,7 +79,8 @@ static_assert(sizeof(LevelEntry) == 80, "pyr_common.glsl's Level is 20 ints");
 
 // Where a super frame keeps the parts of its storage: byte offsets into its plane's buffer and sizes
 // of luma's storage, chroma's (none for Gray) and the coarse levels' (none without them), and the
-// strides of luma's and chroma's rows. Offsets are multiples of 256 bytes, which every device takes
+// strides of luma's rows and chroma's (2 wc samples each, U and V interleaved; the kernels take
+// chromaStride / 2 bytes as their wc). Offsets are multiples of 256 bytes, which every device takes
 // as a storage buffer descriptor's offset.
 struct SuperRegions {
     int64_t luma = 0, lumaBytes = 0, chroma = 0, chromaBytes = 0, pyramid = 0, pyramidBytes = 0;
@@ -124,11 +140,12 @@ struct SuperLayout {
 
     // Chroma kept as its quarter-pel image: subsampled chroma at pel 4
     bool ChromaImage() const { return pel == 4 && format.chroma && (format.xr > 1 || format.yr > 1); }
-    // Plane sizes each chroma plane takes: its full-pel plane, its four half-pel planes, or its image
+    // Plane sizes chroma takes, hc rows of 2 wc samples each (U and V interleaved): the full-pel
+    // plane, the four half-pel planes, or the image
     int ChromaPlanes() const { return ChromaImage() ? 16 : pel == 1 ? 1 : 4; }
     // The storage frames' sizes
     int LumaRows() const { return lumaPlanes * hp + 1; }
-    int ChromaRows() const { return 2 * ChromaPlanes() * hc + 1; }
+    int ChromaRows() const { return ChromaPlanes() * hc + 1; } // of 2 wc samples, U and V interleaved
     int PyramidWidth() const { return wp; }
     int PyramidRows() const { return (pyramidSamples + wp - 1) / wp + 1; }
     // The super clip's frames: Gray of the format's samples, FrameWidth() x FrameRows(), the storage's

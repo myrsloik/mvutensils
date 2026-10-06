@@ -164,6 +164,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 return fail("the clip's frames aren't GPU resident");
         if (vkapi->getGPUPlane(sup, 0, &superPlane))
             return fail("the super's frames aren't GPU resident");
+        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
+        // strides)
+        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
+            return fail("the clip's U and V planes have different strides");
         const ptrdiff_t lumaStride = regions.lumaStride, chromaStride = regions.chromaStride;
         ptrdiff_t recBytes = 0;
         for (int i = 0; i < vectorClips; ++i) {
@@ -219,7 +223,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / bytes);
+        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         pc.hc = L.hc;
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
@@ -234,17 +238,22 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         rec.Bind(kFlVecF, vecPlanes[0].buffer);
         rec.Bind(kFlVecB, d->blur ? vecPlanes[1].buffer : d->tapsInfo.buffer);
         rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
-        for (int p = 0; p < numPlanes; ++p) {
+        // Luma, then chroma: U and V in one dispatch, V's output and clip planes at their own bindings
+        for (int p = 0; p < (numPlanes > 1 ? 2 : 1); ++p) {
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
             pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
             pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
-            pc.colOff = d->colOff[p ? 1 : 0];
-            pc.rowOff = d->rowOff[p ? 1 : 0];
-            pc.flags = d->verticalFirst[p ? 1 : 0] ? kVerticalFirst : 0;
+            pc.colOff = d->colOff[p];
+            pc.rowOff = d->rowOff[p];
+            pc.flags = d->verticalFirst[p] ? kVerticalFirst : 0;
             rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
+            if (p) {
+                rec.Bind(kFlClipSrcV, clipPlanes[2].buffer);
+                rec.Bind(kFlOutV, outPlanes[2].buffer);
+            }
             rec.Dispatch(d->pixels, pc, static_cast<uint32_t>((pc.width + 63) / 64), static_cast<uint32_t>(pc.height));
         }
         stamp(2);

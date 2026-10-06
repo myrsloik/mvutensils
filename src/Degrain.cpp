@@ -456,7 +456,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.ah = L.ah;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / bytes);
+        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         pc.hc = L.hc;
         pc.recStride = static_cast<int32_t>(recBytes / 16);
         pc.refs = refs;
@@ -481,19 +481,27 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         dispatch(d->weights, pc, blockGroups, 1);
         barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         stamp(2);
-        for (int p = 0; p < 3; ++p) {
-            if (!d->process[p])
+        // Luma, then chroma: U and V in one dispatch, which makes the planes pc.plane's bits say (1 U,
+        // 2 V), their blocks, weights and windows being the same and the super holding their samples
+        // side by side; a plane that isn't processed is a dummy, never written. U and V share their
+        // size, stride and limit.
+        for (int c = 0; c < 2; ++c) {
+            const int mask = c ? (d->process[1] ? 1 : 0) | (d->process[2] ? 2 : 0) : 0;
+            if (c ? mask == 0 : !d->process[0])
                 continue;
-            pc.plane = p;
+            const int p = c ? (mask & 1 ? 1 : 2) : 0; // a plane the dispatch makes
+            if (mask == 3 && vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2))
+                return fail("the output frame's U and V planes have different strides");
+            pc.plane = mask;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
             pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
             pc.limit = d->limit[p];
             pc.limitF = d->limitF[p];
-            pc.winOff = d->winOff[p ? 1 : 0];
+            pc.winOff = d->winOff[c];
             // Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the
             // plane's step and overlap multiples of 4 (degrain.comp's Quad, which decides alike)
-            const int lx = p ? L.format.xr >> 1 : 0;
+            const int lx = c ? L.format.xr >> 1 : 0;
             const bool quad = bytes == 1 && L.pel != 4 && ((pc.step >> lx) & 3) == 0 && ((pc.overlap >> lx) & 3) == 0;
             dispatch(d->pixels, pc, static_cast<uint32_t>(quad ? (pc.width + 255) / 256 : (pc.width + 63) / 64), static_cast<uint32_t>(d->nby));
         }

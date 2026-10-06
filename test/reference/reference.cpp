@@ -985,11 +985,13 @@ std::vector<std::vector<Seed>> BuildSeeds(const Search<T> &s, int n, int d, cons
             invF = &it->second;
     std::vector<Vec> inv;
     std::vector<uint32_t> invSad;
+    std::vector<char> hasInv; // (any SAD, 2^32 - 1 too, which a float SAD saturates at)
     if (invF) {
         // The block at p' in frame n + d matched p' + u in frame n: the block of frame n nearest to
-        // that position moves by -u
+        // that position moves by -u; of several, the lowest SAD's, of equal ones the first
         inv.assign(nb, Vec{});
         invSad.assign(nb, UINT32_MAX);
+        hasInv.assign(nb, 0);
         for (int b = 0; b < nb; ++b) {
             const Vec w = invF->v[b];
             const double unit = s.pel;
@@ -997,7 +999,8 @@ std::vector<std::vector<Seed>> BuildSeeds(const Search<T> &s, int n, int d, cons
             if (tx < 0 || ty < 0 || tx >= s.nbx || ty >= s.nby)
                 continue;
             const int t = ty * s.nbx + tx;
-            if (invF->sad[b] < invSad[t]) {
+            if (!hasInv[t] || invF->sad[b] < invSad[t]) {
+                hasInv[t] = 1;
                 invSad[t] = invF->sad[b];
                 inv[t] = {-w.x, -w.y};
             }
@@ -1016,7 +1019,7 @@ std::vector<std::vector<Seed>> BuildSeeds(const Search<T> &s, int n, int d, cons
             const Vec v2 = restF->v[ty * s.nbx + tx];
             add(b, s.HalfGrid(Vec{v1.x + v2.x, v1.y + v2.y}));
         }
-        if (invF && invSad[b] != UINT32_MAX)
+        if (invF && hasInv[b])
             add(b, s.HalfGrid(inv[b]));
         const int span = 8 << kFinest;
         const int cx = std::min((x + s.blk / 2) / span, co.nbx - 1), cy = std::min((y + s.blkY / 2) / span, co.nby - 1);

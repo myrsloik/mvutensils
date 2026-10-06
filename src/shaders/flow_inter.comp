@@ -15,8 +15,9 @@ int MaskAt(int base) {
 // through the occlusion masks), or FlowInterExtra (the medians with the extra frames' compensations
 // instead) where FF and BB serve too; else the clip's frames blended by the time, or the frame
 // before. FlowInter's inner products reach 256 * 65535 * 256 at 16 bits, past int's range though
-// within uint's (mvu takes int64), so they are unsigned. Dispatched as ((width + 63) / 64, height)
-// workgroups per plane.
+// within uint's (mvu takes int64), so they are unsigned. Chroma's lanes make U and V together
+// (MainUV, MainFloatUV): their resized vectors and masks are the same, their samples side by side in
+// the supers. Dispatched as ((width + 63) / 64, height) workgroups per plane, luma and chroma.
 // main()'s pixel of a float clip, mvu's float arithmetic operation for operation: on x86 with
 // AVX-512, where the computation is the most exact, mvu.FlowInter and FlowFPS run FlowInter and
 // FlowInterExtra as the scalar code compiled with AVX-512, its contractible products fused, each
@@ -79,10 +80,119 @@ void MainFloat(int x, int y) {
     outPxF[y * pc.outStride + x] = result;
 }
 
+// MainFloat for chroma: U and V together, each with MainFloat's operations (their selects component
+// by component, the first argument on ties as there)
+void MainFloatUV(int x, int y) {
+    int t = pc.time256;
+    uint limit = uint(pc.scdLimit);
+    bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;
+    vec2 result;
+    if (!fb) {
+        uint i = uint(y * pc.clipStride + x);
+        vec2 s = vec2(clipSrcF[i], clipSrcVF[i]);
+        if ((pc.flags & kBlend) != 0) {
+            precise vec2 a = s * float(256 - t);
+            precise vec2 b = vec2(clipRefF[i], clipRefVF[i]) * float(t);
+            precise vec2 sum = a + b;
+            result = sum * (1.0 / 256.0);
+        } else {
+            result = s;
+        }
+    } else {
+        bool extra = (pc.flags & kHaveExtra) != 0 && counts[2] <= limit && counts[3] <= limit;
+        Weights(x, y);
+        ivec2 vF = VectorAt(0), vB = VectorAt(1);
+        int mFi = MaskAt(0), mBi = MaskAt(pc.nbx * pc.nby);
+        float mF = float(mFi), mB = float(mBi), iF = float(256 - mFi), iB = float(256 - mBi);
+        int xBase = x * kPel, yBase = y * kPel;
+        int vxF = (vF.x * t) >> 8, vyF = (vF.y * t) >> 8;
+        int vxB = (vB.x * (256 - t)) >> 8, vyB = (vB.y * (256 - t)) >> 8;
+        vec2 dF = SampleUVF(false, xBase + vxF, yBase + vyF), dB = SampleUVF(true, xBase + vxB, yBase + vyB);
+        if (extra) {
+            ivec2 vFF = VectorAt(2), vBB = VectorAt(3);
+            int vxFF = (vFF.x * t) >> 8, vyFF = (vFF.y * t) >> 8;
+            int vxBB = (vBB.x * (256 - t)) >> 8, vyBB = (vBB.y * (256 - t)) >> 8;
+            vec2 dFF = SampleUVF(false, xBase + vxFF, yBase + vyFF), dBB = SampleUVF(true, xBase + vxBB, yBase + vyBB);
+            vec2 minfb = mix(dB, dF, lessThan(dF, dB)), maxfb = mix(dB, dF, lessThan(dB, dF));
+            vec2 lowBB = mix(dBB, maxfb, lessThan(maxfb, dBB)), lowFF = mix(dFF, maxfb, lessThan(maxfb, dFF));
+            vec2 medianBB = mix(minfb, lowBB, lessThan(minfb, lowBB)), medianFF = mix(minfb, lowFF, lessThan(minfb, lowFF));
+            precise vec2 rF = dF * iF;
+            precise vec2 t1 = fma(medianBB, vec2(mF), rF) * (1.0 / 256.0);
+            precise vec2 rB = dB * iB;
+            precise vec2 t2 = fma(medianFF, vec2(mB), rB) * (1.0 / 256.0);
+            precise vec2 r2 = t2 * float(t);
+            result = fma(t1, vec2(float(256 - t)), r2) * (1.0 / 256.0);
+        } else {
+            vec2 dF0 = SampleUVF(false, xBase, yBase), dB0 = SampleUVF(true, xBase, yBase);
+            precise vec2 pF0 = mB * dF0;
+            precise vec2 innerF = fma(dB, vec2(iB), pF0);
+            precise vec2 partF = (mF * innerF) * (1.0 / 256.0);
+            precise vec2 occF = fma(dF, vec2(iF), partF) * (1.0 / 256.0);
+            precise vec2 pB0 = mF * dB0;
+            precise vec2 innerB = fma(dF, vec2(iF), pB0);
+            precise vec2 partB = (mB * innerB) * (1.0 / 256.0);
+            precise vec2 occB = fma(dB, vec2(iB), partB) * (1.0 / 256.0);
+            precise vec2 rB = occB * float(t);
+            result = fma(occF, vec2(float(256 - t)), rB) * (1.0 / 256.0);
+        }
+    }
+    uint o = uint(y * pc.outStride + x);
+    outPxF[o] = result.x;
+    outPxVF[o] = result.y;
+}
+
+// main() for chroma's integer samples: U and V together, each with main()'s arithmetic
+void MainUV(int x, int y) {
+    int t = pc.time256;
+    uint limit = uint(pc.scdLimit);
+    bool fb = (pc.flags & kHaveFB) != 0 && counts[0] <= limit && counts[1] <= limit;
+    uvec2 result;
+    if (!fb) {
+        uint i = uint(y * pc.clipStride + x);
+        uvec2 s = uvec2(ClipPx(false, i), ClipPxV(false, i));
+        result = (pc.flags & kBlend) != 0 ? (s * uint(256 - t) + uvec2(ClipPx(true, i), ClipPxV(true, i)) * uint(t)) >> 8u : s;
+    } else {
+        bool extra = (pc.flags & kHaveExtra) != 0 && counts[2] <= limit && counts[3] <= limit;
+        Weights(x, y);
+        ivec2 vF = VectorAt(0), vB = VectorAt(1);
+        int mF = MaskAt(0), mB = MaskAt(pc.nbx * pc.nby);
+        int xBase = x * kPel, yBase = y * kPel;
+        int vxF = (vF.x * t) >> 8, vyF = (vF.y * t) >> 8;
+        int vxB = (vB.x * (256 - t)) >> 8, vyB = (vB.y * (256 - t)) >> 8;
+        ivec2 dF = ivec2(SampleUV(false, xBase + vxF, yBase + vyF)), dB = ivec2(SampleUV(true, xBase + vxB, yBase + vyB));
+        ivec2 blended;
+        if (extra) {
+            ivec2 vFF = VectorAt(2), vBB = VectorAt(3);
+            int vxFF = (vFF.x * t) >> 8, vyFF = (vFF.y * t) >> 8;
+            int vxBB = (vBB.x * (256 - t)) >> 8, vyBB = (vBB.y * (256 - t)) >> 8;
+            ivec2 dFF = ivec2(SampleUV(false, xBase + vxFF, yBase + vyFF)), dBB = ivec2(SampleUV(true, xBase + vxBB, yBase + vyBB));
+            ivec2 minfb = min(dB, dF), maxfb = max(dB, dF);
+            ivec2 medianBB = max(minfb, min(dBB, maxfb)), medianFF = max(minfb, min(dFF, maxfb));
+            blended = ((((medianBB * mF + dF * (256 - mF)) + 256) >> 8) * (256 - t) + (((medianFF * mB + dB * (256 - mB)) + 256) >> 8) * t) >> 8;
+        } else {
+            ivec2 dF0 = ivec2(SampleUV(false, xBase, yBase)), dB0 = ivec2(SampleUV(true, xBase, yBase));
+            ivec2 occF = (dF * (256 - mF) + ivec2((uint(mF) * uvec2(dB * (256 - mB) + mB * dF0) + 256u) >> 8u) + 256) >> 8;
+            ivec2 occB = (dB * (256 - mB) + ivec2((uint(mB) * uvec2(dF * (256 - mF) + mF * dB0) + 256u) >> 8u) + 256) >> 8;
+            blended = (occF * (256 - t) + occB * t) >> 8;
+        }
+        result = uvec2(blended - 1);
+    }
+    uint o = uint(y * pc.outStride + x);
+    Store(o, result.x);
+    StoreV(o, result.y);
+}
+
 void main() {
     int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
     if (x >= pc.width)
         return;
+    if (pc.plane != 0) {
+        if (kFloat)
+            MainFloatUV(x, y);
+        else
+            MainUV(x, y);
+        return;
+    }
     if (kFloat) {
         MainFloat(x, y);
         return;
@@ -120,8 +230,5 @@ void main() {
         }
         result = uint(blended - 1);
     }
-    if (kWide)
-        outPx16[y * pc.outStride + x] = uint16_t(result);
-    else
-        outPx[y * pc.outStride + x] = uint8_t(result);
+    Store(uint(y * pc.outStride + x), result);
 }

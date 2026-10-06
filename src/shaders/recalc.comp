@@ -68,8 +68,9 @@ layout(push_constant) uniform Params {
 } pc;
 
 // The bindings: the supers' storage of the frame (src) and of its reference frame (ref), luma and
-// chroma, bytes, 16 bits each for 9 to 16-bit supers (kWide) or floats (read by SrcF and RefF); the old
-// vectors and the new ones, a record (x, y, SAD, 0) per block
+// chroma (U and V interleaved, sample by sample: SuperLayout.h), bytes, 16 bits each for 9 to 16-bit
+// supers (kWide) or floats (read by SrcF and RefF); the old vectors and the new ones, a record
+// (x, y, SAD, 0) per block
 layout(std430, set = 0, binding = 0) readonly buffer SrcLuma { uint8_t srcY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer SrcChroma { uint8_t srcC[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RefLuma { uint8_t refY[]; };
@@ -103,12 +104,6 @@ uint ChromaAt(bool ref, uint i) {
     return ref ? uint(refC[i]) : uint(srcC[i]);
 }
 
-// The plane sizes U's planes take before V's: its quarter-pel image, its full-pel plane, or its four
-// half-pel planes
-int ChromaPlanes() {
-    return kImage ? 16 : min(kPel * kPel, 4);
-}
-
 // The rounded average mvu.Super's quarter planes take of two samples
 uint Avg(uint a, uint b) {
     return (a + b + 1u) >> 1u;
@@ -120,33 +115,47 @@ uint HalfAddr(int Xh, int Yh, int stride, int rows) {
     return uint((Xh & 1) | ((Yh & 1) << 1)) * uint(stride * rows) + uint((Yh >> 1) * stride + (Xh >> 1));
 }
 
-// mvu's GetAbsolutePointerPel1/2/4: the reference's sample at (X, Y), 1 / pel pixels of the padded
-// plane, of luma or of chroma plane c (1 U, 2 V); the quarter samples computed from the half-pel ones
-// as mvu.Super makes them (subsampled chroma's from its quarter-pel image)
-uint RefSample(int c, int X, int Y) {
-    bool luma = c == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
-    if (!luma && kImage)
-        return ChromaAt(true, base + uint(Y * 4 * stride + X));
+// mvu's GetAbsolutePointerPel1/2/4: the reference's luma sample at (X, Y), 1 / pel pixels of the
+// padded plane; the quarter samples computed from the half-pel ones as mvu.Super makes them
+uint RefSample(int X, int Y) {
     if (kPel == 1)
-        return luma ? LumaAt(true, uint(Y * stride + X)) : ChromaAt(true, base + uint(Y * stride + X));
+        return LumaAt(true, uint(Y * pc.wp + X));
     if (kPel == 2)
-        return luma ? LumaAt(true, HalfAddr(X, Y, stride, rows)) : ChromaAt(true, base + HalfAddr(X, Y, stride, rows));
+        return LumaAt(true, HalfAddr(X, Y, pc.wp, pc.hp));
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
-    uint aa = base + HalfAddr(Xa, Ya, stride, rows), ab = base + HalfAddr(Xa, Yb, stride, rows);
-    uint ba = base + HalfAddr(Xb, Ya, stride, rows), bb = base + HalfAddr(Xb, Yb, stride, rows);
-    if (luma)
-        return Avg(Avg(LumaAt(true, aa), LumaAt(true, ab)), Avg(LumaAt(true, ba), LumaAt(true, bb)));
-    return Avg(Avg(ChromaAt(true, aa), ChromaAt(true, ab)), Avg(ChromaAt(true, ba), ChromaAt(true, bb)));
+    uint aa = HalfAddr(Xa, Ya, pc.wp, pc.hp), ab = HalfAddr(Xa, Yb, pc.wp, pc.hp);
+    uint ba = HalfAddr(Xb, Ya, pc.wp, pc.hp), bb = HalfAddr(Xb, Yb, pc.wp, pc.hp);
+    return Avg(Avg(LumaAt(true, aa), LumaAt(true, ab)), Avg(LumaAt(true, ba), LumaAt(true, bb)));
 }
 
-// The frame's own pixel (x, y) of the padded plane: its full-pel sample
-uint SrcSample(int c, int x, int y) {
-    if (c == 0)
-        return LumaAt(false, uint(y * pc.wp + x));
-    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
-    return ChromaAt(false, base + (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x)));
+// And its chroma samples there, U's and V's, side by side in the interleaved planes (subsampled
+// chroma's from its quarter-pel image)
+uvec2 RefChromaUV(int X, int Y) {
+    uint a = 0u;
+    if (kImage)
+        a = 2u * uint(Y * 4 * pc.wc + X);
+    else if (kPel == 1)
+        a = 2u * uint(Y * pc.wc + X);
+    else if (kPel == 2)
+        a = 2u * HalfAddr(X, Y, pc.wc, pc.hc);
+    if (kPel != 4)
+        return uvec2(ChromaAt(true, a), ChromaAt(true, a + 1u));
+    if (kImage)
+        return uvec2(ChromaAt(true, a), ChromaAt(true, a + 1u));
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    uint aa = 2u * HalfAddr(Xa, Ya, pc.wc, pc.hc), ab = 2u * HalfAddr(Xa, Yb, pc.wc, pc.hc);
+    uint ba = 2u * HalfAddr(Xb, Ya, pc.wc, pc.hc), bb = 2u * HalfAddr(Xb, Yb, pc.wc, pc.hc);
+    return uvec2(Avg(Avg(ChromaAt(true, aa), ChromaAt(true, ab)), Avg(ChromaAt(true, ba), ChromaAt(true, bb))),
+                 Avg(Avg(ChromaAt(true, aa + 1u), ChromaAt(true, ab + 1u)), Avg(ChromaAt(true, ba + 1u), ChromaAt(true, bb + 1u))));
+}
+
+// The frame's own pixel (x, y) of the padded plane: its full-pel luma sample, and its chroma ones
+uint SrcSample(int x, int y) {
+    return LumaAt(false, uint(y * pc.wp + x));
+}
+uvec2 SrcChromaUV(int x, int y) {
+    uint a = 2u * (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x));
+    return uvec2(ChromaAt(false, a), ChromaAt(false, a + 1u));
 }
 
 // The block: its top left pixel in the padded planes, luma's and chroma's, and the pixels this lane
@@ -163,42 +172,53 @@ float AvgF(float a, float b) {
     return s;
 }
 
-float SrcF(int c, int x, int y) {
-    if (c == 0)
-        return srcYF[y * pc.wp + x];
-    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
-    return srcCF[base + (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x))];
+// Luma's samples: the frame's own at (x, y) of the padded plane, the reference's at (X, Y)
+float SrcF(int x, int y) {
+    return srcYF[y * pc.wp + x];
 }
-
-float RefF(int c, int X, int Y) {
-    bool luma = c == 0;
-    int stride = luma ? pc.wp : pc.wc, rows = luma ? pc.hp : pc.hc;
-    uint base = c == 2 ? uint(ChromaPlanes() * pc.wc * pc.hc) : 0u;
-    if (!luma && kImage)
-        return refCF[base + uint(Y * 4 * stride + X)];
+float RefF(int X, int Y) {
     if (kPel == 1)
-        return luma ? refYF[Y * stride + X] : refCF[base + uint(Y * stride + X)];
+        return refYF[Y * pc.wp + X];
     if (kPel == 2)
-        return luma ? refYF[HalfAddr(X, Y, stride, rows)] : refCF[base + HalfAddr(X, Y, stride, rows)];
+        return refYF[HalfAddr(X, Y, pc.wp, pc.hp)];
     int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
-    uint aa = base + HalfAddr(Xa, Ya, stride, rows), ab = base + HalfAddr(Xa, Yb, stride, rows);
-    uint ba = base + HalfAddr(Xb, Ya, stride, rows), bb = base + HalfAddr(Xb, Yb, stride, rows);
-    if (luma)
-        return AvgF(AvgF(refYF[aa], refYF[ab]), AvgF(refYF[ba], refYF[bb]));
-    return AvgF(AvgF(refCF[aa], refCF[ab]), AvgF(refCF[ba], refCF[bb]));
+    uint aa = HalfAddr(Xa, Ya, pc.wp, pc.hp), ab = HalfAddr(Xa, Yb, pc.wp, pc.hp);
+    uint ba = HalfAddr(Xb, Ya, pc.wp, pc.hp), bb = HalfAddr(Xb, Yb, pc.wp, pc.hp);
+    return AvgF(AvgF(refYF[aa], refYF[ab]), AvgF(refYF[ba], refYF[bb]));
 }
 
+// And chroma's, U's and V's, side by side in the interleaved planes, as SrcChromaUV and RefChromaUV
+vec2 SrcUVF(int x, int y) {
+    uint a = 2u * (kImage ? uint(16 * y * pc.wc + 4 * x) : uint(y * pc.wc + x));
+    return vec2(srcCF[a], srcCF[a + 1u]);
+}
+vec2 RefUVF(int X, int Y) {
+    uint a = 0u;
+    if (kImage)
+        a = 2u * uint(Y * 4 * pc.wc + X);
+    else if (kPel == 1)
+        a = 2u * uint(Y * pc.wc + X);
+    else if (kPel == 2)
+        a = 2u * HalfAddr(X, Y, pc.wc, pc.hc);
+    if (kPel != 4)
+        return vec2(refCF[a], refCF[a + 1u]);
+    if (kImage)
+        return vec2(refCF[a], refCF[a + 1u]);
+    int Xa = X >> 1, Xb = Xa + (X & 1), Ya = Y >> 1, Yb = Ya + (Y & 1);
+    uint aa = 2u * HalfAddr(Xa, Ya, pc.wc, pc.hc), ab = 2u * HalfAddr(Xa, Yb, pc.wc, pc.hc);
+    uint ba = 2u * HalfAddr(Xb, Ya, pc.wc, pc.hc), bb = 2u * HalfAddr(Xb, Yb, pc.wc, pc.hc);
+    return vec2(AvgF(AvgF(refCF[aa], refCF[ab]), AvgF(refCF[ba], refCF[bb])), AvgF(AvgF(refCF[aa + 1u], refCF[ab + 1u]), AvgF(refCF[ba + 1u], refCF[bb + 1u])));
+}
+
+// sadf_common.glsl's differences: luma's (p 0), and U's and V's at the vector divided by the subsampling,
+// rounded toward zero
 float DiffF(int p, int x, int y) {
-    float cur, ref;
-    if (p == 0) {
-        cur = SrcF(0, gX + x, gY + y);
-        ref = RefF(0, gX * kPel + gSadV.x + x * kPel, gY * kPel + gSadV.y + y * kPel);
-    } else {
-        int cvx = (gSadV.x + (gSadV.x < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (gSadV.y + (gSadV.y < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
-        cur = SrcF(p, gXc + x, gYc + y);
-        ref = RefF(p, gXc * kPel + cvx + x * kPel, gYc * kPel + cvy + y * kPel);
-    }
-    precise float d = cur - ref;
+    precise float d = SrcF(gX + x, gY + y) - RefF(gX * kPel + gSadV.x + x * kPel, gY * kPel + gSadV.y + y * kPel);
+    return d;
+}
+vec2 DiffUV(int x, int y) {
+    int cvx = (gSadV.x + (gSadV.x < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (gSadV.y + (gSadV.y < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
+    precise vec2 d = SrcUVF(gXc + x, gYc + y) - RefUVF(gXc * kPel + cvx + x * kPel, gYc * kPel + cvy + y * kPel);
     return d;
 }
 
@@ -259,6 +279,58 @@ float SadParF(int p, int w, int h) {
     }
     for (int n = L >> 1; n >= 1; n >>= 1) {
         precise float s = t + subgroupShuffleXor(t, uint(n));
+        t = s;
+    }
+    return subgroupShuffle(t, 0u);
+}
+
+// SadParF for U and V at once: the same sums component by component (sadf_common.glsl's SadUV), one pass
+// over their side-by-side samples
+vec2 SadParUV(int w, int h) {
+    if (w <= 4) {
+        int x = gLane >> 3, i = gLane & 7;
+        vec2 v = x < w && i < h ? AbsDiffUV(x, ColumnRow(i, h)) : vec2(0.0);
+        for (int n = 1; n < h; n <<= 1) {
+            precise vec2 s = v + subgroupShuffleXor(v, uint(n));
+            v = s;
+        }
+        if (w == 2) {
+            precise vec2 s = v + subgroupShuffleXor(v, 8u);
+            v = s;
+        } else {
+            precise vec2 s = v + subgroupShuffleXor(v, 16u);
+            precise vec2 t = s + subgroupShuffleXor(s, 8u);
+            v = t;
+        }
+        return subgroupShuffle(v, 0u);
+    }
+    int L = w == 8 ? 8 : 16, K = h < 4 ? 1 : 4, chains = L * K;
+    vec2 a[2] = vec2[2](vec2(0.0), vec2(0.0));
+    for (int m = 0; m * kSubgroup < chains; ++m) {
+        int c = gLane + m * kSubgroup;
+        precise vec2 s = vec2(0.0);
+        if (c < chains) {
+            int l = c % L, k = c / L;
+            [[dont_unroll]] for (int y = k; y < h; y += K)
+                for (int x = l; x < w; x += L)
+                    s += AbsDiffUV(x, y);
+        }
+        a[m] = s;
+    }
+    vec2 ak[4];
+    for (int k = 0; k < K; ++k) {
+        int c = k * L + gLane % L;
+        vec2 v0 = subgroupShuffle(a[0], uint(c % kSubgroup)), v1 = subgroupShuffle(a[1], uint(c % kSubgroup));
+        ak[k] = c < kSubgroup ? v0 : v1;
+    }
+    precise vec2 t = ak[0];
+    if (K == 4) {
+        precise vec2 s01 = ak[0] + ak[1];
+        precise vec2 s23 = ak[2] + ak[3];
+        t = s01 + s23;
+    }
+    for (int n = L >> 1; n >= 1; n >>= 1) {
+        precise vec2 s = t + subgroupShuffleXor(t, uint(n));
         t = s;
     }
     return subgroupShuffle(t, 0u);
@@ -338,8 +410,8 @@ uint TileSatdAt(int t, int k, int X0, int Y0) {
     ivec4 d[4];
     [[unroll]] for (int i = 0; i < 4; ++i)
         [[unroll]] for (int c = 0; c < 4; ++c) {
-            uint cur = kKeepT ? gSrcT[16 * k + 4 * i + c] : SrcSample(0, gX + tx + c, gY + ty + i);
-            d[i][c] = int(cur) - int(RefSample(0, X0 + (tx + c) * kPel, Y0 + (ty + i) * kPel));
+            uint cur = kKeepT ? gSrcT[16 * k + 4 * i + c] : SrcSample(gX + tx + c, gY + ty + i);
+            d[i][c] = int(cur) - int(RefSample(X0 + (tx + c) * kPel, Y0 + (ty + i) * kPel));
         }
     return TileSatd(d[0], d[1], d[2], d[3]);
 }
@@ -352,8 +424,10 @@ u64vec2 Sads(int vx, int vy) {
         // luma's SAD or SATD, and U's and V's added, each plane's scaled alone, as mvu adds them
         gSadV = ivec2(vx, vy);
         uint64_t c = 0ul;
-        if (kChromaSad)
-            c = uint64_t(ScaledF(SadParF(1, kBlkCX, kBlkCY), 65535.0)) + uint64_t(ScaledF(SadParF(2, kBlkCX, kBlkCY), 65535.0));
+        if (kChromaSad) {
+            vec2 sc = SadParUV(kBlkCX, kBlkCY);
+            c = uint64_t(ScaledF(sc.x, 65535.0)) + uint64_t(ScaledF(sc.y, 65535.0));
+        }
         uint l = kSatd ? ScaledF(SatdParF(kBlkX, kBlkY), 32767.5) : ScaledF(SadParF(0, kBlkX, kBlkY), 65535.0);
         return u64vec2(uint64_t(l), c);
     }
@@ -374,11 +448,11 @@ u64vec2 Sads(int vx, int vy) {
         [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
             int i = gLane + k * kSubgroup;
             if (i < kBlkX * kBlkY)
-                sl += AbsDiff(gSrcY[k], RefSample(0, X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
+                sl += AbsDiff(gSrcY[k], RefSample(X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
         }
     } else {
         for (int i = gLane; i < kBlkX * kBlkY; i += kSubgroup)
-            sl += AbsDiff(SrcSample(0, gX + i % kBlkX, gY + i / kBlkX), RefSample(0, X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
+            sl += AbsDiff(SrcSample(gX + i % kBlkX, gY + i / kBlkX), RefSample(X0 + (i % kBlkX) * kPel, Y0 + (i / kBlkX) * kPel));
     }
     if (kChromaSad) {
         int cvx = (vx + (vx < 0 ? (1 << kLogX) - 1 : 0)) >> kLogX, cvy = (vy + (vy < 0 ? (1 << kLogY) - 1 : 0)) >> kLogY;
@@ -387,14 +461,14 @@ u64vec2 Sads(int vx, int vy) {
             [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
                 int i = gLane + k * kSubgroup;
                 if (i < kBlkCX * kBlkCY) {
-                    int X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
-                    sc += AbsDiff(gSrcU[k], RefSample(1, X, Y)) + AbsDiff(gSrcV[k], RefSample(2, X, Y));
+                    uvec2 r = RefChromaUV(Xc0 + (i % kBlkCX) * kPel, Yc0 + (i / kBlkCX) * kPel);
+                    sc += AbsDiff(gSrcU[k], r.x) + AbsDiff(gSrcV[k], r.y);
                 }
             }
         } else {
             for (int i = gLane; i < kBlkCX * kBlkCY; i += kSubgroup) {
-                int x = gXc + i % kBlkCX, y = gYc + i / kBlkCX, X = Xc0 + (i % kBlkCX) * kPel, Y = Yc0 + (i / kBlkCX) * kPel;
-                sc += AbsDiff(SrcSample(1, x, y), RefSample(1, X, Y)) + AbsDiff(SrcSample(2, x, y), RefSample(2, X, Y));
+                uvec2 c = SrcChromaUV(gXc + i % kBlkCX, gYc + i / kBlkCX), r = RefChromaUV(Xc0 + (i % kBlkCX) * kPel, Yc0 + (i / kBlkCX) * kPel);
+                sc += AbsDiff(c.x, r.x) + AbsDiff(c.y, r.y);
             }
         }
     }
@@ -446,158 +520,251 @@ void Check(int vx, int vy, int flags, int val) {
         gDir = val;
 }
 
-void CheckMV(int vx, int vy) {
-    Check(vx, vy, kPenalty | kUpdateBest, 0);
-}
-
-void CheckMV2(int vx, int vy, int val) {
-    Check(vx, vy, kPenalty | kUpdateDir | kUpdateBest, val);
-}
-
-void CheckMVdir(int vx, int vy, int val) {
-    Check(vx, vy, kPenalty | kUpdateDir, val);
-}
-
-// mvu's DiamondSearch: directions Right 1, Left 2, Down 4, Up 8
-void DiamondSearch(int length) {
-    int direction = 15;
-    while (direction > 0) {
-        int dx = gBest.x, dy = gBest.y;
-        int lastDirection = direction;
-        direction = 0;
-        gDir = 0;
-        if ((lastDirection & 1) != 0)
-            CheckMV2(dx + length, dy, 1);
-        if ((lastDirection & 2) != 0)
-            CheckMV2(dx - length, dy, 2);
-        if ((lastDirection & 4) != 0)
-            CheckMV2(dx, dy + length, 4);
-        if ((lastDirection & 8) != 0)
-            CheckMV2(dx, dy - length, 8);
-        direction = gDir;
-        if (direction != 0) {
-            lastDirection = direction;
-            dx = gBest.x;
-            dy = gBest.y;
-            if ((lastDirection & 3) != 0) {
-                CheckMV2(dx, dy + length, 4);
-                CheckMV2(dx, dy - length, 8);
-            } else {
-                CheckMV2(dx + length, dy, 1);
-                CheckMV2(dx - length, dy, 2);
-            }
-        } else if (lastDirection == 1) {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx + length, dy - length, 1 + 8);
-        } else if (lastDirection == 2) {
-            CheckMV2(dx - length, dy + length, 2 + 4);
-            CheckMV2(dx - length, dy - length, 2 + 8);
-        } else if (lastDirection == 4) {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx - length, dy + length, 2 + 4);
-        } else if (lastDirection == 8) {
-            CheckMV2(dx + length, dy - length, 1 + 8);
-            CheckMV2(dx - length, dy - length, 2 + 8);
-        } else if (lastDirection == 1 + 4) {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx - length, dy + length, 2 + 4);
-            CheckMV2(dx + length, dy - length, 1 + 8);
-        } else if (lastDirection == 2 + 4) {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx - length, dy + length, 2 + 4);
-            CheckMV2(dx - length, dy - length, 2 + 8);
-        } else if (lastDirection == 1 + 8) {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx - length, dy - length, 2 + 8);
-            CheckMV2(dx + length, dy - length, 1 + 8);
-        } else if (lastDirection == 2 + 8) {
-            CheckMV2(dx - length, dy - length, 2 + 8);
-            CheckMV2(dx - length, dy + length, 2 + 4);
-            CheckMV2(dx + length, dy - length, 1 + 8);
-        } else {
-            CheckMV2(dx + length, dy + length, 1 + 4);
-            CheckMV2(dx - length, dy + length, 2 + 4);
-            CheckMV2(dx + length, dy - length, 1 + 8);
-            CheckMV2(dx - length, dy - length, 2 + 8);
-        }
-        direction = gDir;
-    }
-}
-
-// mvu's ExpandingSearch: the square of radius r around (mvx, mvy), its sides without the corners,
-// then the corners
-void ExpandingSearch(int r, int s, int mvx, int mvy) {
-    for (int i = -r + s; i < r; i += s) {
-        CheckMV(mvx + i, mvy - r);
-        CheckMV(mvx + i, mvy + r);
-    }
-    for (int j = -r + s; j < r; j += s) {
-        CheckMV(mvx - r, mvy + j);
-        CheckMV(mvx + r, mvy + j);
-    }
-    CheckMV(mvx - r, mvy - r);
-    CheckMV(mvx - r, mvy + r);
-    CheckMV(mvx + r, mvy - r);
-    CheckMV(mvx + r, mvy + r);
-}
-
-// mvu's Hex2Search (x264's): the radius 2 hexagon, half hexagons while one improves, then the square
-// of radius 1
+// mvu's searches (MotionBlockPyramid.cpp's DiamondSearch, ExpandingSearch, Hex2Search, UMHSearch and the
+// horizontal and vertical lines), candidate for candidate in mvu's order, as one walk: a batch of
+// candidates at a time, each batch's taken from the state the checks before it left (gBest, gDir), and
+// every candidate checked at one place (main). The driver inlines Check, and the SAD in it, wherever it is
+// called: called once per candidate of every search as mvu's code reads, it was compiled about 70 times,
+// 40-60 s per kernel cold, and float SATD on 128x128 blocks didn't compile at all.
+//
+// The batches: Diamond, candidates in direction codes (1 right, 2 left, 4 down, 8 up, and their sums for the
+// diagonals), packed four bits each in gCodes, gR apart from (gCX, gCY), CheckMV2's; Expand, the square of
+// radius gR around (gCX, gCY), its sides without the corners and then the corners (ExpandingSearch's step
+// 1, the only step Recalculate takes), CheckMV's; HexInit, the radius 2 hexagon around (gBmx, gBmy), and
+// HexStep, the half hexagon ahead of direction gHexDir, CheckMVdir's; UmhCross, the cross around (gOmx,
+// gOmy), its horizontal pairs and then its vertical ones, every second pixel, and UmhHex, the 16-point grid
+// of scale gUmhScale around it, CheckMV's; Line, the horizontal or vertical pairs around (gCX, gCY), CheckMV's.
+const int kWalkDone = 0, kWalkDiamondA = 1, kWalkDiamondB = 2, kWalkExpand = 3, kWalkHexInit = 4, kWalkHexStep = 5, kWalkUmhCross = 6, kWalkUmhHex = 7,
+          kWalkLine = 8;
 const int kMod6m1[8] = int[](5, 0, 1, 2, 3, 4, 5, 0);
 const ivec2 kHex2[8] = ivec2[](ivec2(-1, -2), ivec2(-2, 0), ivec2(-1, 2), ivec2(1, 2), ivec2(2, 0), ivec2(1, -2), ivec2(-1, -2), ivec2(-2, 0));
-
-void Hex2Search(int range) {
-    int bmx = gBest.x, bmy = gBest.y;
-    if (range > 1) {
-        gDir = -2;
-        CheckMVdir(bmx - 2, bmy, 0);
-        CheckMVdir(bmx - 1, bmy + 2, 1);
-        CheckMVdir(bmx + 1, bmy + 2, 2);
-        CheckMVdir(bmx + 2, bmy, 3);
-        CheckMVdir(bmx + 1, bmy - 2, 4);
-        CheckMVdir(bmx - 1, bmy - 2, 5);
-        int dir = gDir;
-        if (dir != -2) {
-            bmx += kHex2[dir + 1].x;
-            bmy += kHex2[dir + 1].y;
-            for (int i = 1; i < range / 2 && VectorOK(bmx, bmy); i++) {
-                int odir = kMod6m1[dir + 1];
-                gDir = -2;
-                CheckMVdir(bmx + kHex2[odir].x, bmy + kHex2[odir].y, odir - 1);
-                CheckMVdir(bmx + kHex2[odir + 1].x, bmy + kHex2[odir + 1].y, odir);
-                CheckMVdir(bmx + kHex2[odir + 2].x, bmy + kHex2[odir + 2].y, odir + 1);
-                dir = gDir;
-                if (dir == -2)
-                    break;
-                bmx += kHex2[dir + 1].x;
-                bmy += kHex2[dir + 1].y;
-            }
-        }
-        gBest = ivec2(bmx, bmy);
-    }
-    ExpandingSearch(1, 1, bmx, bmy);
-}
-
-// mvu's UMHSearch (x264's uneven multi-hexagon grid): the cross, the hexagon grids of growing
-// radius, then Hex2Search
 const ivec2 kHex4[16] = ivec2[](ivec2(-4, 2), ivec2(-4, 1), ivec2(-4, 0), ivec2(-4, -1), ivec2(-4, -2), ivec2(4, -2), ivec2(4, -1), ivec2(4, 0), ivec2(4, 1),
                                 ivec2(4, 2), ivec2(2, 3), ivec2(0, 4), ivec2(-2, 3), ivec2(-2, -3), ivec2(0, -4), ivec2(2, -3));
+int gWalk, gCount;                       // the batch's kind and its candidates
+int gCX, gCY, gR;                        // its centre and its distance (Diamond's length, Expand's radius)
+uint gCodes;                             // Diamond: the directions
+int gDirection, gLastDirection;          // DiamondSearch's
+int gBmx, gBmy, gHexDir, gHexStep;       // Hex2Search's
+int gOmx, gOmy, gUmhScale;               // UMHSearch's
 
-void UMHSearch(int range, int omx, int omy) {
-    for (int i = 1; i < range; i += 2) {
-        CheckMV(omx - i, omy);
-        CheckMV(omx + i, omy);
+// A direction code's offset, length apart: x right with 1, left with 2; y down with 4, up with 8
+ivec2 DirectionOffset(int code, int length) {
+    return length * ivec2((code & 1) != 0 ? 1 : ((code & 2) != 0 ? -1 : 0), (code & 4) != 0 ? 1 : ((code & 8) != 0 ? -1 : 0));
+}
+
+// Candidate k of the batch, with Check's flags and value
+void WalkCandidate(int k, out ivec2 v, out int flags, out int val) {
+    flags = kPenalty | kUpdateBest;
+    val = 0;
+    if (gWalk == kWalkDiamondA || gWalk == kWalkDiamondB) {
+        int code = int((gCodes >> uint(4 * k)) & 15u);
+        v = ivec2(gCX, gCY) + DirectionOffset(code, gR);
+        flags = kPenalty | kUpdateDir | kUpdateBest;
+        val = code;
+    } else if (gWalk == kWalkExpand) {
+        int side = 2 * gR - 1; // the positions of a side without its corners
+        if (k < 2 * side)
+            v = ivec2(gCX - gR + 1 + (k >> 1), gCY + ((k & 1) != 0 ? gR : -gR));
+        else if (k < 4 * side)
+            v = ivec2(gCX + (((k - 2 * side) & 1) != 0 ? gR : -gR), gCY - gR + 1 + ((k - 2 * side) >> 1));
+        else
+            v = ivec2(gCX + (k - 4 * side >= 2 ? gR : -gR), gCY + (((k - 4 * side) & 1) != 0 ? gR : -gR));
+    } else if (gWalk == kWalkHexInit) {
+        v = ivec2(gBmx, gBmy) + kHex2[k + 1];
+        flags = kPenalty | kUpdateDir;
+        val = k;
+    } else if (gWalk == kWalkHexStep) {
+        int odir = kMod6m1[gHexDir + 1];
+        v = ivec2(gBmx, gBmy) + kHex2[odir + k];
+        flags = kPenalty | kUpdateDir;
+        val = odir - 1 + k;
+    } else if (gWalk == kWalkUmhCross) {
+        int n = 2 * (pc.searchParam / 2); // the horizontal candidates
+        int i = 1 + 2 * ((k < n ? k : k - n) >> 1), sign = (k & 1) != 0 ? 1 : -1;
+        v = k < n ? ivec2(gOmx + sign * i, gOmy) : ivec2(gOmx, gOmy + sign * i);
+    } else if (gWalk == kWalkUmhHex) {
+        v = ivec2(gOmx, gOmy) + kHex4[k] * gUmhScale;
+    } else {
+        int i = 1 + (k >> 1), d = (k & 1) != 0 ? i : -i;
+        v = pc.search == 4 ? ivec2(gCX + d, gCY) : ivec2(gCX, gCY + d);
     }
-    for (int j = 1; j < range; j += 2) {
-        CheckMV(omx, omy - j);
-        CheckMV(omx, omy + j);
+}
+
+// The batch of codes, their count
+void DiamondBatch(int walk, uint codes, int count) {
+    gWalk = walk;
+    gCodes = codes;
+    gCount = count;
+}
+
+// DiamondSearch's loop body, from the top: the directions of the last step, from the best vector
+void DiamondIteration() {
+    gCX = gBest.x;
+    gCY = gBest.y;
+    gLastDirection = gDirection;
+    gDirection = 0;
+    gDir = 0;
+    uint codes = 0u;
+    int count = 0;
+    for (int b = 1; b <= 8; b <<= 1)
+        if ((gLastDirection & b) != 0) {
+            codes |= uint(b) << uint(4 * count);
+            ++count;
+        }
+    DiamondBatch(kWalkDiamondA, codes, count);
+}
+
+void Expand(int r, int cx, int cy) {
+    gWalk = kWalkExpand;
+    gR = r;
+    gCX = cx;
+    gCY = cy;
+    gCount = 8 * r;
+}
+
+// Hex2Search(range), from the best vector
+void Hex2() {
+    gBmx = gBest.x;
+    gBmy = gBest.y;
+    if (pc.searchParam > 1) {
+        gDir = -2;
+        gWalk = kWalkHexInit;
+        gCount = 6;
+    } else {
+        Expand(1, gBmx, gBmy);
     }
-    int i = 1;
-    do {
-        for (int j = 0; j < 16; j++)
-            CheckMV(omx + kHex4[j].x * i, omy + kHex4[j].y * i);
-    } while (++i <= range / 4);
-    Hex2Search(range);
+}
+
+// Hex2Search's end: the best vector where the hexagons went, then the square around it
+void Hex2End() {
+    gBest = ivec2(gBmx, gBmy);
+    Expand(1, gBmx, gBmy);
+}
+
+// Hex2Search's loop: the next half hexagon while there are steps left and the centre is a vector the
+// planes hold
+void Hex2Loop() {
+    if (gHexStep < pc.searchParam / 2 && VectorOK(gBmx, gBmy)) {
+        gDir = -2;
+        gWalk = kWalkHexStep;
+        gCount = 3;
+    } else {
+        Hex2End();
+    }
+}
+
+void StartWalk() {
+    gWalk = kWalkDone;
+    gCount = 0;
+    if (pc.search == 0) {
+        gR = pc.searchParam;
+        if (gR > 0) {
+            gDirection = 15;
+            DiamondIteration();
+        }
+    } else if (pc.search == 1) {
+        if (pc.searchParam >= 1)
+            Expand(1, gBest.x, gBest.y);
+    } else if (pc.search == 2) {
+        Hex2();
+    } else if (pc.search == 3) {
+        gOmx = gBest.x;
+        gOmy = gBest.y;
+        gWalk = kWalkUmhCross;
+        gCount = 4 * (pc.searchParam / 2);
+    } else {
+        gWalk = kWalkLine;
+        gCX = gBest.x;
+        gCY = gBest.y;
+        gCount = 2 * max(pc.searchParam, 0);
+    }
+}
+
+// The batch after the one just checked
+void NextBatch() {
+    if (gWalk == kWalkDiamondA) {
+        gDirection = gDir;
+        if (gDirection != 0) {
+            // the two directions across the one taken, from where it went
+            gLastDirection = gDirection;
+            gCX = gBest.x;
+            gCY = gBest.y;
+            DiamondBatch(kWalkDiamondB, (gLastDirection & 3) != 0 ? 0x84u : 0x21u, 2);
+        } else {
+            // the diagonals beside the directions tried
+            int l = gLastDirection;
+            if (l == 1)
+                DiamondBatch(kWalkDiamondB, 0x95u, 2);
+            else if (l == 2)
+                DiamondBatch(kWalkDiamondB, 0xA6u, 2);
+            else if (l == 4)
+                DiamondBatch(kWalkDiamondB, 0x65u, 2);
+            else if (l == 8)
+                DiamondBatch(kWalkDiamondB, 0xA9u, 2);
+            else if (l == 5)
+                DiamondBatch(kWalkDiamondB, 0x965u, 3);
+            else if (l == 6)
+                DiamondBatch(kWalkDiamondB, 0xA65u, 3);
+            else if (l == 9)
+                DiamondBatch(kWalkDiamondB, 0x9A5u, 3);
+            else if (l == 10)
+                DiamondBatch(kWalkDiamondB, 0x96Au, 3);
+            else
+                DiamondBatch(kWalkDiamondB, 0xA965u, 4);
+        }
+    } else if (gWalk == kWalkDiamondB) {
+        gDirection = gDir;
+        if (gDirection > 0) {
+            DiamondIteration();
+        } else {
+            gR /= 2;
+            if (gR > 0) {
+                gDirection = 15;
+                DiamondIteration();
+            } else {
+                gWalk = kWalkDone;
+            }
+        }
+    } else if (gWalk == kWalkExpand) {
+        // Exhaustive's next ring around the same centre; Hex2Search's closing square ends either search
+        if (pc.search == 1 && gR < pc.searchParam)
+            Expand(gR + 1, gCX, gCY);
+        else
+            gWalk = kWalkDone;
+    } else if (gWalk == kWalkHexInit) {
+        int dir = gDir;
+        if (dir != -2) {
+            gBmx += kHex2[dir + 1].x;
+            gBmy += kHex2[dir + 1].y;
+            gHexDir = dir;
+            gHexStep = 1;
+            Hex2Loop();
+        } else {
+            Hex2End();
+        }
+    } else if (gWalk == kWalkHexStep) {
+        int dir = gDir;
+        if (dir == -2) {
+            Hex2End();
+        } else {
+            gBmx += kHex2[dir + 1].x;
+            gBmy += kHex2[dir + 1].y;
+            gHexDir = dir;
+            ++gHexStep;
+            Hex2Loop();
+        }
+    } else if (gWalk == kWalkUmhCross) {
+        gWalk = kWalkUmhHex;
+        gUmhScale = 1;
+        gCount = 16;
+    } else if (gWalk == kWalkUmhHex) {
+        if (++gUmhScale <= pc.searchParam / 4)
+            gCount = 16;
+        else
+            Hex2();
+    } else {
+        gWalk = kWalkDone;
+    }
 }
 
 // C++'s a / b for b > 0, truncated toward zero
@@ -656,7 +823,7 @@ void main() {
             [[unroll]] for (int k = 0; k < kTilesPer; ++k) {
                 int t = gLane + k * kSubgroup, tx = (t % kTilesX) * 4, ty = (t / kTilesX) * 4;
                 [[unroll]] for (int i = 0; i < 16; ++i)
-                    gSrcT[16 * k + i] = t < kTiles ? SrcSample(0, gX + tx + (i & 3), gY + ty + (i >> 2)) : 0u;
+                    gSrcT[16 * k + i] = t < kTiles ? SrcSample(gX + tx + (i & 3), gY + ty + (i >> 2)) : 0u;
             }
         }
     }
@@ -664,14 +831,15 @@ void main() {
         if (!kSatd) {
             [[unroll]] for (int k = 0; k < kLumaPer; ++k) {
                 int i = gLane + k * kSubgroup;
-                gSrcY[k] = i < kBlkX * kBlkY ? SrcSample(0, gX + i % kBlkX, gY + i / kBlkX) : 0u;
+                gSrcY[k] = i < kBlkX * kBlkY ? SrcSample(gX + i % kBlkX, gY + i / kBlkX) : 0u;
             }
         }
         [[unroll]] for (int k = 0; k < kChromaPer; ++k) {
             int i = gLane + k * kSubgroup;
             bool live = kChromaSad && i < kBlkCX * kBlkCY;
-            gSrcU[k] = live ? SrcSample(1, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
-            gSrcV[k] = live ? SrcSample(2, gXc + i % kBlkCX, gYc + i / kBlkCX) : 0u;
+            uvec2 c = live ? SrcChromaUV(gXc + i % kBlkCX, gYc + i / kBlkCX) : uvec2(0u);
+            gSrcU[k] = c.x;
+            gSrcV[k] = c.y;
         }
     }
 
@@ -686,29 +854,16 @@ void main() {
     gBestSad = s.x + s.y;
     gMinCost = int64_t(gBestSad);
     if (gBestSad > Thsad()) {
-        if (pc.search == 0) {
-            for (int i = pc.searchParam; i > 0; i /= 2)
-                DiamondSearch(i);
-        } else if (pc.search == 1) {
-            int mvx = gBest.x, mvy = gBest.y;
-            for (int i = 1; i <= pc.searchParam; i++)
-                ExpandingSearch(i, 1, mvx, mvy);
-        } else if (pc.search == 2) {
-            Hex2Search(pc.searchParam);
-        } else if (pc.search == 3) {
-            UMHSearch(pc.searchParam, gBest.x, gBest.y);
-        } else if (pc.search == 4) {
-            int mvx = gBest.x, mvy = gBest.y;
-            for (int i = 1; i <= pc.searchParam; i++) {
-                CheckMV(mvx - i, mvy);
-                CheckMV(mvx + i, mvy);
+        // mvu's search, the walk's batches checked here, the one place Check is called
+        StartWalk();
+        while (gWalk != kWalkDone) {
+            for (int k = 0; k < gCount; ++k) {
+                ivec2 v;
+                int flags, val;
+                WalkCandidate(k, v, flags, val);
+                Check(v.x, v.y, flags, val);
             }
-        } else {
-            int mvx = gBest.x, mvy = gBest.y;
-            for (int i = 1; i <= pc.searchParam; i++) {
-                CheckMV(mvx, mvy - i);
-                CheckMV(mvx, mvy + i);
-            }
+            NextBatch();
         }
     }
     // (the record's SAD is 32 bits: a float SAD past them, of samples far outside their range, saturates)

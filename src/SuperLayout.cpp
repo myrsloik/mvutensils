@@ -12,8 +12,9 @@ namespace {
 // horizontal and vertical geometry. 3: chroma at pel 4 as one image of its quarter-pel grid. 4: only
 // subsampled chroma; 4:4:4 keeps four half-pel planes, as luma does. 5: the coarse levels' chroma
 // border covers chroma's reach in either direction (4:4:4's as far as luma's). 6: the super frame is
-// the storage, its parts in its one plane (Regions); vector clips' frames are the records.
-constexpr int kLayoutVersion = 6;
+// the storage, its parts in its one plane (Regions); vector clips' frames are the records. 7: chroma's
+// U and V interleaved, sample by sample, at level 0 and in the coarse levels.
+constexpr int kLayoutVersion = 7;
 
 int AlignUp(int v, int a) {
     return (v + a - 1) / a * a;
@@ -222,12 +223,12 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
     // a block reaches up to padX >> L pixels past the luma's left and right edges and padY >> L past
     // its top and bottom, those divided by the subsampling (rounded up) past the chroma edges, and
     // LevelSadOf's words up to 3 bytes further on either side of a row. Rows are whole words apart,
-    // planes start on 16 samples.
+    // planes start on 16 samples; chroma's plane holds U and V interleaved, two samples a pixel.
     s.levels.assign(s.topLevel + 1, LevelEntry{});
     int offset = 0;
-    auto addPlane = [&](int w, int h, int border, int32_t &stride) {
-        stride = AlignUp(w + 2 * border, 4);
-        const int first = offset + border * stride + border;
+    auto addPlane = [&](int w, int h, int border, int samples, int32_t &stride) {
+        stride = AlignUp(samples * (w + 2 * border), 4);
+        const int first = offset + border * stride + samples * border;
         offset = AlignUp(offset + stride * (h + 2 * border), 16);
         return first;
     };
@@ -242,13 +243,12 @@ SuperLayout SuperLayout::Make(const SuperFormat &format, int width, int height, 
         e.w = w;
         e.h = h;
         e.borderY = std::max(levelPad, levelPadY) + 3;
-        e.offY = addPlane(w, h, e.borderY, e.strideY);
+        e.offY = addPlane(w, h, e.borderY, 1, e.strideY);
         if (format.chroma) {
             e.wc = wc;
             e.hc = hc;
             e.borderC = std::max((levelPad + format.xr - 1) / format.xr, (levelPadY + format.yr - 1) / format.yr) + 4;
-            e.offU = addPlane(wc, hc, e.borderC, e.strideC);
-            e.offV = addPlane(wc, hc, e.borderC, e.strideC);
+            e.offC = addPlane(wc, hc, e.borderC, 2, e.strideC);
         }
         e.nbx = std::max(1, w / 8);
         e.nby = std::max(1, h / 8);
@@ -318,7 +318,7 @@ SuperRegions SuperLayout::Regions(int64_t stride) const {
     r.lumaBytes = stride * LumaRows();
     int64_t end = r.lumaBytes;
     if (format.chroma) {
-        r.chromaStride = AlignUp64(wc * bytes, 64);
+        r.chromaStride = AlignUp64(2 * wc * bytes, 64);
         r.chroma = AlignUp64(end, 256);
         r.chromaBytes = r.chromaStride * ChromaRows();
         end = r.chroma + r.chromaBytes;

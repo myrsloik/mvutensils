@@ -24,8 +24,9 @@
 const int kMaxRefs = 50; // 2 * the largest radius, VulkanContext.h's kMaxDegrainRefs
 
 // The centre frame's super planes (SuperLayout.h): luma's four half-pel planes, the full-pel one
-// first, and U's planes (at pel 4 its quarter-pel image), then V's. The samples are bytes, 16 bits
-// each for 9 to 16-bit clips (kWide) or floats (kFloat), every plane buffer declared all three ways.
+// first, and chroma's (at pel 4 its quarter-pel image), U and V interleaved sample by sample. The
+// samples are bytes, 16 bits each for 9 to 16-bit clips (kWide) or floats (kFloat), every plane buffer
+// declared all three ways.
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma { uint8_t curY[]; };
 layout(std430, set = 0, binding = 1) readonly buffer CurChroma { uint8_t curC[]; };
 layout(std430, set = 0, binding = 0) readonly buffer CurLuma16 { uint16_t curY16[]; };
@@ -68,7 +69,7 @@ layout(push_constant) uniform Params {
     uint usable0, usable1;       // references with vectors and in the clip, bits 0-31 and 32-49
     int thscd1;                  // scene change: SAD above which a block counts as changed, scaled
     int scdLimit;                // and the changed blocks a reference may have
-    int plane;                   // degrain.comp: the plane, 0 luma, 1 U, 2 V
+    int plane;                   // degrain.comp: 0 luma, else the chroma planes, made together: 1 U, 2 V, 3 both
     int width, height;           // its size
     int outStride;               // its stride in the output frame
     int limit;                   // the largest change of a pixel, -1 for none (for floats limitF)
@@ -98,7 +99,6 @@ const int kLogX = kChromaLog & 1, kLogY = kChromaLog >> 1;
 const bool kWide = (kVariant & 4) != 0;
 const bool kFloat = (kVariant & 8) != 0;
 const bool kImage = kPel == 4 && kChromaLog != 0; // subsampled chroma at pel 4 is its quarter-pel image (SuperLayout.h)
-const int kChromaPlanes = kImage ? 16 : kPel == 1 ? 1 : 4; // U's half-pel planes (or image, or full-pel plane), then V's as many plane sizes on
 
 bool Usable(int r) {
     return (((r < 32 ? pc.usable0 >> uint(r) : pc.usable1 >> uint(r - 32)) & 1u) != 0u);

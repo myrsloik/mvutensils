@@ -24,7 +24,8 @@
   recalculate
            check_recalculate.py: mvgpu.Recalculate against mvu.Recalculate over every search type,
            old vectors of other grids, mvu's and random old vectors, formats and bit depths, pels
-           and the arguments; float clips at pel 1 against mvu's of the clip quantized to 16 bits
+           and the arguments; float clips at every pel against mvu's AVX-512 build (run on an AVX-512
+           CPU), samples far outside their range included
   convert  check_convert.py: mvgpu.ToMVU and mvgpu.FromMVU both ways, round trips included, over
            formats and bit depths, grids, pels, radii, both Recalculates' vectors and mvu's prefix,
            and their errors
@@ -199,7 +200,7 @@ def analyse_cases():
         ('YUV444P16 8/3 1913x1077', ob, ['--frames', '10', '--format', 'YUV444P16', '--crop', '1913x1077'] + grid(8, 3)),
         ('YUV420P16 pad 6 16/8', ff, ['--frames', '10', '--format', 'YUV420P16', '--pad', '6'] + grid(16, 8)),
         ('YUV444P16 pad 7 32/0 pel 4', ff, ['--frames', '10', '--format', 'YUV444P16', '--pad', '7'] + grid(32, 0, 4)),
-        # Gray, and float samples (searched as the 16-bit samples they stand for)
+        # Gray, and float samples (mvu's float SADs)
         ('GRAY8 16/8 pel 2', ff, ['--frames', '10', '--format', 'GRAY8'] + grid(16, 8)),
         ('GRAY8 8/4 pel 4', ob, ['--frames', '10', '--format', 'GRAY8'] + grid(8, 4, 4)),
         ('GRAY16 32/16 pel 4', ff, ['--frames', '10', '--format', 'GRAY16'] + grid(32, 16, 4)),
@@ -215,6 +216,12 @@ def analyse_cases():
                                                               '--plevel', '2'] + grid(32, 16)),
         ('GRAYS 16/8 pel 4', ff, ['--frames', '10', '--format', 'GRAYS'] + grid(16, 8, 4)),
         ('YUV420PS 16/6 pel 4 1914x1074', ff, ['--frames', '10', '--format', 'YUV420PS', '--crop', '1914x1074'] + grid(16, 6, 4)),
+        ('YUV420PS 4/2 pel 2', ff, ['--frames', '8', '--format', 'YUV420PS'] + grid(4, 2)),
+        ('YUV422PS 16x2/8x0 pel 4', ff, ['--frames', '8', '--format', 'YUV422PS', '--pel', '4'] + rect(16, 2, 8, 0)),
+        ('YUV440PS 64/32 pel 2', ff, ['--frames', '8', '--format', 'YUV440PS'] + grid(64, 32)),
+        ('YUV444PS 128/64 pel 4', ff, ['--frames', '6', '--format', 'YUV444PS', '--radius', '1'] + grid(128, 64, 4)),
+        ('satd YUV444PS 8/4 pel 2', ff, ['--frames', '8', '--satd', '--format', 'YUV444PS'] + grid(8, 4)),
+        ('satd GRAYS 64/32 pel 1', ff, ['--frames', '8', '--satd', '--format', 'GRAYS'] + grid(64, 32, 1)),
         # pel 1
         ('pel 1 16/8', ff, ['--frames', '10'] + grid(16, 8, 1)),
         ('pel 1 8/4 chroma 0', ob, ['--frames', '10', '--chroma', '0'] + grid(8, 4, 1)),
@@ -376,6 +383,11 @@ def analyse_cases():
         ('YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--radius', '1'] + grid(128, 64)),
         ('extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme', '--radius', '1'] + grid(128, 64)),
         ('extreme satd YUV420P16 128/64 pel 4', ff, ['--frames', '6', '--format', 'YUV420P16', '--extreme', '--satd', '--radius', '1'] + grid(128, 64, 4)),
+        # Float samples far outside their range (--overrange): SADs past the largest integer blocks make
+        # (the lambda tables' last entries), and past 2^32, saturated
+        ('overrange YUV444PS 16/8 pel 4', ff, ['--frames', '6', '--format', 'YUV444PS', '--overrange', '--radius', '1'] + grid(16, 8, 4)),
+        ('overrange YUV420PS 64/32', ff, ['--frames', '6', '--format', 'YUV420PS', '--overrange', '--radius', '1'] + grid(64, 32)),
+        ('overrange satd YUV444PS 128/64', ff, ['--frames', '6', '--format', 'YUV444PS', '--overrange', '--satd', '--radius', '1'] + grid(128, 64)),
     ]
     return cases
 
@@ -967,6 +979,25 @@ def recalculate_cases():
         ('satd chroma 0 random thsad 300', ff, ['--frames', '6', '--satd', '1', '--chroma', '0', '--vectors', 'random', '--thsad', '300']),
         ('satd to 8/4', ff, ['--frames', '6', '--satd', '1', '--new-blksize', '8', '--new-overlap', '4'] + t0),
         ('satd 440 8/4 pel 4 mvu vectors', ff, ['--frames', '6', '--satd', '1', '--format', 'YUV440P8', '--pel', '4', '--vectors', 'mvu'] + grid_args(8, 4) + t0),
+        # Float SADs, mvu's AVX-512 build's: every pel, subsampling and width, satd, and samples far outside
+        # their range (--overrange: SADs past the largest integer blocks make, summed past 2^32, saturated)
+        ('YUV420PS pel 2', ff, ['--frames', '6', '--format', 'YUV420PS'] + t0),
+        ('YUV444PS pel 4', ff, ['--frames', '6', '--format', 'YUV444PS', '--pel', '4'] + t0),
+        ('YUV422PS 8/4 pel 4', ff, ['--frames', '6', '--format', 'YUV422PS', '--pel', '4'] + grid_args(8, 4) + t0),
+        ('YUV440PS 32/16', ff, ['--frames', '6', '--format', 'YUV440PS'] + grid_args(32, 16) + t0),
+        ('YUV420PS 4/2', ff, ['--frames', '6', '--format', 'YUV420PS'] + grid_args(4, 2) + t0),
+        ('YUV440PS 16x2/8x0', ff, ['--frames', '6', '--format', 'YUV440PS'] + rect(16, 2, 8, 0) + t0),
+        ('YUV444PS 128/64 pel 4', ff, ['--frames', '4', '--format', 'YUV444PS', '--pel', '4'] + grid_args(128, 64) + t0),
+        ('YUV420PS mvu vectors pel 4', ff, ['--frames', '6', '--format', 'YUV420PS', '--vectors', 'mvu', '--pel', '4'] + t0),
+        ('YUV444PS random pel 4 search 3', ff, ['--frames', '6', '--format', 'YUV444PS', '--vectors', 'random', '--pel', '4', '--search', '3'] + t0),
+        ('satd YUV420PS 16/8 pel 4', ff, ['--frames', '6', '--format', 'YUV420PS', '--satd', '1', '--pel', '4'] + t0),
+        ('satd YUV444PS 4/2', ff, ['--frames', '6', '--format', 'YUV444PS', '--satd', '1'] + grid_args(4, 2) + t0),
+        ('satd YUV422PS 32x16/16x8', ff, ['--frames', '6', '--format', 'YUV422PS', '--satd', '1'] + rect(32, 16, 16, 8) + t0),
+        ('satd GRAYS 128/64', ff, ['--frames', '4', '--format', 'GRAYS', '--satd', '1'] + grid_args(128, 64) + t0),
+        ('overrange YUV444PS 32/16', ff, ['--frames', '6', '--format', 'YUV444PS', '--overrange'] + grid_args(32, 16) + t0),
+        ('overrange YUV444PS 64/32 pel 4', ff, ['--frames', '4', '--format', 'YUV444PS', '--overrange', '--pel', '4'] + grid_args(64, 32) + t0),
+        ('overrange satd YUV444PS 128/64', ff, ['--frames', '4', '--format', 'YUV444PS', '--overrange', '--satd', '1'] + grid_args(128, 64) + t0),
+        ('overrange YUV420PS thsad 100000', ff, ['--frames', '6', '--format', 'YUV420PS', '--overrange', '--thsad', '100000']),
         # SADs past 2^31
         ('extreme YUV444P16 128/64', ff, ['--frames', '6', '--format', 'YUV444P16', '--extreme'] + grid_args(128, 64) + t0),
         ('extreme satd YUV420P16 128/64', ff, ['--frames', '6', '--format', 'YUV420P16', '--extreme', '--satd', '1'] + grid_args(128, 64) + t0),
@@ -1010,7 +1041,7 @@ SMOKE = {
     'analyse': ['16/8 pel 2', '8/4 pel 4', '444 32/16 pel 4', 'YUV420P16 16/8 pel 4', 'YUV420PS 16/8 pel 2', 'GRAY8 16/8 pel 2', 'pel 1 16/8',
                 '422 16/8 pel 4', '440 8/4 pel 4', '16x8/8x4 pel 4', '16x2/8x0 pel 2', '4/2 pel 2', '128/64 pel 2', '8/4 on a 32/16 super pel 4 1914x1074',
                 'onelevel 16/8 pel 2', '180x100 16/8', '9600x1080 16/8 radius 1', 'satd 8/4 pel 4', 'extreme YUV444P16 128/64',
-                'pzero 100 pglobal 50 pnew 10 444', 'levels -2 globalmv 0 pzero 0 pnew 40 pelsearch 5 badstep 1'],
+                'pzero 100 pglobal 50 pnew 10 444', 'levels -2 globalmv 0 pzero 0 pnew 40 pelsearch 5 badstep 1', 'overrange YUV444PS 16/8 pel 4'],
     'degrain': ['YUV420P8 16/8 pel 2 mvgpu vectors', 'radius 3 444 32/16 pel 4', 'YUV420P16 16/8 pel 4 analysed on 8 bits', 'YUV420PS 16/8 pel 2 mvgpu vectors',
                 'thscd1 150 thscd2 20', 'pel 1 16/8', 'YUV440P8 16/8 pel 4 mvgpu vectors', '32x16/16x8 pel 4', '64/32 pel 4',
                 '32/16 super, analysed 32x16/16x8 mvu vectors'],
@@ -1020,7 +1051,7 @@ SMOKE = {
     'motion': ['flow 16/8 pel 2', 'blur 444 16/8 pel 4', 'compensate const', 'compensate YUV420PS pel 4', 'compensate 440 32/16 pel 2',
                'compensate 16x8/8x4', 'compensate other super thsad 300', 'compensate extreme YUV444P16 128/64 thsad 42000'],
     'recalculate': ['16/8 pel 2', 'search 3 searchparam 8', 'YUV420PS pel 1', 'random pel 1 from pel 4', '16x8/8x4 from 32x16/16x8 search 3',
-                    '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4'],
+                    '128/64 pel 4 from 16/8', '32/16 super, to 16/8 from mvu 8/4', 'satd 8/4 pel 4', 'YUV444PS pel 4', 'overrange satd YUV444PS 128/64'],
     'convert': ['16/8 pel 2', 'YUV420P16 pel 4 analysed on 8 bits'],
     'robustness': ['1080p'],
 }

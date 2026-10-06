@@ -150,6 +150,10 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return fail("the super's frames aren't GPU resident");
         if (vkapi->getGPUPlane(vec, 0, &vecPlane))
             return fail("the vectors aren't GPU resident");
+        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
+        // strides)
+        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
+            return fail("the clip's U and V planes have different strides");
         const ptrdiff_t recBytes = vsapi->getStride(vec, 0);
         if (vsapi->getFrameWidth(vec, 0) != 4 * d->nbx || vsapi->getFrameHeight(vec, 0) != d->nby || recBytes % 16)
             return fail("a vector frame doesn't match the super's grid");
@@ -197,7 +201,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(regions.lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(regions.chromaStride / bytes);
+        pc.wc = static_cast<int32_t>(regions.chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         pc.hc = L.hc;
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;
@@ -218,15 +222,20 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         }
         rec.Bind(kFlVecF, vecPlane.buffer);
         rec.Bind(kFlCounts, scratchInfo.buffer, 0, 16);
-        for (int p = 0; p < numPlanes; ++p) {
+        // Luma, then chroma: U and V in one dispatch, V's output and clip planes at their own bindings
+        for (int p = 0; p < (numPlanes > 1 ? 2 : 1); ++p) {
             pc.plane = p;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);
             pc.outStride = static_cast<int32_t>(vsapi->getStride(dst, p) / bytes);
             pc.clipStride = static_cast<int32_t>(vsapi->getStride(src, p) / bytes);
-            pc.colOff = d->winOff[p ? 1 : 0]; // compensate.comp's windows
+            pc.colOff = d->winOff[p]; // compensate.comp's windows
             rec.Bind(kFlClipSrc, clipPlanes[p].buffer);
             rec.Bind(kFlOut, outPlanes[p].buffer);
+            if (p) {
+                rec.Bind(kFlClipSrcV, clipPlanes[2].buffer);
+                rec.Bind(kFlOutV, outPlanes[2].buffer);
+            }
             // Four pixels per lane where they share their blocks: 8-bit samples at pel 1 or 2, the
             // plane's step and overlap multiples of 4 (compensate.comp's kQuad)
             const int lx = p ? L.format.xr >> 1 : 0;

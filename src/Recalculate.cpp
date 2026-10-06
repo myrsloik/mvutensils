@@ -171,7 +171,7 @@ static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, voi
         pc.recStride = static_cast<int32_t>(recBytes / 16);
         pc.recStrideOld = static_cast<int32_t>(oldBytes / 16);
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
-        pc.wc = static_cast<int32_t>(chromaStride / bytes);
+        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
         rec.Bind(0, curPlane.buffer, cur.luma, cur.lumaBytes);
         rec.Bind(2, refPlane.buffer, rf.luma, rf.lumaBytes);
         if (chroma) {
