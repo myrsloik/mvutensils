@@ -150,10 +150,9 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
             return fail("the super's frames aren't GPU resident");
         if (vkapi->getGPUPlane(vec, 0, &vecPlane))
             return fail("the vectors aren't GPU resident");
-        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
-        // strides)
-        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
-            return fail("the clip's U and V planes have different strides");
+        // Chroma's U and V are made together, one dispatch taking both planes
+        if (const std::string e = CheckChromaStrides({src, dst}, vsapi); !e.empty())
+            return fail(e);
         const ptrdiff_t recBytes = vsapi->getStride(vec, 0);
         if (vsapi->getFrameWidth(vec, 0) != 4 * d->nbx || vsapi->getFrameHeight(vec, 0) != d->nby || recBytes % 16)
             return fail("a vector frame doesn't match the super's grid");
@@ -201,7 +200,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(regions.lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(regions.chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
+        pc.wc = regions.KernelWc(bytes);
         pc.hc = L.hc;
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;

@@ -125,6 +125,22 @@ int WindowAt(int bx, int by, int Bx, int By, int dx, int dy) {
     return pc.winOff + ((wby + wbx) * By + dy) * Bx + dx;
 }
 
+// mvu's LimitChanges of an integer pixel: within limit of the centre's, and of the sample type's range;
+// of four 8-bit pixels at once (Main4, Main4UV)
+uint Limit(uint p, uint centre) {
+    return uint(clamp(int(p), max(int(centre) - pc.limit, 0), min(int(centre) + pc.limit, kWide ? 65535 : 255)));
+}
+uvec4 Limit4(uvec4 p, uvec4 centre) {
+    ivec4 c = ivec4(centre);
+    return uvec4(clamp(ivec4(p), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
+}
+// And mvu's LimitChanges_C of a float pixel: within limitF of the centre's (std::clamp)
+float LimitF(float v, float centre) {
+    precise float lo = centre - pc.limitF;
+    precise float hi = centre + pc.limitF;
+    return v < lo ? lo : (hi < v ? hi : v);
+}
+
 // mvu.Degrain. A lane is one pixel column of a cell row of a plane: the rows between two block
 // rows, step of them (chroma's subsampling halving it), the last cell row also the rows below it its
 // blocks reach. Every pixel of it lies in the same block columns, one or, inside the overlap, two,
@@ -235,22 +251,12 @@ void MainFloat() {
         [[unroll]] for (int j = 0; j < kChunk; ++j) {
             if (j < n) {
                 precise float v = (pc.overlap | pc.overlapY) == 0 ? acc[j] : acc[j] * (1.0 / 32.0);
-                if (pc.limit >= 0) {
-                    precise float lo = centre[j] - pc.limitF;
-                    precise float hi = centre[j] + pc.limitF;
-                    v = v < lo ? lo : (hi < v ? hi : v); // std::clamp
-                }
+                if (pc.limit >= 0)
+                    v = LimitF(v, centre[j]);
                 outPlaneF[0].px[out0 + uint((j0 + j) * pc.outStride)] = v;
             }
         }
     }
-}
-
-// mvu's LimitChanges_C of a float pixel: within limitF of the centre's (std::clamp)
-float LimitF(float v, float centre) {
-    precise float lo = centre - pc.limitF;
-    precise float hi = centre + pc.limitF;
-    return v < lo ? lo : (hi < v ? hi : v);
 }
 
 // Chroma, float samples: MainFloat's arithmetic for U and V at once. A lane holds kChunkUV rows at a
@@ -485,10 +491,8 @@ void Main4() {
         [[unroll]] for (int j = 0; j < kChunk4; ++j) {
             if (j < n) {
                 uvec4 p = (pc.overlap | pc.overlapY) == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax)));
-                if (pc.limit >= 0) {
-                    ivec4 c = ivec4(Unpack4(centre[j]));
-                    p = uvec4(clamp(ivec4(p), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
-                }
+                if (pc.limit >= 0)
+                    p = Limit4(p, Unpack4(centre[j]));
                 uint o = out0 + uint((j0 + j) * pc.outStride);
                 if (inside == 4 && (o & 3u) == 0u) {
                     outPlane32[0].px[o >> 2u] = Pack4(p);
@@ -602,10 +606,8 @@ void Main4UV() {
                 uvec4 pu = ov ? min((au[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax))) : au[j];
                 uvec4 pv = ov ? min((av[j] + 16u) >> 5u, uvec4(uint(pc.pixelMax))) : av[j];
                 if (pc.limit >= 0) {
-                    ivec4 c = ivec4(Unpack4(cu[j]));
-                    pu = uvec4(clamp(ivec4(pu), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
-                    c = ivec4(Unpack4(cv[j]));
-                    pv = uvec4(clamp(ivec4(pv), max(c - pc.limit, ivec4(0)), min(c + pc.limit, ivec4(255))));
+                    pu = Limit4(pu, Unpack4(cu[j]));
+                    pv = Limit4(pv, Unpack4(cv[j]));
                 }
                 uint o = out0 + uint((j0 + j) * pc.outStride);
                 if (DoU())
@@ -693,7 +695,7 @@ void MainLuma() {
             if (j < n) {
                 uint p = (pc.overlap | pc.overlapY) == 0 ? acc[j] : min((acc[j] + 16u) >> 5u, uint(pc.pixelMax));
                 if (pc.limit >= 0)
-                    p = uint(clamp(int(p), max(int(centre[j]) - pc.limit, 0), min(int(centre[j]) + pc.limit, kWide ? 65535 : 255)));
+                    p = Limit(p, centre[j]);
                 uint o = out0 + uint((j0 + j) * pc.outStride);
                 if (kWide)
                     outPlane16[0].px[o] = uint16_t(p);
@@ -702,11 +704,6 @@ void MainLuma() {
             }
         }
     }
-}
-
-// mvu's LimitChanges of an integer pixel: within limit of the centre's, and of the sample type's range
-uint Limit(uint p, uint centre) {
-    return uint(clamp(int(p), max(int(centre) - pc.limit, 0), min(int(centre) + pc.limit, kWide ? 65535 : 255)));
 }
 
 // Chroma, integer samples, one pixel per lane, U and V together: MainLuma's arithmetic, at any pel (at

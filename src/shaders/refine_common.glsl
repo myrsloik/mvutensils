@@ -138,7 +138,8 @@ const int kBlkCX = kBlkX >> kLogCX, kBlkCY = kBlkY >> kLogCY;
 // shrinks its block cache (sCur), so more workgroups fit on a compute unit to hide the SADs' memory
 // reads: Analyse.cpp gives the blocks whose current pixels take 768 bytes or more 2 lanes per
 // candidate and those taking 3 KB or more 4 (RefineSplit), which made 8-bit 4:4:4 32x32 fields
-// 40% faster and 4:2:0 32x32 ones 14-21%.
+// 40% faster and 4:2:0 32x32 ones 14-21%. Float searches share a candidate's float SAD out over its
+// lanes (LaneSadF), 2 or 4 by the block's size, which made them up to twice as fast.
 const int kSplit = 1 << ((kVariant >> 2) & 3);
 const int kGroupLanes = 8 * kSplit;  // a block's lanes
 const int kGroupBlocks = 8 / kSplit; // a workgroup's blocks
@@ -645,10 +646,11 @@ uint LaneSad(ivec2 v) {
 
 #if !defined(NO_BLOCK_CACHE) && !defined(LEVEL_BLOCKS)
 // Float samples (kFloatS) take their own SAD: mvu's of float blocks, its float operations in its order
-// (sadf_common.glsl), the samples read as they are, one lane measuring the whole block (kSplit 1), the
-// current pixels read from the super (no cache). gSadV is the vector measured, gSadQuarter whether it may
-// lie between the half-pel grid's samples (refine_qpel.comp), which then come from them as mvu.Super's
-// float quarter planes hold them, the rounded average (a + b) * 0.5 of two vertical averages.
+// (sadf_common.glsl), the samples read as they are, the sums shared out over the candidate's lanes
+// (SadRawSplitF), the current pixels read from the super (no cache). gSadV is the vector measured,
+// gSadQuarter whether it may lie between the half-pel grid's samples (refine_qpel.comp), which then come
+// from them as mvu.Super's float quarter planes hold them, the rounded average (a + b) * 0.5 of two
+// vertical averages.
 ivec2 gSadV;
 bool gSadQuarter = false;
 
@@ -700,16 +702,101 @@ vec2 DiffUV(int x, int y) {
 
 #include "sadf_common.glsl"
 
-// The block's float SAD at vector v (with kSatd luma's SATD), each plane's scaled alone and added as mvu
-// adds them, the total saturated to the records' 32 bits (only float samples far outside their range reach
-// them)
+// A float SAD over the candidate's kSplit lanes, gHalf the lane's share. mvu's lanes (sadf_common.glsl's
+// LaneF; for blocks 4 or 2 wide its columns, ColumnF) are sums of their own until they halve, so share j
+// sums those whose index is j modulo kSplit, halves them among themselves as long as mvu's halving pairs two
+// of them, and the shares then halve across, lane ^ 16 (shares two apart) before lane ^ 8 (next to each
+// other), which pairs them as mvu's last steps do. Float addition commutes, so every share ends with mvu's
+// sum, bit for bit; a column a share doesn't have counts as +0.0, which adds exactly to the sums, none of
+// them negative. Every lane of the candidate must call these.
+float AcrossF(float t) {
+    if (kSplit >= 4) {
+        precise float s = t + subgroupShuffleXor(t, 16u);
+        t = s;
+    }
+    if (kSplit >= 2) {
+        precise float s = t + subgroupShuffleXor(t, 8u);
+        t = s;
+    }
+    return t;
+}
+vec2 AcrossUV(vec2 t) {
+    if (kSplit >= 4) {
+        precise vec2 s = t + subgroupShuffleXor(t, 16u);
+        t = s;
+    }
+    if (kSplit >= 2) {
+        precise vec2 s = t + subgroupShuffleXor(t, 8u);
+        t = s;
+    }
+    return t;
+}
+
+// SadRawF(0, w, h), luma's, so shared
+float SadRawSplitF(int w, int h) {
+    if (kSplit == 1)
+        return SadRawF(0, w, h);
+    precise float t;
+    if (w <= 4) {
+        // (c0 + c2) + (c1 + c3), or c0 + c1: the share's columns, then across
+        t = 0.0;
+        if (gHalf < w)
+            t = ColumnF(0, gHalf, h);
+        if (kSplit == 2 && w == 4) {
+            precise float s = t + ColumnF(0, gHalf + 2, h);
+            t = s;
+        }
+        return AcrossF(t);
+    }
+    int L = w == 8 ? 8 : 16, n = L / kSplit;
+    float u[16]; // (n is at most 8 here, but 8 entries made the float chains 1.5-2.7% slower)
+    [[dont_unroll]] for (int k = 0; k < n; ++k)
+        u[k] = LaneF(0, w, h, L, gHalf + k * kSplit);
+    for (int m = n >> 1; m >= 1; m >>= 1)
+        for (int k = 0; k < m; ++k) {
+            precise float s = u[k] + u[k + m];
+            u[k] = s;
+        }
+    return AcrossF(u[0]);
+}
+
+// And SadRawUV's, U's and V's
+vec2 SadRawSplitUV(int w, int h) {
+    if (kSplit == 1)
+        return SadRawUV(w, h);
+    precise vec2 t;
+    if (w <= 4) {
+        t = vec2(0.0);
+        if (gHalf < w)
+            t = ColumnUV(gHalf, h);
+        if (kSplit == 2 && w == 4) {
+            precise vec2 s = t + ColumnUV(gHalf + 2, h);
+            t = s;
+        }
+        return AcrossUV(t);
+    }
+    int L = w == 8 ? 8 : 16, n = L / kSplit;
+    vec2 u[16]; // (as SadRawSplitF's)
+    [[dont_unroll]] for (int k = 0; k < n; ++k)
+        u[k] = LaneUV(w, h, L, gHalf + k * kSplit);
+    for (int m = n >> 1; m >= 1; m >>= 1)
+        for (int k = 0; k < m; ++k) {
+            precise vec2 s = u[k] + u[k + m];
+            u[k] = s;
+        }
+    return AcrossUV(u[0]);
+}
+
+// The block's float SAD at vector v (with kSatd luma's SATD, which takes kSplit 1), each plane's scaled
+// alone and added as mvu adds them, the total saturated to the records' 32 bits (only float samples far
+// outside their range reach them); the same in every lane of the candidate
 uint LaneSadF(ivec2 v, bool quarter) {
     gSadV = v;
     gSadQuarter = quarter;
-    uint64_t s = uint64_t(kSatd ? SatdF(kBlkX, kBlkY) : SadF(0, kBlkX, kBlkY));
+    uint64_t s = uint64_t(kSatd ? SatdF(kBlkX, kBlkY) : ScaledF(SadRawSplitF(kBlkX, kBlkY), 65535.0));
     if (kChroma) {
-        uvec2 c = SadUV(kBlkCX, kBlkCY);
-        s += uint64_t(c.x) + uint64_t(c.y);
+        vec2 c = SadRawSplitUV(kBlkCX, kBlkCY);
+        s += uint64_t(ScaledF(c.x, 65535.0)) + uint64_t(ScaledF(c.y, 65535.0));
     }
     return uint(min(s, 0xFFFFFFFFul));
 }

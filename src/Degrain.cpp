@@ -329,6 +329,9 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         for (int p = 0; p < 3; ++p)
             if (d->process[p] && vkapi->getGPUPlane(dst, p, &outPlanes[p]))
                 return fail("the output frame isn't GPU resident; the clip must be");
+        // Both chroma planes processed are made together, one dispatch writing them
+        if (const std::string e = d->process[1] && d->process[2] ? CheckChromaStrides({dst}, vsapi) : std::string(); !e.empty())
+            return fail(e);
         std::vector<VSVulkanPlaneInfo> rs(refs), rv(refs);
         for (int r = 0; r < refs; ++r)
             if (refVec[r] && (vkapi->getGPUPlane(refSuper[r], 0, &rs[r]) || vkapi->getGPUPlane(refVec[r], 0, &rv[r])))
@@ -456,7 +459,7 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
         pc.ah = L.ah;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
+        pc.wc = cur.KernelWc(bytes);
         pc.hc = L.hc;
         pc.recStride = static_cast<int32_t>(recBytes / 16);
         pc.refs = refs;
@@ -490,8 +493,6 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             if (c ? mask == 0 : !d->process[0])
                 continue;
             const int p = c ? (mask & 1 ? 1 : 2) : 0; // a plane the dispatch makes
-            if (mask == 3 && vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2))
-                return fail("the output frame's U and V planes have different strides");
             pc.plane = mask;
             pc.width = vsapi->getFrameWidth(dst, p);
             pc.height = vsapi->getFrameHeight(dst, p);

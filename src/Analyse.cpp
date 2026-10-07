@@ -126,12 +126,19 @@ int SearchVariant(const SuperLayout &L, bool chroma, bool satd = false) {
 // against 8 blocks per workgroup: 4:4:4 32x32 -31..-32%, 4:2:0 32x32 -14..-21%, luma-only 32x32
 // -3..-7%, 4:4:4 16x16 -2..-4%, 16-bit 4:4:4 16x16 -17%, 16-bit 4:2:0 16x16 +-3%; split 4 against 2:
 // 4:4:4 32x32 -12..-13%, 16-bit 4:2:0 32x32 -18..-21%, 16-bit 4:4:4 32x32 -35..-36%, but blocks of
-// 1.5 KB (4:2:0 32x32, 16-bit 4:4:4 16x16) +6..7%. Float samples take 1: a lane measures a candidate's
-// whole SAD in mvu's order (refine_common.glsl's LaneSadF).
+// 1.5 KB (4:2:0 32x32, 16-bit 4:4:4 16x16) +6..7%.
+// Float samples take their own SAD (refine_common.glsl's LaneSadF), whose sums in mvu's order a lane
+// measured alone, one long chain of reads and additions per candidate; kSplit lanes share them out as
+// mvu's lanes add up, bit for bit, 2 for blocks of 32 luma pixels and 4 for larger ones. Measured (1080p
+// float 4:2:0, radius 2, the Degrain chain's frames per second against one lane): 8x4 +28%, 16x2 +35%,
+// 8x8 +32%, 16x8 +60%, 16x16 +77%, 32x32 +102%, 64x64 +51%, 4:4:4 16x16 +43%, 4K 16x16 +81%, but 4x4
+// -5% (with 4 lanes, 8x4 +10% and 16x2 +25%). With satd, whose luma SATD a lane takes whole, one lane.
 constexpr int kSplitBytes = 768, kSplit4Bytes = 3072;
-int RefineSplit(const SuperLayout &L, bool chroma) {
-    if (L.format.Kind() == 2)
-        return 1;
+int RefineSplit(const SuperLayout &L, bool chroma, bool satd) {
+    if (L.format.Kind() == 2) {
+        const int pixels = L.blk * L.blkY;
+        return satd ? 1 : pixels > 32 ? 4 : pixels == 32 ? 2 : 1;
+    }
     const int bytes = BlockPixels(L, chroma) * (L.format.Kind() == 0 ? 1 : 2);
     return bytes >= kSplit4Bytes ? 4 : bytes >= kSplitBytes ? 2 : 1;
 }
@@ -783,7 +790,7 @@ static const VSFrame *VS_CC analyseGetFrame(int n, int activationReason, void *i
         std::function<void(int)> stamp;
         if (d->profile)
             stamp = [&](int stage) { d->profile->Stamp(*d->vc, cmd, queries, stage); };
-        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), static_cast<int>(chromaStride / (2 * bytes)), static_cast<int>(recBytes / 16),
+        FieldRecorder field(*d, rec, work, static_cast<int>(lumaStride / bytes), cur.KernelWc(bytes), static_cast<int>(recBytes / 16),
                             static_cast<int>(d->coarseRow * coarseRowBytes / 8), flags, std::move(stamp));
         field.SeedLists();
         field.Refinement();
@@ -1088,7 +1095,7 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
-    d->split = RefineSplit(L, a.chroma);
+    d->split = RefineSplit(L, a.chroma, a.satd);
     const int pel = L.pel, variant = SearchVariant(L, a.chroma, a.satd), split = variant | (d->split == 4 ? 8 : d->split == 2 ? 4 : 0);
     d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel, 0, blkY);
     d->seedBuild = vc.Pipeline(Kernel::SeedBuild, blk, pel, 0, blkY);

@@ -79,12 +79,15 @@ static_assert(sizeof(LevelEntry) == 80, "pyr_common.glsl's Level is 20 ints");
 
 // Where a super frame keeps the parts of its storage: byte offsets into its plane's buffer and sizes
 // of luma's storage, chroma's (none for Gray) and the coarse levels' (none without them), and the
-// strides of luma's rows and chroma's (2 wc samples each, U and V interleaved; the kernels take
-// chromaStride / 2 bytes as their wc). Offsets are multiples of 256 bytes, which every device takes
-// as a storage buffer descriptor's offset.
+// strides of luma's rows and chroma's (2 wc samples each, U and V interleaved: KernelWc). Offsets are
+// multiples of 256 bytes, which every device takes as a storage buffer descriptor's offset.
 struct SuperRegions {
     int64_t luma = 0, lumaBytes = 0, chroma = 0, chromaBytes = 0, pyramid = 0, pyramidBytes = 0;
     int64_t lumaStride = 0, chromaStride = 0;
+
+    // The kernels' wc, for samples of bytes bytes each: chroma's rows' stride in pixels, two samples a
+    // pixel (0 without chroma)
+    int32_t KernelWc(int64_t bytes) const { return static_cast<int32_t>(chromaStride / (2 * bytes)); }
 };
 
 // The samples of a super: the clip's

@@ -164,11 +164,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 return fail("the clip's frames aren't GPU resident");
         if (vkapi->getGPUPlane(sup, 0, &superPlane))
             return fail("the super's frames aren't GPU resident");
-        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
-        // strides)
-        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
-            return fail("the clip's U and V planes have different strides");
-        const ptrdiff_t lumaStride = regions.lumaStride, chromaStride = regions.chromaStride;
+        // Chroma's U and V are made together, one dispatch taking both planes
+        if (const std::string e = CheckChromaStrides({src, dst}, vsapi); !e.empty())
+            return fail(e);
+        const ptrdiff_t lumaStride = regions.lumaStride;
         ptrdiff_t recBytes = 0;
         for (int i = 0; i < vectorClips; ++i) {
             if (vkapi->getGPUPlane(vec[i], 0, &vecPlanes[i]))
@@ -223,7 +222,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
+        pc.wc = regions.KernelWc(bytes);
         pc.hc = L.hc;
         pc.time256 = d->time256;
         pc.scdLimit = d->scd.limit;

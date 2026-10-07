@@ -62,6 +62,12 @@ struct SuperData {
     }
 };
 
+// Whether every part of a super's storage fits the device's storage buffers: the kernels bind each
+// part as a range of its own (SuperRegions), luma's growing with the frame's stride
+static bool FitsStorageBuffers(const SuperRegions &r, const VulkanContext &vc) {
+    return static_cast<VkDeviceSize>(std::max({r.lumaBytes, r.chromaBytes, r.pyramidBytes})) <= vc.limits.maxStorageBufferRange;
+}
+
 static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
     SuperData *d = reinterpret_cast<SuperData *>(instanceData);
 
@@ -103,6 +109,8 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         SuperRegions regions;
         if (!GetSuperRegions(dst, L, regions, vsapi))
             return fail("the storage frame doesn't hold the storage");
+        if (!FitsStorageBuffers(regions, *d->vc))
+            return fail("the frame is too large for the device's storage buffers");
         const ptrdiff_t bytes = F.Bytes();
         const ptrdiff_t lumaStride = regions.lumaStride, chromaStride = regions.chromaStride;
         if (lumaStride % (4 * bytes) || chromaStride % (4 * bytes))
@@ -148,7 +156,7 @@ static const VSFrame *VS_CC superGetFrame(int n, int activationReason, void *ins
         q.padcY = L.padcY;
         q.wp = static_cast<int32_t>(lumaStride / bytes);
         q.hp = L.hp;
-        q.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
+        q.wc = regions.KernelWc(bytes);
         q.hc = L.hc;
         q.lumaPlanes = L.lumaPlanes;
         q.chromaPlanes = L.ChromaPlanes();
@@ -316,9 +324,8 @@ static void VS_CC superCreate(const VSMap *in, VSMap *out, [[maybe_unused]] void
             d->quarterPipeline = vc.Pipeline(Kernel::SuperQuarter, 0, pel, format.Kind());
         if (L.topLevel > 0)
             d->reducePipeline = vc.Pipeline(Kernel::PyrReduce, 0, pel, format.Kind());
-        const VkDeviceSize lumaBytes = static_cast<VkDeviceSize>(L.LumaRows()) * L.wp * format.Bytes();
-        const VkDeviceSize chromaBytes = static_cast<VkDeviceSize>(L.ChromaRows()) * 2 * L.wc * format.Bytes();
-        if (lumaBytes > vc.limits.maxStorageBufferRange || (format.chroma && chromaBytes > vc.limits.maxStorageBufferRange))
+        // At the least stride the core can give the frames (superGetFrame checks their own)
+        if (!FitsStorageBuffers(L.Regions(static_cast<int64_t>(L.FrameWidth()) * format.Bytes()), vc))
             throw std::runtime_error("the frame is too large for the device's storage buffers");
 
         char errMsg[1024] = {};

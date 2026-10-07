@@ -56,8 +56,11 @@ denoised = core.mvgpu.Degrain(clip, sup, vectors)
   the planes in 64 bits, where mvgpu's SADs, 32 bits wide, saturate (`Recalculate` compares the
   64-bit sums as mvu does, so its vectors stay mvu's; `Analyse`'s lambda relaxation takes a float
   SAD past the largest an integer block can make as that largest). Float `Analyse` runs at about a
-  fifth of 16-bit's speed (4:4:4, 16×16 blocks, `pel=4`, RX 6900 XT): a lane measures a candidate's
-  float SAD in mvu's order, where integer SADs take a word of packed samples at a time.
+  fifth of 16-bit's speed (4:4:4, 16×16 blocks, `pel=4`, RX 6900 XT): a candidate's float SAD keeps
+  mvu's order of additions, shared out over 2 or 4 lanes as mvu's own lanes add up, where integer
+  SADs take a word of packed samples at a time. The sharing made the float `Degrain` chain 28–102%
+  faster than one lane per candidate (1080p 4:2:0: 8×4 blocks 28%, 8×8 32%, 16×16 77%, 32×32 102%;
+  4:4:4 16×16 43%; 4K 4:2:0 16×16 81%).
 * `Analyse` searches its own way: a coarse search on a pyramid of the frame, a seed list per block,
   checkerboard passes under mvu's cost (`mvlambda`, `lsad`; `plevel` scales the coarse levels'
   lambda as mvu scales it per level), a wide search for the blocks still

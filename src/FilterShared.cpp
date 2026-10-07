@@ -8,6 +8,13 @@
 #include <stdexcept>
 #include <string>
 
+std::string CheckChromaStrides(std::initializer_list<const VSFrame *> frames, const VSAPI *vsapi) {
+    for (const VSFrame *f : frames)
+        if (vsapi->getVideoFrameFormat(f)->numPlanes == 3 && vsapi->getStride(f, 1) != vsapi->getStride(f, 2))
+            return "a frame's U and V planes have different strides";
+    return {};
+}
+
 std::vector<int32_t> MakeOverlapWindows(int nx, int ny, int ox, int oy) {
     std::vector<float> fWin1UVx(nx), fWin1UVxfirst(nx), fWin1UVxlast(nx);
     for (int i = 0; i < ox; i++) {

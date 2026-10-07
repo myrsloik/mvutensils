@@ -248,10 +248,10 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         for (int p = 0; p < numPlanes; ++p)
             if (vsapi->getStride(ref, p) != vsapi->getStride(src, p))
                 return fail("the clip's frames' strides differ");
-        // Chroma's U and V are made together (one dispatch, their output and clip planes at the same
-        // strides)
-        if (numPlanes > 1 && (vsapi->getStride(dst, 1) != vsapi->getStride(dst, 2) || vsapi->getStride(src, 1) != vsapi->getStride(src, 2)))
-            return fail("the clip's U and V planes have different strides");
+        // Chroma's U and V are made together, one dispatch taking both planes (the frame after's at
+        // the frame before's strides, as just checked)
+        if (const std::string e = CheckChromaStrides({src, dst}, vsapi); !e.empty())
+            return fail(e);
 
         // Scratch: the scene change counts, then F's and B's occlusion masks
         const int nb = d->nbx * d->nby;
@@ -302,7 +302,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
         pc.padcY = L.padcY;
         pc.wp = static_cast<int32_t>(lumaStride / bytes);
         pc.hp = L.hp;
-        pc.wc = static_cast<int32_t>(chromaStride / (2 * bytes)); // chroma's pixels per row, U and V interleaved
+        pc.wc = regions[0].KernelWc(bytes);
         pc.hc = L.hc;
         pc.time256 = time256;
         pc.thscd1 = d->thscd1;

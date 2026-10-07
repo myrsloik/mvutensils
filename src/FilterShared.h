@@ -1,13 +1,20 @@
 #pragma once
 
-// Host-side helpers the mvgpu filters share: mvu's overlap windows and scene change thresholds, and
-// the taps of the zimg bilinear resizes through which mvu spreads the blocks' values (vectors,
-// masks) over the pixels.
+// Host-side helpers the mvgpu filters share: mvu's overlap windows and scene change thresholds, the
+// taps of the zimg bilinear resizes through which mvu spreads the blocks' values (vectors, masks)
+// over the pixels, and the check of the planes a chroma dispatch takes.
 
 #include <cstdint>
+#include <initializer_list>
+#include <string>
 #include <vector>
 
 #include "SuperLayout.h"
+
+// The filters that make chroma's U and V in one dispatch (Degrain, Compensate, Flow, FlowBlur,
+// FlowInter, FlowFPS) take both planes of a frame at one stride: the error if a frame's U and V
+// planes have different strides, else empty (Gray frames have no chroma to differ)
+std::string CheckChromaStrides(std::initializer_list<const VSFrame *> frames, const VSAPI *vsapi);
 
 // mvu's OverlapWindows::Init: the 9 windows of nx x ny blocks overlapping by ox, oy (top left, top
 // middle, top right, middle left, ..., bottom right, nx * ny values each, 0 .. 2048), in the same
