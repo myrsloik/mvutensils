@@ -5,7 +5,7 @@
 layout(local_size_x = 64) in;
 
 // The fallback's list of blocks (refine_flag.comp), emptied here for the field's fallback
-layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
+layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint listed; uint flagged[]; };
 
 // Every seed of every block: its SAD, kept for the passes, and the seed of the lowest cost (its SAD
 // with its penalty, SeedPenalty) as the block's starting vector, ties to the earlier seed, by one
@@ -17,6 +17,7 @@ void main() {
         dispatchX = 0u;
         dispatchY = 1u;
         dispatchZ = 1u;
+        listed = 0u;
     }
     uint lane = WorkgroupLane();
     int group = int(lane) / kGroupLanes, sub = int(lane & 7u), inGroup = int(lane) & (kGroupLanes - 1);

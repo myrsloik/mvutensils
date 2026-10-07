@@ -1,7 +1,9 @@
 # MVGPUtensils
 
 MVGPUtensils (namespace `mvgpu`) is MVUtensils on the GPU, through VapourSynth's Vulkan GPU frames
-(API 4.3): every clip it takes and returns is GPU resident. The goal is a drop-in replacement for
+(API 4.3): the clips its filters take and return are GPU resident, but for `SCDetection`'s, which
+it passes through wherever they live, and the vector clips in mvu's form, which `ToMVU` returns on
+the CPU and `FromMVU` takes from anywhere. The goal is a drop-in replacement for
 `mvu`, the same functions with the same arguments; there are `Super`, `Analyse`, `AnalyseMany`,
 `Recalculate`, `Degrain` (with `Degrain1` … `Degrain25`), `Compensate`, `Flow`, `FlowBlur`,
 `FlowInter`, `FlowFPS`, `SCDetection`, `VectorLengthMask`, `SADMask` and `OcclusionMask` (not the

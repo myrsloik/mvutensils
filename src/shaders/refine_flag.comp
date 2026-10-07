@@ -1,18 +1,36 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #define NO_BLOCK_CACHE
 #include "refine_common.glsl"
 
 layout(local_size_x = 64) in;
 
-// The blocks the fallback searches: those whose SAD is still above badSad, appended to a list
-// whose length is also the fallback's indirect dispatch size. One lane per block; dispatched as
-// ((nbx * nby + 63) / 64, 1) workgroups.
-layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
+// The blocks the fallback searches: those whose SAD is still above badSad, appended to a list, a
+// subgroup's with one atomic. Its length sizes the fallback's indirect dispatch, a workgroup per
+// listed block, in rows of kListRow workgroups, as many rows as the list needs (refine_fallback.comp
+// and refine_apply.comp find their entry from both): Vulkan guarantees only 65535 workgroups in a
+// dimension, fewer than a grid can have blocks (1080p in 8x8 blocks overlapping by 4 has 128851).
+// One lane per block; dispatched as ((nbx * nby + 63) / 64, 1) workgroups.
+layout(std430, set = 0, binding = 15) buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint listed; uint flagged[]; };
+
+const uint kListRow = 65535u;
 
 void main() {
     uint b = gl_GlobalInvocationID.x;
-    if (b >= uint(pc.nbx * pc.nby) || int64_t(sadA[b]) <= int64_t(pc.badSad))
+    bool flag = b < uint(pc.nbx * pc.nby) && int64_t(sadA[b]) > int64_t(pc.badSad);
+    uvec4 ballot = subgroupBallot(flag);
+    uint n = subgroupBallotBitCount(ballot);
+    if (n == 0u)
         return;
-    flagged[atomicAdd(dispatchX, 1u)] = b;
+    uint base = 0u;
+    if (subgroupElect()) {
+        base = atomicAdd(listed, n);
+        uint end = base + n;
+        atomicMax(dispatchX, min(end, kListRow));
+        atomicMax(dispatchY, (end + kListRow - 1u) / kListRow);
+    }
+    base = subgroupBroadcastFirst(base);
+    if (flag)
+        flagged[base + subgroupBallotExclusiveBitCount(ballot)] = b;
 }

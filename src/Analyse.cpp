@@ -1095,6 +1095,7 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
 
     d->vc = VulkanContext::Get(core, vsapi);
     VulkanContext &vc = *d->vc;
+    vc.RequireBlockLanes(static_cast<int64_t>(L.nbx) * L.nby); // seed_scatter, seed_build, refine_flag
     d->split = RefineSplit(L, a.chroma, a.satd);
     const int pel = L.pel, variant = SearchVariant(L, a.chroma, a.satd), split = variant | (d->split == 4 ? 8 : d->split == 2 ? 4 : 0);
     d->seedScatter = vc.Pipeline(Kernel::SeedScatter, blk, pel, 0, blkY);
@@ -1134,10 +1135,11 @@ VSNode *CreateAnalyse(const AnalyseArgs &a, int delta, VSNode *coarseNode, int c
     scratch.Place(d->lastChange, nb * 4);
     scratch.Place(d->lastEval, nb * 4);
     scratch.Place(d->counters, kCounterSlots * 4);
-    scratch.Place(d->flagged, 12 + nb * 4); // the fallback's dispatch size (x, y, z), then its list of blocks
+    scratch.Place(d->flagged, 16 + nb * 4); // the fallback's dispatch size (x, y, z) and its list's length, then the list of blocks
     scratch.Place(d->invKey, nb * 8);
     d->scratchBytes = scratch.Total();
-    if (d->scratchBytes > vc.limits.maxStorageBufferRange || static_cast<VkDeviceSize>(L.LumaRows()) * L.wp > vc.limits.maxStorageBufferRange)
+    // (the super's parts mvgpu.Super checks itself)
+    if (d->scratchBytes > vc.limits.maxStorageBufferRange)
         throw std::runtime_error("the frame is too large for the device's storage buffers");
 
     char err[1024] = {};

@@ -324,6 +324,7 @@ static void VS_CC compensateCreate(const VSMap *in, VSMap *out, [[maybe_unused]]
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
+        vc.RequireBlockLanes(static_cast<int64_t>(d->nbx) * d->nby); // the scene change count
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical; bit 2
         // 16-bit samples, bit 3 float
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);

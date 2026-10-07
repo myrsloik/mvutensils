@@ -221,6 +221,10 @@ public:
     VkDescriptorSetLayout SetLayout(Layout layout) const { return setLayouts[static_cast<int>(layout)]; }
     // Throws when the device can't hold the Degrain layout's descriptors
     void RequireDegrain() const;
+    // Throws when the kernels with a lane per block can't take a grid of this many blocks: they are
+    // dispatched as (blocks + 63) / 64 workgroups, more than the device's maxComputeWorkGroupCount
+    // from some 4.2 million blocks where it has Vulkan's least, 65535
+    void RequireBlockLanes(int64_t blocks) const;
 
     const VSVULKANAPI *vkapi = nullptr;
     const VSVulkanFunctions *vk = nullptr;

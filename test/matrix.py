@@ -140,6 +140,8 @@ def analyse_cases():
         ('badrange 0 16/8', ff, ['--frames', '10', '--badrange', '0'] + grid(16, 8)),
         ('badrange -40 badstep 4 8/4', ff, ['--frames', '10', '--badrange', '-40', '--badstep', '4'] + grid(8, 4)),
         ('badsad 200 16/8 pel 4', ob, ['--frames', '10', '--badsad', '200'] + grid(16, 8, 4)),
+        # (all of 959 x 539 = 516901 blocks listed for the fallback: past a row of 65535 workgroups)
+        ('badsad 0 badrange 4 4/2', ff, ['--frames', '4', '--badsad', '0', '--badrange', '4', '--radius', '1'] + grid(4, 2)),
         ('mvlambda 0 32/16', ff, ['--frames', '10', '--mvlambda', '0'] + grid(32, 16)),
         ('mvlambda 4000 lsad 1200 32/16 pel 4', ff, ['--frames', '10', '--mvlambda', '4000', '--lsad', '1200'] + grid(32, 16, 4)),
         ('lsad 0 16/8', ff, ['--frames', '10', '--lsad', '0'] + grid(16, 8)),
@@ -391,6 +393,8 @@ def analyse_cases():
         ('overrange YUV444PS 16/8 pel 4', ff, ['--frames', '6', '--format', 'YUV444PS', '--overrange', '--radius', '1'] + grid(16, 8, 4)),
         ('overrange YUV420PS 64/32', ff, ['--frames', '6', '--format', 'YUV420PS', '--overrange', '--radius', '1'] + grid(64, 32)),
         ('overrange satd YUV444PS 128/64', ff, ['--frames', '6', '--format', 'YUV444PS', '--overrange', '--satd', '--radius', '1'] + grid(128, 64)),
+        # (and by 2000: the coarse levels' SADs saturate too, the top level's costs past 2^32)
+        ('overrange 2000 GRAYS 16/8', ff, ['--frames', '6', '--format', 'GRAYS', '--overrange', '--overrange-scale', '2000', '--radius', '1'] + grid(16, 8)),
     ]
     return cases
 

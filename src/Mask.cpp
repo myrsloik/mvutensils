@@ -301,6 +301,7 @@ static void VS_CC maskCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
+        vc.RequireBlockLanes(static_cast<int64_t>(v.nbx) * v.nby); // mask_blocks.comp
         // Specialization constant 6: the mask's samples
         const int sampleKind = v.bits == 8 ? 0 : isFloat ? 2 : 1;
         d->blocks = vc.Pipeline(Kernel::MaskBlocks, 0, 0, sampleKind);

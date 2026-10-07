@@ -7,7 +7,7 @@
 // kFallbackSubgroups subgroups per block (specialization constant 4 sizes the workgroup)
 layout(local_size_x_id = 4) in;
 
-layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint flagged[]; };
+layout(std430, set = 0, binding = 15) readonly buffer Flagged { uint dispatchX; uint dispatchY; uint dispatchZ; uint listed; uint flagged[]; };
 
 // The blocks refine_flag.comp listed, whose SAD is still above badSad, try every position
 // fallbackStep px apart within fallbackRadius px of their predictor, then the positions up to
@@ -161,9 +161,28 @@ uint UnitsSad(int ua, int ub) {
     return kWide ? gSa : gSa + (sUnitBefore[ub] - sUnitBefore[ua]) - 2u * gSm;
 }
 
+// The lane's cheapest position of the window: its cost, 64 bits as it is (a far position's lambda
+// term can pass 2^40, which a cost packed with the position into one 64-bit key couldn't hold), and
+// its place in scan order, the earlier of equal costs, so that the first of the cheapest wins, as on
+// the CPU
+const int64_t kNoCost = 0x7FFFFFFFFFFFFFFFl;
+int64_t gMineCost = kNoCost;
+int gMineK = 0;
+
+void Keep(int64_t cost, int k) {
+    if (cost < gMineCost || (cost == gMineCost && k < gMineK)) {
+        gMineCost = cost;
+        gMineK = k;
+    }
+}
+
 void main() {
+    // The workgroup's listed block, in refine_flag.comp's rows of workgroups (the last row's past the
+    // list's end have none)
+    int entry = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    if (entry >= int(listed))
+        return;
     int lanes = int(gl_WorkGroupSize.x), lane = int(WorkgroupLane());
-    int entry = int(gl_WorkGroupID.x);
     int b = int(flagged[entry]);
     int bx = b % pc.nbx, by = b / pc.nbx;
     // The block's current pixels as LoadBlock lays them out, loaded by all the lanes, their sum and
@@ -220,8 +239,6 @@ void main() {
     int x0 = (lo.x + kPel - 1) & ~(kPel - 1), y0 = (lo.y + kPel - 1) & ~(kPel - 1);
     int nx = hi.x >= x0 ? (hi.x - x0) / stepH + 1 : 0, ny = hi.y >= y0 ? (hi.y - y0) / stepH + 1 : 0;
     int total = nx * ny;
-    // cost << 24 | position: fewer than 2^24 positions, costs far below 2^40
-    uint64_t mine = kNoKey;
     int batch = kPerLane * lanes;
     int dc = nx > 0 ? lanes % nx : 0, dr = nx > 0 ? lanes / nx : 0;
     // Small blocks' units are too small to pay for the phases' bookkeeping: every position gets its
@@ -231,7 +248,7 @@ void main() {
         for (int k = lane; k < total; k += lanes) {
             ivec2 v = ivec2(x0 + (k % nx) * stepH, y0 + (k / nx) * stepH);
             uint s = LaneSad(v);
-            mine = min(mine, (uint64_t(Cost(s, v, p, lambda) + Penalty(s, PNew())) << 24) | uint64_t(k));
+            Keep(Cost(s, v, p, lambda) + Penalty(s, PNew()), k);
         }
     } else for (int base = 0; base < total; base += batch) {
         int count = min(batch, total - base);
@@ -278,7 +295,7 @@ void main() {
                     int64_t c = PositionCost(sad);
                     if (c <= int64_t(bound)) {
                         if (phase == 2) {
-                            mine = min(mine, (uint64_t(c) << 24) | uint64_t(pr0 * nx + pc0));
+                            Keep(c, pr0 * nx + pc0);
                             atomicMin(sBound, uint(c));
                             bound = uint(c);
                         } else {
@@ -292,12 +309,14 @@ void main() {
         }
         barrier();
     }
-    // A winner's SAD follows from its cost less its lambda term, so it needn't be measured again
-    uint64_t found = WorkgroupMin(mine);
-    if (total > 0 && int64_t(found >> 24) < bestCost) {
-        int k = int(found & 0xFFFFFFul);
+    // The cheapest position of all the lanes, then the first in scan order of those that cheap. A
+    // winner's SAD follows from its cost less its lambda term, so it needn't be measured again.
+    uint64_t least = WorkgroupMin(uint64_t(gMineCost));
+    uint64_t first = WorkgroupMin(uint64_t(gMineCost) == least ? uint64_t(gMineK) : kNoKey);
+    if (total > 0 && int64_t(least) < bestCost) {
+        int k = int(first);
         best = ivec2(x0 + (k % nx) * stepH, y0 + (k / nx) * stepH);
-        bestCost = int64_t(found >> 24);
+        bestCost = int64_t(least);
         bestSad = SadOfPenalized(bestCost - Cost(0u, best, p, lambda), PNew());
     }
     if (pc.fallbackStep > 1) {

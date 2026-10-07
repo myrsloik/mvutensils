@@ -716,6 +716,7 @@ static void VS_CC degrainCreate(const VSMap *in, VSMap *out, void *userData, VSC
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
         vc.RequireDegrain();
+        vc.RequireBlockLanes(static_cast<int64_t>(d->nbx) * d->nby); // degrain_count, degrain_weights
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical, and for
         // the pixels bit 2 for 16-bit samples, bit 3 for float ones
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);

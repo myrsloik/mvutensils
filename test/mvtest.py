@@ -64,14 +64,15 @@ def extreme(core, clip):
     return core.std.SelectEvery(pairs, 4, [0, 3])  # dark 0, bright 1, dark 2, ...
 
 
-def overrange(core, clip):
-    """A float clip with every other frame's samples multiplied by 32 and the others' by -32, chroma's
-    as luma's, so that frames next to each other differ by many times the nominal range everywhere:
-    float SADs, which mvu scales to the 16-bit range with each sample unbounded, then pass the largest
-    SAD a block's pixels make at 16 bits, the sum of a block's planes passes 2^32 from 32x32 4:4:4
-    blocks on, and each plane's saturates at 2^32 - 1 from 64x64 blocks on"""
+def overrange(core, clip, scale=32):
+    """A float clip with every other frame's samples multiplied by scale and the others' by -scale,
+    chroma's as luma's, so that frames next to each other differ by many times the nominal range
+    everywhere: float SADs, which mvu scales to the 16-bit range with each sample unbounded, then pass
+    the largest SAD a block's pixels make at 16 bits; at 32 the sum of a block's planes passes 2^32 from
+    32x32 4:4:4 blocks on, and each plane's saturates at 2^32 - 1 from 64x64 blocks on, and at 2000 even
+    the coarse levels' 8x8 blocks saturate"""
     assert clip.format.sample_type == vs.FLOAT
-    pairs = core.std.Interleave([core.std.Expr(clip, 'x 32 *'), core.std.Expr(clip, 'x -32 *')])
+    pairs = core.std.Interleave([core.std.Expr(clip, f'x {scale:g} *'), core.std.Expr(clip, f'x {-scale:g} *')])
     return core.std.SelectEvery(pairs, 4, [0, 3])
 
 

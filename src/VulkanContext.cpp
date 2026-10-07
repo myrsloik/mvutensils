@@ -230,6 +230,12 @@ void VulkanContext::RequireDegrain() const {
         throw std::runtime_error(degrainError);
 }
 
+void VulkanContext::RequireBlockLanes(int64_t blocks) const {
+    if ((blocks + 63) / 64 > static_cast<int64_t>(limits.maxComputeWorkGroupCount[0]))
+        throw std::runtime_error("the grid has " + std::to_string(blocks) + " blocks, more than " + deviceName + " can dispatch a lane for each (" +
+                                 std::to_string(64 * static_cast<int64_t>(limits.maxComputeWorkGroupCount[0])) + ")");
+}
+
 VkPipeline VulkanContext::Pipeline(Kernel kernel, int blk, int pel, int variant, int blkY) {
     if (KernelLayout(kernel) == Layout::Degrain)
         RequireDegrain();

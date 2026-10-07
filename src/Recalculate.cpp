@@ -68,8 +68,7 @@ struct RecalcData {
 // The analysis description mvu.Recalculate attaches: the super's, with the vectors' delta, and one
 // level, the recalculated one
 static void ExportRecalculated(VSFrame *dst, const RecalcData *d, bool hasVectors, const VSAPI *vsapi) {
-    ExportAnalysis(dst, d->grid, d->delta, d->chroma, hasVectors, d->prefix, vsapi);
-    vsapi->mapSetInt(vsapi->getFramePropertiesRW(dst), (d->prefix + "AnalysisLevels").c_str(), 1, maReplace);
+    ExportAnalysis(dst, d->grid, d->delta, d->chroma, hasVectors, d->prefix, vsapi, 1);
 }
 
 static const VSFrame *VS_CC recalculateGetFrame(int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {

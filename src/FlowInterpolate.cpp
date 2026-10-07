@@ -495,6 +495,7 @@ static void VS_CC flowCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
+        vc.RequireBlockLanes(static_cast<int64_t>(d->nbx) * d->nby); // flow_prep.comp
         // Specialization constant 6: chroma's subsampling, bit 0 horizontal, bit 1 vertical
         const int chromaLog = (L.format.xr > 1 ? 1 : 0) | (L.format.yr > 1 ? 2 : 0);
         d->prep = vc.Pipeline(Kernel::FlowPrep, 0, L.pel, chromaLog);

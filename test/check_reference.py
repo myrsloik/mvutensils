@@ -26,7 +26,8 @@ grids that end inside a block.
 temporary one.
 --extreme makes every other frame dark and the others bright first (mvtest.extreme), for SADs past 2^31;
 --overrange multiplies a float clip's frames by 32 and -32 by turns (mvtest.overrange), for float SADs past
-what integer samples make (the lambda tables' last entries), and past 2^32, saturated.
+what integer samples make (the lambda tables' last entries), and past 2^32, saturated; --overrange-scale
+sets the factor (2000 saturates even the coarse levels' SADs, whose top level's costs then pass 2^32).
 """
 import argparse
 import os
@@ -71,6 +72,7 @@ def main():
     ap.add_argument('--format', default='YUV420P8', help='a VapourSynth preset name, Gray or YUV at 8 to 16 bits or float: YUV420P8, YUV422P10, YUV444PS, ...')
     ap.add_argument('--extreme', action='store_true', help='every other frame dark, the others bright (mvtest.extreme)')
     ap.add_argument('--overrange', action='store_true', help="a float clip's frames multiplied by 32 and -32 by turns (mvtest.overrange)")
+    ap.add_argument('--overrange-scale', type=float, default=32.0, help='the factor --overrange multiplies by')
     ref = ap.add_mutually_exclusive_group(required=True)
     ref.add_argument('--reference', help='the reference executable, run with matching arguments')
     ref.add_argument('--ref', help='a vector file the reference wrote')
@@ -110,7 +112,7 @@ def main():
     if args.extreme:
         clip = extreme(core, clip)
     if args.overrange:
-        clip = overrange(core, clip)
+        clip = overrange(core, clip, args.overrange_scale)
     if args.crop:
         w, h = (int(v) for v in args.crop.split('x'))
         clip = core.std.CropAbs(clip, w, h)

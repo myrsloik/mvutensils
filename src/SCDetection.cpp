@@ -167,6 +167,7 @@ static void VS_CC scdetectionCreate(const VSMap *in, VSMap *out, [[maybe_unused]
 
         d->vc = VulkanContext::Get(core, vsapi);
         VulkanContext &vc = *d->vc;
+        vc.RequireBlockLanes(static_cast<int64_t>(d->nbx) * d->nby); // the scene change count
         d->count = vc.Pipeline(Kernel::MaskBlocks, 0, 0, 0);
         char errMsg[1024] = {};
         d->pool = vc.vkapi->createGPUExecPool(core, vqCompute, errMsg, sizeof(errMsg));
