@@ -1093,6 +1093,8 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
     int nStepXold = nBlkSizeXold - nOverlapXold;
     int nStepYold = nBlkSizeYold - nOverlapYold;
     int nLogPelold = ilog2(nPel);
+    // every block divides by the old grid's steps
+    const InvariantDivisor stepXold(nStepXold), stepYold(nStepYold);
 
     std::vector<VECTOR> oldVectors;
     std::swap(oldVectors, vectors);
@@ -1138,6 +1140,11 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
     this->pRefFrame = &pRefFrame;
 
     InitMotionEstimationFields(useSatd, chroma, sizeof(PixelType));
+
+    // A block's first SAD reads it where it is in the super frame. Only a search, which compares many candidates against
+    // it, copies it to the aligned buffer, so most blocks skip the copy. (SATD kernels honour any source pitch.)
+    const SADFunction sadInPlace = useSatd ? SAD : selectSADFunctionAnySource(nBlkSizeX, nBlkSizeY, sizeof(PixelType) * 8);
+    const SADFunction sadInPlaceChroma = chroma ? selectSADFunctionAnySource(nBlkSizeX / xRatioUV, nBlkSizeY / yRatioUV, sizeof(PixelType) * 8) : nullptr;
 
     x[0] = pSrcFrame.planes[0].nHPadding;
     y[0] = pSrcFrame.planes[0].nVPadding;
@@ -1187,12 +1194,6 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
                 pRealSrc[2] = pSrcFrame.planes[2].GetAbsolutePointerPel1<PixelType>(x[2], y[2]);
             }
 
-            BLITLUMA(pSrc_temp[0], nSrcPitch_temp[0], pRealSrc[0], pSrcFrame.planes[0].nPitch);
-            if (chroma) {
-                BLITCHROMA(pSrc_temp[1], nSrcPitch_temp[1], pRealSrc[1], pSrcFrame.planes[1].nPitch);
-                BLITCHROMA(pSrc_temp[2], nSrcPitch_temp[2], pRealSrc[2], pSrcFrame.planes[2].nPitch);
-            }
-
             if (blky == 0)
                 nLambda = 0;
             else
@@ -1209,9 +1210,9 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
 
             // get and interplolate old vectors
             int centerX = nBlkSizeX / 2 + (nBlkSizeX - nOverlapX) * blkx; // center of new block
-            int blkxold = (centerX - nBlkSizeXold / 2) / nStepXold;       // centerXold less or equal to new
+            int blkxold = stepXold.Divide(centerX - nBlkSizeXold / 2);   // centerXold less or equal to new
             int centerY = nBlkSizeY / 2 + (nBlkSizeY - nOverlapY) * blky;
-            int blkyold = (centerY - nBlkSizeYold / 2) / nStepYold;
+            int blkyold = stepYold.Divide(centerY - nBlkSizeYold / 2);
 
             int deltaX = std::max(0, centerX - (nBlkSizeXold / 2 + nStepXold * blkxold)); // distance from old to new
             int deltaY = std::max(0, centerY - (nBlkSizeYold / 2 + nStepYold * blkyold));
@@ -1221,7 +1222,9 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
             int blkyold1 = std::min(nBlkYold - 1, std::max(0, blkyold));
             int blkyold2 = std::min(nBlkYold - 1, std::max(0, blkyold + 1));
 
-            VECTOR vectorOld; // interpolated or nearest
+            // Only the position matters: Recalculate's searches don't read the predictor's SAD (only Analyse's lambda
+            // scaling does)
+            VECTOR vectorOld = {}; // interpolated or nearest
 
             if (smooth) { // interpolate
                 VECTOR vectorOld1 = oldVectors[blkxold1 + blkyold1 * nBlkXold]; // 4 old nearest vectors (may coinside)
@@ -1232,16 +1235,12 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
                 // interpolate
                 int vector1_x = vectorOld1.x * nStepXold + deltaX * (vectorOld2.x - vectorOld1.x); // scaled by nStepXold to skip slow division
                 int vector1_y = vectorOld1.y * nStepXold + deltaX * (vectorOld2.y - vectorOld1.y);
-                int64_t vector1_sad = vectorOld1.sad * nStepXold + deltaX * (vectorOld2.sad - vectorOld1.sad);
 
                 int vector2_x = vectorOld3.x * nStepXold + deltaX * (vectorOld4.x - vectorOld3.x);
                 int vector2_y = vectorOld3.y * nStepXold + deltaX * (vectorOld4.y - vectorOld3.y);
-                int64_t vector2_sad = vectorOld3.sad * nStepXold + deltaX * (vectorOld4.sad - vectorOld3.sad);
 
-                vectorOld.x = (vector1_x + deltaY * (vector2_x - vector1_x) / nStepYold) / nStepXold;
-                vectorOld.y = (vector1_y + deltaY * (vector2_y - vector1_y) / nStepYold) / nStepXold;
-                vectorOld.sad = (vector1_sad + deltaY * (vector2_sad - vector1_sad) / nStepYold) / nStepXold;
-
+                vectorOld.x = stepXold.Divide(vector1_x + stepYold.Divide(deltaY * (vector2_x - vector1_x)));
+                vectorOld.y = stepXold.Divide(vector1_y + stepYold.Divide(deltaY * (vector2_y - vector1_y)));
             } else { // nearest
                 if (deltaX * 2 < nStepXold && deltaY * 2 < nStepYold)
                     vectorOld = oldVectors[blkxold1 + blkyold1 * nBlkXold];
@@ -1257,20 +1256,25 @@ void MotionBlockLevel::DoRecalculateMVs(const FramePyramidLevel &pSrcFrame, cons
             vectorOld.x = RescaleToPel(vectorOld.x, nLogPelold, nLogPel);
             vectorOld.y = RescaleToPel(vectorOld.y, nLogPelold, nLogPel);
 
-            predictor = ClipMV(vectorOld);                                                                    // predictor
-            predictor.sad = vectorOld.sad * (nBlkSizeX * nBlkSizeY) / (nBlkSizeXold * nBlkSizeYold); // normalized to new block size
+            predictor = ClipMV(vectorOld);
 
             bestMV = predictor;
 
-            int64_t sad = SAD(pSrc_temp[0], nSrcPitch_temp[0], GetRefBlock<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[0]);
+            int64_t sad = sadInPlace(pRealSrc[0], pSrcFrame.planes[0].nPitch, GetRefBlock<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[0]);
             if (chroma) {
-                sad += SADCHROMA(pSrc_temp[1], nSrcPitch_temp[1], GetRefBlockU<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[1]);
-                sad += SADCHROMA(pSrc_temp[2], nSrcPitch_temp[2], GetRefBlockV<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[2]);
+                sad += sadInPlaceChroma(pRealSrc[1], pSrcFrame.planes[1].nPitch, GetRefBlockU<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[1]);
+                sad += sadInPlaceChroma(pRealSrc[2], pSrcFrame.planes[2].nPitch, GetRefBlockV<nLogPel, PixelType>(predictor.x, predictor.y), nRefPitch[2]);
             }
             bestMV.sad = sad;
             nMinCost = sad;
 
             if (bestMV.sad > thSAD) { // if old interpolated vector is bad
+                BLITLUMA(pSrc_temp[0], nSrcPitch_temp[0], pRealSrc[0], pSrcFrame.planes[0].nPitch);
+                if (chroma) {
+                    BLITCHROMA(pSrc_temp[1], nSrcPitch_temp[1], pRealSrc[1], pSrcFrame.planes[1].nPitch);
+                    BLITCHROMA(pSrc_temp[2], nSrcPitch_temp[2], pRealSrc[2], pSrcFrame.planes[2].nPitch);
+                }
+
                 // then, we refine, according to the search type
 
                 if (searchType == SearchType::Logarithmic) {
@@ -1746,13 +1750,6 @@ bool MotionBlockPyramid::IsUsable(int64_t thscd1, float thscd2) const noexcept {
     return HasMotionVectors() && !pyramidLevels[0].IsSceneChange(thscd1, thscd2);
 }
 
-BlockData MotionBlockPyramid::GetBlock(int nBlk) const noexcept {
-    int bY = nBlk / nBlkX;
-    int bX = nBlk % nBlkX;
-
-    return { bX * (nBlkSizeX - nOverlapX), bY * (nBlkSizeY - nOverlapY), pyramidLevels[0].vectors[nBlk] };
-}
-
 double MotionBlockPyramid::GetThSCDScaleFactor(int bitsPerSample) const {
     // thscd1 is defined as SAD per reference 8x8 luma block at 8-bit depth.
     // Scale to the actual block geometry, chroma contribution, and bit depth.
@@ -1855,7 +1852,7 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeVectorLengthMask(f
 
     for (int by = 0; by < nBlkY; by++) {
         for (int bx = 0; bx < nBlkX; bx++)
-            Mask[bx] = MaskLength<PixelType>(GetBlock(bx + by * nBlkX).vector, nPel, normFactor, halfGamma, maxVal);
+            Mask[bx] = MaskLength<PixelType>(GetBlock(bx, by).vector, nPel, normFactor, halfGamma, maxVal);
         Mask += MaskPitch;
     }
 
@@ -1887,8 +1884,7 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeSADMask(float dSAD
 
     for (int by = 0; by < nBlkY; by++) {
         for (int bx = 0; bx < nBlkX; bx++) {
-            int i = bx + by * nBlkX;
-            const BlockData block = GetBlock(i);
+            const BlockData block = GetBlock(bx, by);
             int vx = block.vector.x;
             int vy = block.vector.y;
             int bxi = bx - vx * time4096X / 4096;
@@ -1897,8 +1893,7 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeSADMask(float dSAD
                 bxi = bx;
                 byi = by;
             }
-            int i1 = bxi + byi * nBlkX;
-            int64_t sad = GetBlock(i1).vector.sad >> (std::min(16, bitsPerSample) - 8);
+            int64_t sad = GetBlock(bxi, byi).vector.sad >> (std::min(16, bitsPerSample) - 8);
             Mask[bx] = PixelNorm<PixelType>(sad, dSADNormFactor, fGamma, maxVal);
         }
         Mask += MaskPitch;
@@ -1939,13 +1934,11 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeVectorOcclusionMas
 
     for (int by = 0; by < nBlkY; by++) {
         for (int bx = 0; bx < nBlkX; bx++) {
-            int i = bx + by * nBlkX;
-            const BlockData block = GetBlock(i);
+            const BlockData block = GetBlock(bx, by);
             int vx = block.vector.x;
             int vy = block.vector.y;
             if (bx < nBlkX - 1) {
-                int i1 = i + 1;
-                const BlockData block1 = GetBlock(i1);
+                const BlockData block1 = GetBlock(bx + 1, by);
                 int vx1 = block1.vector.x;
                 if (vx1 < vx) {
                     int occlusion = vx - vx1;
@@ -1956,8 +1949,7 @@ std::unique_ptr<BlockMask<PixelType>> MotionBlockPyramid::MakeVectorOcclusionMas
                 }
             }
             if (by < nBlkY - 1) {
-                int i1 = i + nBlkX;
-                const BlockData block1 = GetBlock(i1);
+                const BlockData block1 = GetBlock(bx, by + 1);
                 int vy1 = block1.vector.y;
                 if (vy1 < vy) {
                     int occlusion = vy - vy1;
@@ -1979,8 +1971,7 @@ std::unique_ptr<SmallVectorMasks> MotionBlockPyramid::MakeSmallVectorMasks() con
 
     for (int by = 0; by < nBlkY; by++) {
         for (int bx = 0; bx < nBlkX; bx++) {
-            int i = bx + by * nBlkX;
-            const BlockData block = GetBlock(i);
+            const BlockData block = GetBlock(bx, by);
             int vx = block.vector.x;
             int vy = block.vector.y;
             // Bias into uint16_t for the resizer (see SmallVectorMasks). Saturate so a vector that doesn't

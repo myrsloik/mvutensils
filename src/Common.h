@@ -5,6 +5,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <cassert>
 #include <bit>
 #include <memory>
 #include <cstddef>
@@ -28,6 +29,29 @@
 #endif
 
 static constexpr size_t MVU_MEMORY_ALIGN = 64;
+
+// n / d rounded toward zero, exactly like C++'s / for every int n, for a divisor that stays the same for many divisions:
+// a multiply and a shift instead of a division instruction (Granlund and Montgomery's round-up method; |n| <= 2^31 keeps
+// the product below 2^64). Construct it in baseline-ISA code and pass it to AVX2/AVX-512 kernels: the constructor
+// isn't force-inlined and std::bit_width compiled for AVX2 assumes lzcnt, so their files' copy could be the one the
+// linker keeps.
+class InvariantDivisor {
+    int shift;
+    uint64_t magic;
+
+    static int ShiftFor(int d) noexcept {
+        assert(d >= 1); // before the initialisers shift by 64 or divide by 0
+        return 32 + std::bit_width(static_cast<unsigned>(d - 1));
+    }
+public:
+    explicit InvariantDivisor(int d = 1) noexcept : shift(ShiftFor(d)), magic(((uint64_t(1) << shift) + d - 1) / d) {}
+
+    [[nodiscard]] MVU_FORCE_INLINE int Divide(int n) const noexcept {
+        const uint64_t a = n < 0 ? uint64_t(0) - static_cast<uint64_t>(n) : static_cast<uint64_t>(n);
+        const uint32_t q = static_cast<uint32_t>((a * magic) >> shift);
+        return static_cast<int>(n < 0 ? 0u - q : q); // negated unsigned: INT_MIN / 1 doesn't overflow
+    }
+};
 
 class MVUtensilsError : public std::runtime_error {
     using std::runtime_error::runtime_error;

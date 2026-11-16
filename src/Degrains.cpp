@@ -246,13 +246,11 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
 
                         int xx = 0;
                         for (int bx = 0; bx < nBlkX; bx++) {
-                            int i = by * nBlkX + bx;
-
                             const uint8_t *pointers[radius * 2];
                             uint16_t WSrc, WRefs[radius * 2];
 
                             for (int r = 0; r < radius * 2; r++)
-                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], i, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
+                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
 
                             normaliseWeights<radius>(WSrc, WRefs, d->userWeights);
 
@@ -299,13 +297,11 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                             wbx = bx == nBlkX - 1 ? 2 : wbx;
                             const int16_t *winOver = OverWins[plane]->GetWindow(wby + wbx);
 
-                            int i = by * nBlkX + bx;
-
                             const uint8_t *pointers[radius * 2];
                             uint16_t WSrc, WRefs[radius * 2];
 
                             for (int r = 0; r < radius * 2; r++)
-                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], i, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
+                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
 
                             normaliseWeights<radius>(WSrc, WRefs, d->userWeights);
 

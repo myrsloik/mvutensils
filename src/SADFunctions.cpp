@@ -13,7 +13,10 @@
 #define zeroes _mm_setzero_si128()
 
 // This version used for width >= 16.
-template <unsigned width, unsigned height>
+// packedSrc: the source is a packed block (rows of exactly width pixels, the aligned copy the motion searches compare
+// against), which lets narrow blocks load two source rows at once and nSrcPitch go unused; otherwise its rows are
+// nSrcPitch apart.
+template <unsigned width, unsigned height, bool packedSrc>
 struct SADWrapperU8 {
     static_assert(width >= 16, "");
 
@@ -30,7 +33,7 @@ struct SADWrapperU8 {
                 sum = _mm_add_epi64(sum, diff);
             }
 
-            pSrc += /*nSrcPitch*/ width;
+            pSrc += packedSrc ? width : nSrcPitch;
             pRef += nRefPitch;
         }
 
@@ -42,18 +45,23 @@ struct SADWrapperU8 {
 };
 
 
-template <unsigned height>
-struct SADWrapperU8<2, height> {
+template <unsigned height, bool packedSrc>
+struct SADWrapperU8<2, height, packedSrc> {
     static_assert(height % 2 == 0, "");
 
     static unsigned int sad_u8_sse2(const uint8_t *pSrc, [[maybe_unused]] intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
         __m128i sum = zeroes;
 
-        // 2-wide: src is contiguous, so two rows are 4 adjacent bytes. Load each ref row as a
+        // 2-wide: a packed src has two rows in 4 adjacent bytes. Load each ref row as a
         // 2-byte value and interleave with unpacklo (same idea as SADWrapperU16<2, h>), then one
         // _mm_sad_epu8 per row pair (the unused upper bytes are zero, contributing nothing).
         for (unsigned y = 0; y < height; y += 2) {
-            __m128i m2 = _mm_cvtsi32_si128(*(const int *)(pSrc + y * 2));
+            __m128i m2;
+            if constexpr (packedSrc)
+                m2 = _mm_cvtsi32_si128(*(const int *)(pSrc + y * 2));
+            else
+                m2 = _mm_unpacklo_epi16(_mm_cvtsi32_si128(*(const uint16_t *)(pSrc + y * nSrcPitch)),
+                                        _mm_cvtsi32_si128(*(const uint16_t *)(pSrc + (y + 1) * nSrcPitch)));
             __m128i r0 = _mm_cvtsi32_si128(*(const uint16_t *)(pRef + y * nRefPitch));
             __m128i r1 = _mm_cvtsi32_si128(*(const uint16_t *)(pRef + (y + 1) * nRefPitch));
 
@@ -65,8 +73,8 @@ struct SADWrapperU8<2, height> {
 };
 
 
-template <unsigned height>
-struct SADWrapperU8<4, height> {
+template <unsigned height, bool packedSrc>
+struct SADWrapperU8<4, height, packedSrc> {
 
     static unsigned int sad_u8_sse2(const uint8_t *pSrc, [[maybe_unused]] intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
         __m128i sum = zeroes;
@@ -79,7 +87,7 @@ struct SADWrapperU8<4, height> {
 
             sum = _mm_add_epi64(sum, diff);
 
-            pSrc += /*nSrcPitch*/ 4;
+            pSrc += packedSrc ? 4 : nSrcPitch;
             pRef += nRefPitch;
         }
 
@@ -89,8 +97,8 @@ struct SADWrapperU8<4, height> {
 };
 
 
-template <unsigned height>
-struct SADWrapperU8<8, height> {
+template <unsigned height, bool packedSrc>
+struct SADWrapperU8<8, height, packedSrc> {
     static_assert(height == 1 || height % 2 == 0, "");
 
     static unsigned int sad_u8_sse2(const uint8_t *pSrc, [[maybe_unused]] intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
@@ -104,7 +112,12 @@ struct SADWrapperU8<8, height> {
         }
 
         for (int y = 0; (unsigned)y < height; y += 2) {
-            __m128i m2 = _mm_loadu_si128((const __m128i *)(pSrc + y * 8));
+            __m128i m2;
+            if constexpr (packedSrc)
+                m2 = _mm_loadu_si128((const __m128i *)(pSrc + y * 8));
+            else
+                m2 = _mm_castpd_si128(_mm_loadh_pd(_mm_castsi128_pd(_mm_loadl_epi64((const __m128i *)(pSrc + y * nSrcPitch))),
+                                                   (const double *)(pSrc + (y + 1) * nSrcPitch)));
             __m128i m3 = _mm_loadl_epi64((const __m128i *)(pRef + y * nRefPitch));
             m3 = _mm_castpd_si128(_mm_loadh_pd(_mm_castsi128_pd(m3), (const double *)(pRef + (y + 1) * nRefPitch)));
 
@@ -274,48 +287,32 @@ unsigned int sad_c(const uint8_t *pSrc8, intptr_t nSrcPitch, const uint8_t *pRef
 
 // SSE2 is baseline on x86-64 and an intrinsic wrapper exists for every block size, so on x86 the
 // SSE2 kernel takes the scalar version's place directly in the map (no instruction-set key, no
-// separate map). On non-x86 the same macro emits the scalar kernel.
+// separate map). On non-x86 the same macro emits the scalar kernel. sad_functions holds the kernels
+// that honour nSrcPitch, sad_functions_packed_src those that need a packed source block.
 #if defined(MVTOOLS_X86)
 #define SAD(width, height) \
-    { KEY(width, height, 8), SADWrapperU8<width, height>::sad_u8_sse2 }, \
+    { KEY(width, height, 8), SADWrapperU8<width, height, false>::sad_u8_sse2 }, \
     { KEY(width, height, 16), SADWrapperU16<width, height>::sad_u16_sse2 },
+#define SAD_PACKED_SRC(width, height) \
+    { KEY(width, height, 8), SADWrapperU8<width, height, true>::sad_u8_sse2 },
 #else
 #define SAD(width, height) \
     { KEY(width, height, 8), sad_c<width, height, uint8_t> }, \
     { KEY(width, height, 16), sad_c<width, height, uint16_t> },
 #endif
 
-static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
-    SAD(2, 2)
-    SAD(2, 4)
-    SAD(4, 2)
-    SAD(4, 4)
-    SAD(4, 8)
-    SAD(8, 1)
-    SAD(8, 2)
-    SAD(8, 4)
-    SAD(8, 8)
-    SAD(8, 16)
-    SAD(16, 1)
-    SAD(16, 2)
-    SAD(16, 4)
-    SAD(16, 8)
-    SAD(16, 16)
-    SAD(16, 32)
-    SAD(32, 8)
-    SAD(32, 16)
-    SAD(32, 32)
-    SAD(32, 64)
-    SAD(64, 16)
-    SAD(64, 32)
-    SAD(64, 64)
-    SAD(64, 128)
-    SAD(128, 32)
-    SAD(128, 64)
-    SAD(128, 128)
-});
+// Every block size with a kernel
+#define SAD_SIZES(X) \
+    X(2, 2) X(2, 4) X(4, 2) X(4, 4) X(4, 8) X(8, 1) X(8, 2) X(8, 4) X(8, 8) X(8, 16) \
+    X(16, 1) X(16, 2) X(16, 4) X(16, 8) X(16, 16) X(16, 32) X(32, 8) X(32, 16) X(32, 32) X(32, 64) \
+    X(64, 16) X(64, 32) X(64, 64) X(64, 128) X(128, 32) X(128, 64) X(128, 128)
 
-SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
+static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({ SAD_SIZES(SAD) });
+#if defined(MVTOOLS_X86)
+static constexpr auto sad_functions_packed_src = std::to_array<FunctionTableEntry<SADFunction>>({ SAD_SIZES(SAD_PACKED_SRC) });
+#endif
+
+static SADFunction selectSAD(unsigned width, unsigned height, unsigned bits, [[maybe_unused]] bool packedSrc) {
     // 32-bit float pixels: separate dispatch (auto-vec C baseline, overridden by the hand AVX2/AVX-512
     // kernels). The result is scaled to the 16-bit integer pixel range inside the kernel.
     if (bits == 32) {
@@ -323,9 +320,9 @@ SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
         selectSADFunctionFloat(width, height, sad);
 #if defined(MVTOOLS_X86)
         if (g_cpuinfo & MVU_CPU_AVX2)
-            selectSADFunctionAVX2(width, height, bits, sad);
+            selectSADFunctionAVX2(width, height, bits, sad, packedSrc);
         if (g_cpuinfo & MVU_CPU_AVX512_BASE)
-            selectSADFunctionAVX512(width, height, bits, sad);
+            selectSADFunctionAVX512(width, height, bits, sad, packedSrc);
 #endif
         return sad;
     }
@@ -333,18 +330,31 @@ SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
     SADFunction sad = findFunctionOrThrow(sad_functions, KEY(width, height, bits));
 
 #if defined(MVTOOLS_X86)
+    if (packedSrc)
+        if (SADFunction fn = findFunction(sad_functions_packed_src, KEY(width, height, bits)))
+            sad = fn;
     if (g_cpuinfo & MVU_CPU_AVX2)
-        selectSADFunctionAVX2(width, height, bits, sad);
+        selectSADFunctionAVX2(width, height, bits, sad, packedSrc);
     if (g_cpuinfo & MVU_CPU_AVX512_BASE)
-        selectSADFunctionAVX512(width, height, bits, sad);
+        selectSADFunctionAVX512(width, height, bits, sad, packedSrc);
     if (g_cpuinfo & MVU_CPU_AVX512VNNI)
-        selectSADFunctionAVX512VNNI(width, height, bits, sad); // 16-bit only, beats the base kernel at W 8-64
+        selectSADFunctionAVX512VNNI(width, height, bits, sad, packedSrc); // 16-bit only, beats the base kernel at W 8-64
 #endif
 
     return sad;
 }
 
+SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits) {
+    return selectSAD(width, height, bits, true);
+}
+
+SADFunction selectSADFunctionAnySource(unsigned width, unsigned height, unsigned bits) {
+    return selectSAD(width, height, bits, false);
+}
+
 #undef SAD
+#undef SAD_PACKED_SRC
+#undef SAD_SIZES
 
 
 

@@ -160,11 +160,11 @@ static inline uint16_t DegrainWeight(int64_t thSAD, int64_t blockSAD) noexcept {
 }
 
 template<typename PixelType>
-static inline void useBlock(const uint8_t *&p, uint16_t &WRef, int isUsable, const std::optional<MotionBlockPyramid> &blocks, int i, const FramePyramidLevel *pPlane, const uint8_t **pSrcCur, int xx, int nLogPel, int plane, int xSubUV, int ySubUV, const int64_t *thSAD) noexcept {
+static inline void useBlock(const uint8_t *&p, uint16_t &WRef, int isUsable, const std::optional<MotionBlockPyramid> &blocks, int bx, int by, const FramePyramidLevel *pPlane, const uint8_t **pSrcCur, int xx, int nLogPel, int plane, int xSubUV, int ySubUV, const int64_t *thSAD) noexcept {
     // Resolves only the block pointer and its weight; the row stride is the centre's, shared by every reference
     // (see DenoiseFunction), so the kernel steps them all with nSrcPitch.
     if (isUsable) {
-        const BlockData block = blocks->GetBlock(i);
+        const BlockData block = blocks->GetBlock(bx, by);
         int blx = (block.x << nLogPel) + block.vector.x;
         int bly = (block.y << nLogPel) + block.vector.y;
         p = pPlane->planes[plane].GetPointer<PixelType>(plane ? blx >> xSubUV : blx, plane ? bly >> ySubUV : bly);

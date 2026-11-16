@@ -17,16 +17,18 @@
 // Everything else falls back to the AVX2 / SSE2 path via selectSAD/SATDFunction.
 
 // ===================== SAD =====================
+// Every kernel here honours nSrcPitch, so there's no table of kernels that need a packed source block. For 8-bit that
+// costs nothing on a packed source, and reading a block in place it beats the AVX2 kernel (~7% at 64x64).
 template <unsigned W, unsigned H>
 struct SADWrapperU8_AVX512 {
     static_assert(W >= 64 && W % 64 == 0, "");
-    static unsigned int sad_u8_avx512(const uint8_t *pSrc, [[maybe_unused]] intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
+    static unsigned int sad_u8_avx512(const uint8_t *pSrc, intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
         __m512i s0 = _mm512_setzero_si512(), s1 = _mm512_setzero_si512();
         for (unsigned y = 0; y < H; y++) {
             s0 = _mm512_add_epi64(s0, _mm512_sad_epu8(_mm512_loadu_si512(pSrc), _mm512_loadu_si512(pRef)));
             for (unsigned x = 64; x < W; x += 64)
                 s1 = _mm512_add_epi64(s1, _mm512_sad_epu8(_mm512_loadu_si512(pSrc + x), _mm512_loadu_si512(pRef + x)));
-            pSrc += W;
+            pSrc += nSrcPitch;
             pRef += nRefPitch;
         }
         return (unsigned)_mm512_reduce_add_epi64(_mm512_add_epi64(s0, s1));
@@ -273,7 +275,7 @@ static constexpr auto satd_functions = std::to_array<FunctionTableEntry<SADFunct
     SATD_U16_AVX512(64, 32) SATD_U16_AVX512(64, 64) SATD_U16_AVX512(128, 64) SATD_U16_AVX512(128, 128)
 });
 
-void selectSADFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
+void selectSADFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &sad, [[maybe_unused]] bool packedSrc) {
     if (SADFunction fn = findFunction(sad_functions, KEY(width, height, bits)))
         sad = fn;
 }
@@ -288,7 +290,7 @@ static constexpr auto sad_vnni_functions = std::to_array<FunctionTableEntry<SADF
     SAD_U16_AVX512_VNNI(64, 16) SAD_U16_AVX512_VNNI(64, 32) SAD_U16_AVX512_VNNI(64, 64) SAD_U16_AVX512_VNNI(64, 128)
 });
 
-void selectSADFunctionAVX512VNNI(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
+void selectSADFunctionAVX512VNNI(unsigned width, unsigned height, unsigned bits, SADFunction &sad, [[maybe_unused]] bool packedSrc) {
     if (bits != 16)
         return;
     if (SADFunction fn = findFunction(sad_vnni_functions, KEY(width, height, bits)))

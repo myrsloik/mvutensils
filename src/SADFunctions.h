@@ -26,7 +26,12 @@ using SADFunction = unsigned int (*)(const uint8_t *pSrc, intptr_t nSrcPitch,
                                      const uint8_t *pRef, intptr_t nRefPitch) noexcept;
 
 
+// For a packed source block (rows of exactly width pixels: the aligned copy the motion searches compare every candidate
+// against). The kernel may need that: some load several source rows at once and ignore nSrcPitch.
 SADFunction selectSADFunction(unsigned width, unsigned height, unsigned bits);
+
+// Only kernels that honour nSrcPitch, for a block read where it is in its frame.
+SADFunction selectSADFunctionAnySource(unsigned width, unsigned height, unsigned bits);
 
 SADFunction selectSATDFunction(unsigned width, unsigned height, unsigned bits);
 
@@ -38,12 +43,14 @@ void selectSATDFunctionFloat(unsigned width, unsigned height, SADFunction &satd)
 
 
 #if defined(MVTOOLS_X86)
-// Higher-ISA selectors overwrite sad/satd only when a kernel exists for the given size.
-void selectSADFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &sad);
+// Higher-ISA selectors overwrite sad/satd only when a kernel exists for the given size. Each instruction set registers
+// its SAD kernels in two tables, those that honour nSrcPitch and those that need a packed source block; only packedSrc
+// allows the second.
+void selectSADFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &sad, bool packedSrc = true);
 void selectSATDFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &satd);
-void selectSADFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &sad);
+void selectSADFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &sad, bool packedSrc = true);
 void selectSATDFunctionAVX512(unsigned width, unsigned height, unsigned bits, SADFunction &satd);
 // AVX-512 VNNI 16-bit SAD (vpdpwssd bias trick). Full-16-bit correct; only the sizes where it beats
 // the plain AVX-512 kernel (widths 8-64, not 128/4, height >= 8) are registered.
-void selectSADFunctionAVX512VNNI(unsigned width, unsigned height, unsigned bits, SADFunction &sad);
+void selectSADFunctionAVX512VNNI(unsigned width, unsigned height, unsigned bits, SADFunction &sad, bool packedSrc = true);
 #endif

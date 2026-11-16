@@ -8,6 +8,26 @@
 #include "Common.h"
 #include "CPU.h"
 
+// FlowBlur divides by each moving pixel's small tap counts: precomputed divisors for 1..kFlowBlurTapDivisors. Like the
+// prec divisor, the table is built in FlowBlur.cpp, which is compiled for the baseline ISA (see InvariantDivisor).
+constexpr int kFlowBlurTapDivisors = 512;
+const InvariantDivisor *FlowBlurTapDivisors() noexcept;
+
+// n / d for d >= 1
+static MVU_FORCE_INLINE int DivideByTaps(const InvariantDivisor *divisors, int n, int d) noexcept {
+    return d <= kFlowBlurTapDivisors ? divisors[d].Divide(n) : n / d;
+}
+
+// The average of d summed pixels; an integer sum of at most kFlowBlurTapDivisors 16-bit pixels fits an int
+template <typename T>
+static MVU_FORCE_INLINE T DivideTapSum(const InvariantDivisor *divisors, T sum, int d) noexcept {
+    if constexpr (std::is_integral_v<T>) {
+        if (d <= kFlowBlurTapDivisors)
+            return divisors[d].Divide(static_cast<int>(sum));
+    }
+    return sum / d;
+}
+
 #if defined(MVTOOLS_X86)
 // AVX-512 gather kernels (FlowShared_AVX512.cpp). See that file for the subpel-gather addressing and
 // the documented <= 3-byte tail over-read of the pPlane[0] allocation.
@@ -42,18 +62,19 @@ void FlowFetch_avx512_f32(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane
 // FlowBlur per-pixel tap-gather (FlowShared_AVX512.cpp): the mF+mB motion-blur taps of one output pixel
 // are dense-packed and gathered in up to four 8-wide masked vpgatherdd chunks, then horizontally summed.
 // u8/u16 only (float keeps the scalar's in-order double accumulation). Bit-exact with FlowBlur_scalar.
+// precDiv divides by prec.
 void FlowBlur_avx512_u8(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
     const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept;
+    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept;
 void FlowBlur_avx512_u16(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
     const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept;
+    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept;
 // Float gather variant: tap values gathered as float32, summed in double (reordered vs the scalar walk).
 // For normal pixel ranges the double sum is order-independent-exact, so it matches FlowBlur_scalar<float>
 // bit-for-bit (measured 0 error); only extreme magnitudes could differ sub-ULP (build-variant-dependent).
 void FlowBlur_avx512_f32(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
     const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept;
+    ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept;
 
 // AVX2 gather kernels (FlowShared_AVX2.cpp): 8 px/iter, same addressing/limits as the AVX-512 ones.
 void FlowInter_avx2_u8(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &prefB, const PyramidPlane &prefF,

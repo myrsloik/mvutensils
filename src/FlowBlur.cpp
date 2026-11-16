@@ -17,6 +17,7 @@
 // Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
 // http://www.gnu.org/copyleft/gpl.html .
 
+#include <array>
 #include <cstdint>
 #include <algorithm>
 #include <stdexcept>
@@ -38,6 +39,7 @@ struct FlowBlurData {
     VSNode *mvfw = nullptr;
 
     int prec;
+    InvariantDivisor precDiv;
     int64_t thscd1;
     float thscd2;
 
@@ -68,13 +70,14 @@ struct FlowBlurData {
 template<typename PixelType>
 static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, const PyramidPlane &pref,
                          const uint16_t * MVU_RESTRICT VXFullB, const uint16_t *MVU_RESTRICT VXFullF, const uint16_t *MVU_RESTRICT VYFullB, const uint16_t *MVU_RESTRICT VYFullF,
-                         ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
+                         ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
     PixelType *pdst = (PixelType *)pdst8;
 
     dst_pitch /= sizeof(PixelType);
     tilePitch /= sizeof(int16_t);
     int nPelLog = ilog2(pref.nPel);
     const int64_t thresh = 256LL * prec; // max(|vx0|,|vy0|) < thresh  <=>  m == 0 (no taps; centre pixel only)
+    const InvariantDivisor *divisors = FlowBlurTapDivisors();
 
     /* very slow, but precise motion blur */
     for (int h = 0; h < height; h++) {
@@ -100,10 +103,10 @@ static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, c
             }
             int xBase = (w + dstX) << nPelLog;
             std::conditional_t<std::is_integral_v<PixelType>, int64_t, double> blurredsum = prefPtr[w];
-            int mF = (aF / prec) >> 8;
+            int mF = precDiv.Divide(aF) >> 8;
             if (mF > 0) {
-                vxF0 /= mF;
-                vyF0 /= mF;
+                vxF0 = DivideByTaps(divisors, vxF0, mF);
+                vyF0 = DivideByTaps(divisors, vyF0, mF);
                 int vxF = vxF0;
                 int vyF = vyF0;
                 for (int i = 0; i < mF; i++) {
@@ -112,10 +115,10 @@ static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, c
                     vyF += vyF0;
                 }
             }
-            int mB = (aB / prec) >> 8;
+            int mB = precDiv.Divide(aB) >> 8;
             if (mB > 0) {
-                vxB0 /= mB;
-                vyB0 /= mB;
+                vxB0 = DivideByTaps(divisors, vxB0, mB);
+                vyB0 = DivideByTaps(divisors, vyB0, mB);
                 int vxB = vxB0;
                 int vyB = vyB0;
                 for (int i = 0; i < mB; i++) {
@@ -124,7 +127,7 @@ static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, c
                     vyB += vyB0;
                 }
             }
-            pdst[w] = static_cast<PixelType>(blurredsum / (mF + mB + 1));
+            pdst[w] = static_cast<PixelType>(DivideTapSum(divisors, blurredsum, mF + mB + 1));
         }
         pdst += dst_pitch;
         VXFullB += tilePitch;
@@ -134,6 +137,16 @@ static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, c
     }
 }
 
+const InvariantDivisor *FlowBlurTapDivisors() noexcept {
+    static const auto table = [] {
+        std::array<InvariantDivisor, kFlowBlurTapDivisors + 1> t;
+        for (int d = 1; d <= kFlowBlurTapDivisors; d++)
+            t[d] = InvariantDivisor(d);
+        return t;
+    }();
+    return table.data();
+}
+
 // Dispatch: per-pixel AVX-512 tap-gather when the int32 gather offsets fit, else the scalar walk.
 // u8/u16 are bit-exact with the scalar across all build variants. The float gather reorders the double
 // sum but matches scalar float bit-for-bit for normal pixel ranges (measured 0 error); only pathological
@@ -141,19 +154,19 @@ static void FlowBlur_scalar(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, c
 template<typename PixelType>
 static MVU_FORCE_INLINE void FlowBlur(uint8_t * MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, const PyramidPlane &pref,
                          const uint16_t * MVU_RESTRICT VXFullB, const uint16_t *MVU_RESTRICT VXFullF, const uint16_t *MVU_RESTRICT VYFullB, const uint16_t *MVU_RESTRICT VYFullF,
-                         ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
+                         ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
 #if defined(MVTOOLS_X86)
     if (FlowGatherFits(pref) && (g_cpuinfo & MVU_CPU_AVX512_BASE)) {
         if constexpr (sizeof(PixelType) == 1)
-            FlowBlur_avx512_u8(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+            FlowBlur_avx512_u8(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
         else if constexpr (sizeof(PixelType) == 2)
-            FlowBlur_avx512_u16(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+            FlowBlur_avx512_u16(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
         else
-            FlowBlur_avx512_f32(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+            FlowBlur_avx512_f32(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
         return;
     }
 #endif
-    FlowBlur_scalar<PixelType>(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+    FlowBlur_scalar<PixelType>(pdst8, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
 }
 
 template<typename PixelType>
@@ -205,7 +218,7 @@ static const VSFrame *VS_CC flowblurGetFrame(int n, int activationReason, void *
 
                     FlowBlur<PixelType>(dstPtrY + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideY, dstStrideY, refGOF.GetLevel(0).planes[0],
                              dstTileVXBw.get(), dstTileVXFw.get(), dstTileVYBw.get(), dstTileVYFw.get(), MaskResizer::GetTileBufferStride(),
-                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec);
+                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec, d->precDiv);
                 }
 
                 if (d->vi->format.numPlanes == 3) {
@@ -222,10 +235,10 @@ static const VSFrame *VS_CC flowblurGetFrame(int n, int activationReason, void *
 
                         FlowBlur<PixelType>(dstPtrU + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideU, dstStrideU, refGOF.GetLevel(0).planes[1],
                              dstTileVXBw.get(), dstTileVXFw.get(), dstTileVYBw.get(), dstTileVYFw.get(), MaskResizer::GetTileBufferStride(),
-                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec);
+                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec, d->precDiv);
                         FlowBlur<PixelType>(dstPtrV + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideV, dstStrideV, refGOF.GetLevel(0).planes[2],
                              dstTileVXBw.get(), dstTileVXFw.get(), dstTileVYBw.get(), dstTileVYFw.get(), MaskResizer::GetTileBufferStride(),
-                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec);
+                             tile.dstX, tile.dstY, tile.dstWidth, tile.dstHeight, d->blur256, d->prec, d->precDiv);
                     }
                 }
 
@@ -276,6 +289,7 @@ static void VS_CC flowblurCreate(const VSMap *in, VSMap *out, [[maybe_unused]] v
 
         if (d->prec < 1)
             throw std::runtime_error("prec must be at least 1");
+        d->precDiv = InvariantDivisor(d->prec);
 
         d->blur256 = (int)(blur * 256.0f / 200.0f);
 

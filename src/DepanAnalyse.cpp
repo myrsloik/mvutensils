@@ -201,7 +201,7 @@ static const VSFrame *VS_CC depanAnalyseGetFrame(int n, int activationReason, vo
                 for (int j = 0; j < vectors.nBlkY; j++) {
                     for (int i = 0; i < vectors.nBlkX; i++) {
                         int nb = j * vectors.nBlkX + i;
-                        const auto fbd = vectors.GetBlock(nb);
+                        const auto fbd = vectors.GetBlock(i, j);
                         blockDx[nb] = fbd.vector.x * dPel;
                         blockDy[nb] = fbd.vector.y * dPel;
                         blockSAD[nb] = fbd.vector.sad;

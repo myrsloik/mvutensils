@@ -16,12 +16,13 @@ static unsigned int sad_f32_avx2(const uint8_t *s, intptr_t sp, const uint8_t *r
 }
 
 
-// This version used for width >= 32.
+// This version used for width >= 32. Honouring nSrcPitch costs nothing on a packed source, and reading a block in place
+// it beats the SSE2 kernel (~12% at 32x32).
 template <unsigned width, unsigned height>
 struct SADWrapperU8_AVX2 {
     static_assert(width >= 32 && height % 2 == 0, "");
 
-    static unsigned int sad_u8_avx2(const uint8_t *pSrc, [[maybe_unused]] intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
+    static unsigned int sad_u8_avx2(const uint8_t *pSrc, intptr_t nSrcPitch, const uint8_t *pRef, intptr_t nRefPitch) noexcept {
         // Two accumulators (even/odd rows) -> two independent _mm256_add_epi64 chains. vpsadbw is the
         // bottleneck for most sizes (so this is neutral there), but for the largest blocks the single
         // accumulator's loop-carried add chain dominates; splitting it is ~22% faster at 128x128 and
@@ -33,11 +34,11 @@ struct SADWrapperU8_AVX2 {
             for (unsigned x = 0; x < width; x += 32) {
                 sum0 = _mm256_add_epi64(sum0, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)&pSrc[x]),
                                                               _mm256_loadu_si256((const __m256i *)&pRef[x])));
-                sum1 = _mm256_add_epi64(sum1, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)&pSrc[width + x]),
+                sum1 = _mm256_add_epi64(sum1, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)&pSrc[nSrcPitch + x]),
                                                               _mm256_loadu_si256((const __m256i *)&pRef[nRefPitch + x])));
             }
 
-            pSrc += /*nSrcPitch*/ 2 * width;
+            pSrc += 2 * nSrcPitch;
             pRef += 2 * nRefPitch;
         }
 
@@ -49,6 +50,8 @@ struct SADWrapperU8_AVX2 {
 
 };
 
+// 16-wide: one load takes two rows of a packed source block, so this needs one (rows of exactly 16 pixels) and ignores
+// nSrcPitch. Loading two rows of a block in place, as for the reference, lost to the SSE2 kernel.
 template <unsigned height>
 struct SADWrapperU8_AVX2<16, height> {
     static_assert(height >= 2, "");
@@ -112,7 +115,7 @@ struct SADWrapperU16_AVX2 {
 
 #define KEY(width, height, bits) (unsigned)(width) << 24 | (height) << 16 | (bits) << 8
 
-// This AVX2 map is private to this TU and only queried via selectSADFunctionAVX2, which overwrites
+// These AVX2 maps are private to this TU and only queried via selectSADFunctionAVX2, which overwrites
 // the caller's function pointer when a kernel exists for the requested size.
 #define SAD_U8_AVX2(width, height) \
     { KEY(width, height, 8), SADWrapperU8_AVX2<width, height>::sad_u8_avx2 },
@@ -121,12 +124,18 @@ struct SADWrapperU16_AVX2 {
 #define SAD_F32_AVX2(width, height) \
     { KEY(width, height, 32), sad_f32_avx2<width, height> },
 
-static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
+// The kernels that need a packed source block
+static constexpr auto sad_functions_packed_src = std::to_array<FunctionTableEntry<SADFunction>>({
     SAD_U8_AVX2(16, 2)
     SAD_U8_AVX2(16, 4)
     SAD_U8_AVX2(16, 8)
     SAD_U8_AVX2(16, 16)
     SAD_U8_AVX2(16, 32)
+});
+
+// The kernels that honour nSrcPitch
+static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFunction>>({
+    // 8-bit: width >= 32 (16-wide needs a packed source)
     SAD_U8_AVX2(32, 8)
     SAD_U8_AVX2(32, 16)
     SAD_U8_AVX2(32, 32)
@@ -164,9 +173,12 @@ static constexpr auto sad_functions = std::to_array<FunctionTableEntry<SADFuncti
     SAD_F32_AVX2(128, 32) SAD_F32_AVX2(128, 64) SAD_F32_AVX2(128, 128)
 });
 
-void selectSADFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &sad) {
+void selectSADFunctionAVX2(unsigned width, unsigned height, unsigned bits, SADFunction &sad, bool packedSrc) {
     if (SADFunction fn = findFunction(sad_functions, KEY(width, height, bits)))
         sad = fn;
+    if (packedSrc)
+        if (SADFunction fn = findFunction(sad_functions_packed_src, KEY(width, height, bits)))
+            sad = fn;
 }
 
 

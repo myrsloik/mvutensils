@@ -313,7 +313,7 @@ void FlowFetch_avx512_f32(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane
 template <int S>
 static void flowblur_impl(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, const PyramidPlane &pref,
         const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
+        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
     using PT = typename std::conditional<S == 1, uint8_t, uint16_t>::type;
     constexpr int FB_LO = 2;    // below this the gather + horizontal-add overhead loses to the scalar walk
     constexpr int FB_CAP = 128; // up to 16 8-wide chunks gathered before the (rare) >128-tap scalar remainder
@@ -322,6 +322,7 @@ static void flowblur_impl(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, cons
     tilePitch /= sizeof(int16_t);
     const int nPelLog = ilog2(pref.nPel);
     const int64_t thresh = 256LL * prec;
+    const InvariantDivisor *divisors = FlowBlurTapDivisors();
     const __m256i laneId = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
 
     for (int h = 0; h < height; h++) {
@@ -337,17 +338,17 @@ static void flowblur_impl(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, cons
             int aB = std::max(vxB0 < 0 ? -vxB0 : vxB0, vyB0 < 0 ? -vyB0 : vyB0);
             if (aF < thresh && aB < thresh) { pdst[w] = prefPtr[w]; continue; } // static: centre only
             int xBase = (w + dstX) << nPelLog;
-            int mF = (aF / prec) >> 8;
-            int mB = (aB / prec) >> 8;
-            int vxFd = mF > 0 ? vxF0 / mF : 0, vyFd = mF > 0 ? vyF0 / mF : 0;
-            int vxBd = mB > 0 ? vxB0 / mB : 0, vyBd = mB > 0 ? vyB0 / mB : 0;
+            int mF = precDiv.Divide(aF) >> 8;
+            int mB = precDiv.Divide(aB) >> 8;
+            int vxFd = mF > 0 ? DivideByTaps(divisors, vxF0, mF) : 0, vyFd = mF > 0 ? DivideByTaps(divisors, vyF0, mF) : 0;
+            int vxBd = mB > 0 ? DivideByTaps(divisors, vxB0, mB) : 0, vyBd = mB > 0 ? DivideByTaps(divisors, vyB0, mB) : 0;
             int T = mF + mB;
 
             if (T < FB_LO) { // scalar walk: too few taps to amortise the gather + horizontal add
                 int64_t s = prefPtr[w];
                 int vxF = vxFd, vyF = vyFd; for (int i = 0; i < mF; i++) { s += *(const PT *)pref.GetPointer<PT>((vxF >> 8) + xBase, (vyF >> 8) + yBase); vxF += vxFd; vyF += vyFd; }
                 int vxB = vxBd, vyB = vyBd; for (int i = 0; i < mB; i++) { s += *(const PT *)pref.GetPointer<PT>((vxB >> 8) + xBase, (vyB >> 8) + yBase); vxB += vxBd; vyB += vyBd; }
-                pdst[w] = (PT)(s / (mF + mB + 1));
+                pdst[w] = (PT)DivideTapSum(divisors, s, mF + mB + 1);
                 continue;
             }
 
@@ -374,7 +375,7 @@ static void flowblur_impl(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, cons
                 int sx = back ? vxBd : vxFd, sy = back ? vyBd : vyFd, ti = back ? p + 1 : p - mB + 1;
                 s += *(const PT *)pref.GetPointer<PT>(((ti * sx) >> 8) + xBase, ((ti * sy) >> 8) + yBase);
             }
-            pdst[w] = (PT)(s / (mF + mB + 1));
+            pdst[w] = (PT)DivideTapSum(divisors, s, mF + mB + 1);
         }
         pdst += dst_pitch; VXFullB += tilePitch; VYFullB += tilePitch; VXFullF += tilePitch; VYFullF += tilePitch;
     }
@@ -382,13 +383,13 @@ static void flowblur_impl(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, cons
 
 void FlowBlur_avx512_u8(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
         const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
-    flowblur_impl<1>(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
+    flowblur_impl<1>(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
 }
 void FlowBlur_avx512_u16(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
         const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
-    flowblur_impl<2>(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
+    flowblur_impl<2>(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
 }
 
 // Float (32-bit pixel) variant of the FlowBlur split. The motion maths (mF, mB, steps, tap indices,
@@ -402,13 +403,14 @@ void FlowBlur_avx512_u16(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane 
 // vpgatherdd has NO tail over-read (unlike the u8/u16 paths).
 static void flowblur_impl_f32(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, const PyramidPlane &pref,
         const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
+        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
     constexpr int FB_LO = 2, FB_CAP = 128; // gather every tap up to 128; no upper gate (see flowblur_impl)
     float *pdst = (float *)pdst8;
     dst_pitch /= sizeof(float);
     tilePitch /= sizeof(int16_t);
     const int nPelLog = ilog2(pref.nPel);
     const int64_t thresh = 256LL * prec;
+    const InvariantDivisor *divisors = FlowBlurTapDivisors();
     const __m256i laneId = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
 
     for (int h = 0; h < height; h++) {
@@ -423,10 +425,10 @@ static void flowblur_impl_f32(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, 
             int aB = std::max(vxB0 < 0 ? -vxB0 : vxB0, vyB0 < 0 ? -vyB0 : vyB0);
             if (aF < thresh && aB < thresh) { pdst[w] = prefPtr[w]; continue; } // static: centre only
             int xBase = (w + dstX) << nPelLog;
-            int mF = (aF / prec) >> 8;
-            int mB = (aB / prec) >> 8;
-            int vxFd = mF > 0 ? vxF0 / mF : 0, vyFd = mF > 0 ? vyF0 / mF : 0;
-            int vxBd = mB > 0 ? vxB0 / mB : 0, vyBd = mB > 0 ? vyB0 / mB : 0;
+            int mF = precDiv.Divide(aF) >> 8;
+            int mB = precDiv.Divide(aB) >> 8;
+            int vxFd = mF > 0 ? DivideByTaps(divisors, vxF0, mF) : 0, vyFd = mF > 0 ? DivideByTaps(divisors, vyF0, mF) : 0;
+            int vxBd = mB > 0 ? DivideByTaps(divisors, vxB0, mB) : 0, vyBd = mB > 0 ? DivideByTaps(divisors, vyB0, mB) : 0;
             int T = mF + mB;
 
             if (T < FB_LO) { // scalar walk (double accumulation, matches FlowBlur_scalar<float>)
@@ -471,8 +473,8 @@ static void flowblur_impl_f32(uint8_t *MVU_RESTRICT pdst8, ptrdiff_t dst_pitch, 
 
 void FlowBlur_avx512_f32(uint8_t *pdst, ptrdiff_t dst_pitch, const PyramidPlane &pref,
         const uint16_t *VXFullB, const uint16_t *VXFullF, const uint16_t *VYFullB, const uint16_t *VYFullF,
-        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec) noexcept {
-    flowblur_impl_f32(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec);
+        ptrdiff_t tilePitch, int dstX, int dstY, int width, int height, int blur256, int prec, const InvariantDivisor &precDiv) noexcept {
+    flowblur_impl_f32(pdst, dst_pitch, pref, VXFullB, VXFullF, VYFullB, VYFullF, tilePitch, dstX, dstY, width, height, blur256, prec, precDiv);
 }
 
 #endif // MVTOOLS_X86

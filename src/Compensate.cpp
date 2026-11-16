@@ -156,8 +156,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
                         int xx[3] = {};
 
                         for (int bx = 0; bx < nBlkX; bx++) {
-                            int i = by * nBlkX + bx;
-                            const BlockData block = vectors.GetBlock(i);
+                            const BlockData block = vectors.GetBlock(bx, by);
 
                             int blx[3], bly[3];
 
@@ -218,8 +217,7 @@ static const VSFrame *VS_CC compensateGetFrame(int n, int activationReason, void
                             if (chroma)
                                 winOver[1] = winOver[2] = d->OverWinsUV.GetWindow(wby + wbx);
 
-                            int i = by * nBlkX + bx;
-                            const BlockData block = vectors.GetBlock(i);
+                            const BlockData block = vectors.GetBlock(bx, by);
 
                             int blx[3], bly[3];
 

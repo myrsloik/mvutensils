@@ -318,7 +318,9 @@ public:
         int64_t thSAD, bool useSatd, bool smooth, bool meander, int deltaFrame);
 
     [[nodiscard]] bool IsUsable(int64_t thscd1, float thscd2) const noexcept;
-    [[nodiscard]] BlockData GetBlock(int nBlk) const noexcept;
+    [[nodiscard]] BlockData GetBlock(int bx, int by) const noexcept {
+        return { bx * (nBlkSizeX - nOverlapX), by * (nBlkSizeY - nOverlapY), pyramidLevels[0].vectors[by * nBlkX + bx] };
+    }
     [[nodiscard]] double GetThSCDScaleFactor(int bitsPerSample) const;
     void ScaleThSCD(int64_t &thscd1, float &thscd2, int bitsPerSample) const;
     [[nodiscard]] State GetState() const noexcept;
