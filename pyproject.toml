@@ -7,7 +7,7 @@ name = "vapoursynth-mvutensils"
 description = "Motion estimation and denoising filter for VapourSynth"
 readme = "readme.md"
 requires-python = ">=3.12"
-license = "GPL-2.0"
+license = "GPL-2.0-or-later"
 license-files = ["LICENSE"]
 keywords = ["video", "motion estimation", "denoising"]
 classifiers = [

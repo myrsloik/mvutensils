@@ -1,7 +1,7 @@
 // Create an overlay mask with the motion vectors
 // Author: Manao
 // Copyright(c)2006 A.G.Balakhnin aka Fizick - YUY2, occlusion
-// See legal notice in Copying.txt for more information
+// See legal notice in LICENSE for more information
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by

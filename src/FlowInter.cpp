@@ -1,6 +1,6 @@
 // Make a motion compensate temporal denoiser
 // Copyright(c)2006 A.G.Balakhnin aka Fizick
-// See legal notice in Copying.txt for more information
+// See legal notice in LICENSE for more information
 
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by

@@ -2,7 +2,7 @@
 
 // Functions that computes distances between blocks
 
-// See legal notice in Copying.txt for more information
+// See legal notice in LICENSE for more information
 
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
