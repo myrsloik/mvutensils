@@ -1985,23 +1985,31 @@ std::unique_ptr<SmallVectorMasks> MotionBlockPyramid::MakeSmallVectorMasks() con
     return masks;
 }
 
+// The vectors scaled to the chroma planes, rounded toward zero so positive and negative vectors are treated alike
+// (a shift alone rounds negative ones down, so they get divisor - 1 added first)
 void SmallVectorMasks::AdjustSmallVectorMaskSubSampling(int nBlkX, int nBlkY, int subSamplingW, int subSamplingH) noexcept {
     ptrdiff_t pitch = pitchVSmallY / sizeof(uint16_t);
 
     if (subSamplingW > 0) {
+        const int round = (1 << subSamplingW) - 1;
         uint16_t *cVXSmallY = VXSmallY;
         for (int by = 0; by < nBlkY; by++) {
-            for (int bx = 0; bx < nBlkX; bx++)
-                cVXSmallY[bx] = ((static_cast<int>(cVXSmallY[bx]) - (1 << 15)) >> subSamplingW) + (1 << 15);
+            for (int bx = 0; bx < nBlkX; bx++) {
+                const int v = static_cast<int>(cVXSmallY[bx]) - (1 << 15);
+                cVXSmallY[bx] = ((v < 0 ? v + round : v) >> subSamplingW) + (1 << 15);
+            }
             cVXSmallY += pitch;
         }
     }
 
     if (subSamplingH > 0) {
+        const int round = (1 << subSamplingH) - 1;
         uint16_t *cVYSmallY = VYSmallY;
         for (int by = 0; by < nBlkY; by++) {
-            for (int bx = 0; bx < nBlkX; bx++)
-                cVYSmallY[bx] = ((static_cast<int>(cVYSmallY[bx]) - (1 << 15)) >> subSamplingH) + (1 << 15);
+            for (int bx = 0; bx < nBlkX; bx++) {
+                const int v = static_cast<int>(cVYSmallY[bx]) - (1 << 15);
+                cVYSmallY[bx] = ((v < 0 ? v + round : v) >> subSamplingH) + (1 << 15);
+            }
             cVYSmallY += pitch;
         }
     }

@@ -48,11 +48,11 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;C:\Libraries\mvutensils\zimg\src\zimg\api;$(IncludePath)</IncludePath>
+    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;$(IncludePath)</IncludePath>
     <LibraryPath>C:\libraries\mvutensils\msvc\x64\Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;C:\Libraries\mvutensils\zimg\src\zimg\api;$(IncludePath)</IncludePath>
+    <IncludePath>C:\vapoursynth-portable\Lib\site-packages\vapoursynth\include;$(IncludePath)</IncludePath>
     <LibraryPath>C:\libraries\mvutensils\msvc\x64\Release;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -68,7 +68,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>z.lib;fftw3f.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fftw3f.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -90,7 +90,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>z.lib;fftw3f.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fftw3f.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>

@@ -108,8 +108,6 @@ static const VSFrame *VS_CC flowinterGetFrame(int n, int activationReason, void 
                 auto MaskSmallB = vectorsB.MakeVectorOcclusionMask<uint16_t>(d->ml, 1.0f, (256 - d->time256), true);
                 auto MaskSmallF = vectorsF.MakeVectorOcclusionMask<uint16_t>(d->ml, 1.0f, d->time256, true);
 
-                auto tmp = MaskResizer::GetTmpBuffer(std::max(d->maskResizerFull.tmpSize, d->maskResizerSubSampled.tmpSize));
-
                 auto [dstTileMaskF, dstTileMaskB, dstTileXF, dstTileYF, dstTileXB, dstTileYB] = MaskResizer::GetTileBuffers<6>();
 
                 auto bufMaskF = MaskResizer::MakeBufferPair(MaskSmallF->mask, MaskSmallF->stride, dstTileMaskF.get());
@@ -139,8 +137,7 @@ static const VSFrame *VS_CC flowinterGetFrame(int n, int activationReason, void 
                     uint8_t *dstPtrY = vsapi->getWritePtr(dst, 0);
 
                     for (auto &tile : d->maskResizerFull.tiles) {
-                        tile.Process(tmp.get(),
-                             bufMaskF, bufMaskB,
+                        tile.Process(bufMaskF, bufMaskB,
                              bufSmallFX, bufSmallFY, bufSmallBX, bufSmallBY,
                              bufSmallFFX, bufSmallFFY, bufSmallBBX, bufSmallBBY);
 
@@ -164,8 +161,7 @@ static const VSFrame *VS_CC flowinterGetFrame(int n, int activationReason, void 
                         uint8_t *dstPtrV = vsapi->getWritePtr(dst, 2);
 
                         for (auto &tile : (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0) ? d->maskResizerSubSampled.tiles : d->maskResizerFull.tiles) {
-                            tile.Process(tmp.get(),
-                                 bufMaskF, bufMaskB,
+                            tile.Process(bufMaskF, bufMaskB,
                                  bufSmallFX, bufSmallFY, bufSmallBX, bufSmallBY,
                                  bufSmallFFX, bufSmallFFY, bufSmallBBX, bufSmallBBY);
 
@@ -189,8 +185,7 @@ static const VSFrame *VS_CC flowinterGetFrame(int n, int activationReason, void 
                     uint8_t *dstPtrY = vsapi->getWritePtr(dst, 0);
 
                     for (auto &tile : d->maskResizerFull.tiles) {
-                        tile.Process(tmp.get(),
-                             bufMaskF, bufMaskB,
+                        tile.Process(bufMaskF, bufMaskB,
                              bufSmallFX, bufSmallFY, bufSmallBX, bufSmallBY);
 
                         FlowInter<PixelType>(dstPtrY + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideY, dstStrideY,
@@ -211,8 +206,7 @@ static const VSFrame *VS_CC flowinterGetFrame(int n, int activationReason, void 
                         uint8_t *dstPtrV = vsapi->getWritePtr(dst, 2);
 
                         for (auto &tile : (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0) ? d->maskResizerSubSampled.tiles : d->maskResizerFull.tiles) {
-                            tile.Process(tmp.get(),
-                                 bufMaskF, bufMaskB,
+                            tile.Process(bufMaskF, bufMaskB,
                                  bufSmallFX, bufSmallFY, bufSmallBX, bufSmallBY);
 
                             FlowInter<PixelType>(dstPtrU + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideU, dstStrideU,

@@ -201,8 +201,6 @@ static const VSFrame *VS_CC flowblurGetFrame(int n, int activationReason, void *
                 auto smallMasksFw = vectorsfw.MakeSmallVectorMasks();
                 auto smallMasksBw = vectorsbw.MakeSmallVectorMasks();
 
-                auto tmp = MaskResizer::GetTmpBuffer(std::max(d->maskResizerFull.tmpSize, d->maskResizerSubSampled.tmpSize));
-
                 auto [dstTileVXFw, dstTileVYFw, dstTileVXBw, dstTileVYBw] = MaskResizer::GetTileBuffers<4>();
 
                 auto bufVXFw = MaskResizer::MakeBufferPair(smallMasksFw->VXSmallY, smallMasksFw->pitchVSmallY, dstTileVXFw.get());
@@ -214,7 +212,7 @@ static const VSFrame *VS_CC flowblurGetFrame(int n, int activationReason, void *
                 uint8_t *dstPtrY = vsapi->getWritePtr(dst, 0);
 
                 for (auto &tile : d->maskResizerFull.tiles) {
-                    tile.Process(tmp.get(), bufVXFw, bufVYFw, bufVXBw, bufVYBw);
+                    tile.Process(bufVXFw, bufVYFw, bufVXBw, bufVYBw);
 
                     FlowBlur<PixelType>(dstPtrY + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideY, dstStrideY, refGOF.GetLevel(0).planes[0],
                              dstTileVXBw.get(), dstTileVXFw.get(), dstTileVYBw.get(), dstTileVYFw.get(), MaskResizer::GetTileBufferStride(),
@@ -231,7 +229,7 @@ static const VSFrame *VS_CC flowblurGetFrame(int n, int activationReason, void *
                     uint8_t *dstPtrV = vsapi->getWritePtr(dst, 2);
 
                     for (auto &tile : (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0) ? d->maskResizerSubSampled.tiles : d->maskResizerFull.tiles) {
-                        tile.Process(tmp.get(), bufVXFw, bufVYFw, bufVXBw, bufVYBw);
+                        tile.Process(bufVXFw, bufVYFw, bufVXBw, bufVYBw);
 
                         FlowBlur<PixelType>(dstPtrU + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideU, dstStrideU, refGOF.GetLevel(0).planes[1],
                              dstTileVXBw.get(), dstTileVXFw.get(), dstTileVYBw.get(), dstTileVYFw.get(), MaskResizer::GetTileBufferStride(),

@@ -91,8 +91,6 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
 
                 auto smallMasks = vectors.MakeSmallVectorMasks();
 
-                auto tmp = MaskResizer::GetTmpBuffer(std::max(d->maskResizerFull.tmpSize, d->maskResizerSubSampled.tmpSize));
-
                 auto [dstTileVX, dstTileVY] = MaskResizer::GetTileBuffers<2>();
 
                 auto bufVX = MaskResizer::MakeBufferPair(smallMasks->VXSmallY, smallMasks->pitchVSmallY, dstTileVX.get());
@@ -102,7 +100,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                 uint8_t *dstPtrY = vsapi->getWritePtr(dst, 0);
 
                 for (auto &tile : d->maskResizerFull.tiles) {
-                    tile.Process(tmp.get(), bufVX, bufVY);
+                    tile.Process(bufVX, bufVY);
 
                     FlowFetch<PixelType>(dstPtrY + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideY, dstStrideY, refGOF.GetLevel(0).planes[0],
                         dstTileVX.get(), dstTileVY.get(), MaskResizer::GetTileBufferStride(),
@@ -118,7 +116,7 @@ static const VSFrame *VS_CC flowGetFrame(int n, int activationReason, void *inst
                     uint8_t *dstPtrV = vsapi->getWritePtr(dst, 2);
 
                     for (auto &tile : (d->vi->format.subSamplingH > 0 || d->vi->format.subSamplingW > 0) ? d->maskResizerSubSampled.tiles : d->maskResizerFull.tiles) {
-                        tile.Process(tmp.get(), bufVX, bufVY);
+                        tile.Process(bufVX, bufVY);
 
                         FlowFetch<PixelType>(dstPtrU + tile.dstX * sizeof(PixelType) + tile.dstY * dstStrideU, dstStrideU, refGOF.GetLevel(0).planes[1],
                             dstTileVX.get(), dstTileVY.get(), MaskResizer::GetTileBufferStride(),
