@@ -223,6 +223,29 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
             pSrcCur[0] = pSrc[0];
             pSrcCur[1] = pSrc[1];
             pSrcCur[2] = pSrc[2];
+
+            // The block weights of each distinct per-plane threshold set (one for all planes by default)
+            constexpr int nWeights = radius * 2 + 1;
+            int weightSet[3] = {};
+            std::unique_ptr<uint16_t[]> weights[3];
+            for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
+                if (!d->process[plane])
+                    continue;
+                weightSet[plane] = plane;
+                for (int q = 0; q < plane; q++) {
+                    bool same = d->process[q];
+                    for (int r = 0; same && r < radius * 2; r++)
+                        same = thSAD[r][q] == thSAD[r][plane];
+                    if (same) {
+                        weightSet[plane] = weightSet[q];
+                        break;
+                    }
+                }
+                if (weightSet[plane] == plane) {
+                    weights[plane].reset(new uint16_t[static_cast<size_t>(nBlkX) * nBlkY * nWeights]);
+                    blockWeights<radius>(weights[plane].get(), fgops, isUsable, thSAD, plane, d->userWeights, nBlkX, nBlkY);
+                }
+            }
             // -----------------------------------------------------------------------------
 
             for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
@@ -247,12 +270,9 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                         int xx = 0;
                         for (int bx = 0; bx < nBlkX; bx++) {
                             const uint8_t *pointers[radius * 2];
-                            uint16_t WSrc, WRefs[radius * 2];
-
                             for (int r = 0; r < radius * 2; r++)
-                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
-
-                            normaliseWeights<radius>(WSrc, WRefs, d->userWeights);
+                                pointers[r] = blockPointer<PixelType>(isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV);
+                            const uint16_t *w = weights[weightSet[plane]].get() + (static_cast<size_t>(by) * nBlkX + bx) * nWeights;
 
                             const int dstPixX = xx / bytesPerSample;
                             const int validW = std::min(nBlkSizeX[plane], frameW - dstPixX);
@@ -260,11 +280,11 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                             if (validW == nBlkSizeX[plane] && validH == nBlkSizeY[plane]) {
                                 // Block fits entirely — write directly
                                 d->DEGRAIN[plane](pDstCur[plane] + xx, nDstPitches[plane], pSrcCur[plane] + xx, nSrcPitches[plane],
-                                    pointers, WSrc, WRefs);
+                                    pointers, w[0], w + 1);
                             } else if (validW > 0) {
                                 // Edge block — write to tmpBlock, then copy only the valid region
                                 d->DEGRAIN[plane](tmpBlock, tmpBlockPitch, pSrcCur[plane] + xx, nSrcPitches[plane],
-                                    pointers, WSrc, WRefs);
+                                    pointers, w[0], w + 1);
                                 mvu_bitblt(pDstCur[plane] + xx, nDstPitches[plane],
                                     tmpBlock, tmpBlockPitch,
                                     validW * bytesPerSample, validH);
@@ -298,15 +318,12 @@ static const VSFrame *VS_CC degrainGetFrame(int n, int activationReason, void *i
                             const int16_t *winOver = OverWins[plane]->GetWindow(wby + wbx);
 
                             const uint8_t *pointers[radius * 2];
-                            uint16_t WSrc, WRefs[radius * 2];
-
                             for (int r = 0; r < radius * 2; r++)
-                                useBlock<PixelType>(pointers[r], WRefs[r], isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV, thSAD[r]);
-
-                            normaliseWeights<radius>(WSrc, WRefs, d->userWeights);
+                                pointers[r] = blockPointer<PixelType>(isUsable[r], fgops[r], bx, by, pPlanes[r], pSrcCur, xx, nLogPel, plane, xSubUV, ySubUV);
+                            const uint16_t *w = weights[weightSet[plane]].get() + (static_cast<size_t>(by) * nBlkX + bx) * nWeights;
 
                             d->DEGRAIN[plane](tmpBlock, tmpBlockPitch, pSrcCur[plane] + xx, nSrcPitches[plane],
-                                pointers, WSrc, WRefs);
+                                pointers, w[0], w + 1);
                             // accumulator is 1x pixel width for float, 2x for 8/16-bit integer.
                             constexpr int accRatio = std::is_floating_point_v<PixelType> ? 1 : 2;
                             d->OVERS[plane](DstTemp + xx * accRatio, dstTempPitch, tmpBlock, tmpBlockPitch, winOver, nBlkSizeX[plane]);

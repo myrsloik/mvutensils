@@ -160,20 +160,13 @@ static inline uint16_t DegrainWeight(int64_t thSAD, int64_t blockSAD) noexcept {
 }
 
 template<typename PixelType>
-static inline void useBlock(const uint8_t *&p, uint16_t &WRef, int isUsable, const std::optional<MotionBlockPyramid> &blocks, int bx, int by, const FramePyramidLevel *pPlane, const uint8_t **pSrcCur, int xx, int nLogPel, int plane, int xSubUV, int ySubUV, const int64_t *thSAD) noexcept {
-    // Resolves only the block pointer and its weight; the row stride is the centre's, shared by every reference
-    // (see DenoiseFunction), so the kernel steps them all with nSrcPitch.
-    if (isUsable) {
-        const BlockData block = blocks->GetBlock(bx, by);
-        int blx = (block.x << nLogPel) + block.vector.x;
-        int bly = (block.y << nLogPel) + block.vector.y;
-        p = pPlane->planes[plane].GetPointer<PixelType>(plane ? blx >> xSubUV : blx, plane ? bly >> ySubUV : bly);
-        int64_t blockSAD = block.vector.sad;
-        WRef = DegrainWeight(thSAD[plane], blockSAD);
-    } else {
-        p = pSrcCur[plane] + xx;
-        WRef = 0;
-    }
+static inline const uint8_t *blockPointer(bool isUsable, const std::optional<MotionBlockPyramid> &blocks, int bx, int by, const FramePyramidLevel *pPlane, const uint8_t *const *pSrcCur, int xx, int nLogPel, int plane, int xSubUV, int ySubUV) noexcept {
+    if (!isUsable)
+        return pSrcCur[plane] + xx;
+    const BlockData block = blocks->GetBlock(bx, by);
+    int blx = (block.x << nLogPel) + block.vector.x;
+    int bly = (block.y << nLogPel) + block.vector.y;
+    return pPlane->planes[plane].GetPointer<PixelType>(plane ? blx >> xSubUV : blx, plane ? bly >> ySubUV : bly);
 }
 
 
@@ -199,4 +192,20 @@ static inline void normaliseWeights(uint16_t &WSrc, uint16_t *WRefs, const int *
     }
 
     WSrc = static_cast<uint16_t>(wsrc < 0 ? 0 : wsrc);
+}
+
+// Every block's normalised weights for the thresholds of one plane, block after block as WSrc then WRefs[radius * 2].
+// They depend on the plane only through its thresholds, which all planes share by default, so one pass per frame and
+// distinct threshold set replaces computing them for every block of every plane (two double divisions per reference
+// plus one, most of degrainGetFrame's own time); a loop of only this also lets the divisions of consecutive blocks
+// overlap.
+template <int radius>
+static void blockWeights(uint16_t *out, const std::optional<MotionBlockPyramid> *blocks, const bool *isUsable, const int64_t (*thSAD)[3], int plane, const int *userWeights, int nBlkX, int nBlkY) noexcept {
+    for (int by = 0; by < nBlkY; by++) {
+        for (int bx = 0; bx < nBlkX; bx++, out += radius * 2 + 1) {
+            for (int r = 0; r < radius * 2; r++)
+                out[1 + r] = isUsable[r] ? DegrainWeight(thSAD[r][plane], blocks[r]->GetBlock(bx, by).vector.sad) : 0;
+            normaliseWeights<radius>(out[0], out + 1, userWeights);
+        }
+    }
 }
